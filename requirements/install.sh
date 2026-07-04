@@ -77,6 +77,7 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 USE_MIRRORS=0
 GITHUB_PREFIX=""
+GIT_CLONE_RETRIES=${GIT_CLONE_RETRIES:-3}
 NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
@@ -1039,6 +1040,38 @@ EOF
     uv pip install "${base_url}/${wheel_name}" || (echo "Apex installation via wheel failed. Attempting to install from source..."; APEX_CPP_EXT=1 APEX_CUDA_EXT=1 uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/apex.git --no-build-isolation)
 }
 
+clone_repo_with_retry() {
+    local git_url="$1"
+    local target_dir="$2"
+    shift 2
+
+    local parent_dir
+    parent_dir="$(dirname "$target_dir")"
+    mkdir -p "$parent_dir"
+
+    local attempt=1
+    local tmp_dir
+    while [ "$attempt" -le "$GIT_CLONE_RETRIES" ]; do
+        tmp_dir="$(mktemp -d "${parent_dir}/.clone-tmp.XXXXXX")"
+        echo "Cloning $git_url into $target_dir (attempt $attempt/$GIT_CLONE_RETRIES)..." >&2
+        if git clone "$@" "$git_url" "$tmp_dir" >&2; then
+            rm -rf "$target_dir"
+            mv "$tmp_dir" "$target_dir"
+            return 0
+        fi
+
+        rm -rf "$tmp_dir"
+        if [ "$attempt" -lt "$GIT_CLONE_RETRIES" ]; then
+            echo "Clone failed; retrying..." >&2
+            sleep $((attempt * 2))
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    echo "Failed to clone $git_url after $GIT_CLONE_RETRIES attempts." >&2
+    return 1
+}
+
 clone_or_reuse_repo() {
     # Usage: clone_or_reuse_repo ENV_VAR_NAME DEFAULT_DIR GIT_URL [GIT_CLONE_ARGS...]
     # - If ENV_VAR_NAME is set, use it as the checkout location: reuse it when it
@@ -1062,25 +1095,28 @@ clone_or_reuse_repo() {
         target_dir="$env_value"
         if [ ! -d "$target_dir" ]; then
             echo "$env_var_name=$target_dir does not exist yet; cloning $git_url into it..." >&2
-            git clone "$@" "$git_url" "$target_dir" >&2
+            clone_repo_with_retry "$git_url" "$target_dir" "$@" || return 1
         else
             echo "Reusing existing checkout at $env_var_name=$target_dir." >&2
         fi
     else
         target_dir="$default_dir"
         if [ ! -d "$target_dir" ]; then
-            git clone "$@" "$git_url" "$target_dir" >&2
+            clone_repo_with_retry "$git_url" "$target_dir" "$@" || return 1
         elif [ -d "$target_dir/.git" ]; then
             echo "Checking git repo $target_dir..." >&2
             local git_intact=1
             git -C "$target_dir" status --porcelain >/dev/null 2>&1 || git_intact=0
+            git -C "$target_dir" fsck --connectivity-only >/dev/null 2>&1 || git_intact=0
             if [ $git_intact -eq 1 ]; then
                 echo "Git repo $target_dir is intact." >&2
             else
                 echo "Git repo $target_dir is corrupted. Re-cloning..." >&2
-                rm -rf "$target_dir"
-                git clone "$@" "$git_url" "$target_dir" >&2
+                clone_repo_with_retry "$git_url" "$target_dir" "$@" || return 1
             fi
+        else
+            echo "$target_dir exists but is not a git repo. Re-cloning..." >&2
+            clone_repo_with_retry "$git_url" "$target_dir" "$@" || return 1
         fi
     fi
 
@@ -1653,7 +1689,7 @@ install_libero_env() {
     # Use LIBERO_PATH as the checkout location if set (shared, cloned on first use);
     # otherwise clone into the venv.
     local libero_dir
-    libero_dir=$(clone_or_reuse_repo LIBERO_PATH "$VENV_DIR/libero" https://github.com/RLinf/LIBERO.git)
+    libero_dir=$(clone_or_reuse_repo LIBERO_PATH "$VENV_DIR/libero" https://github.com/RLinf/LIBERO.git --depth 1)
 
     uv pip install -e "$libero_dir"
     uv pip install "mujoco<=3.9.0"
@@ -1733,22 +1769,22 @@ install_d4rl_env() {
 install_liberopro_env() {
     # Base LIBERO + ManiSkill required for LIBERO-Pro.
     local libero_dir
-    libero_dir=$(clone_or_reuse_repo LIBERO_PATH "$VENV_DIR/libero" https://github.com/RLinf/LIBERO.git)
+    libero_dir=$(clone_or_reuse_repo LIBERO_PATH "$VENV_DIR/libero" https://github.com/RLinf/LIBERO.git --depth 1)
     uv pip install -e "$libero_dir"
 
     local libero_pro_dir
-    libero_pro_dir=$(clone_or_reuse_repo LIBERO_PRO_PATH "$VENV_DIR/libero_pro" https://github.com/RLinf/LIBERO-PRO.git)
+    libero_pro_dir=$(clone_or_reuse_repo LIBERO_PRO_PATH "$VENV_DIR/libero_pro" https://github.com/RLinf/LIBERO-PRO.git --depth 1)
     uv pip install -e "$libero_pro_dir"
     uv pip install "mujoco<=3.9.0"
 }
 
 install_liberoplus_env() {
     local libero_dir
-    libero_dir=$(clone_or_reuse_repo LIBERO_PATH "$VENV_DIR/libero" https://github.com/RLinf/LIBERO.git)
+    libero_dir=$(clone_or_reuse_repo LIBERO_PATH "$VENV_DIR/libero" https://github.com/RLinf/LIBERO.git --depth 1)
     uv pip install -e "$libero_dir"
 
     local libero_plus_dir
-    libero_plus_dir=$(clone_or_reuse_repo LIBERO_PLUS_PATH "$VENV_DIR/libero_plus" https://github.com/RLinf/LIBERO-plus.git)
+    libero_plus_dir=$(clone_or_reuse_repo LIBERO_PLUS_PATH "$VENV_DIR/libero_plus" https://github.com/RLinf/LIBERO-plus.git --depth 1)
     uv pip install -r $libero_plus_dir/extra_requirements.txt
     uv pip install -e "$libero_plus_dir"
     uv pip install "mujoco<=3.9.0"
