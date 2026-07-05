@@ -18,6 +18,12 @@ if [[ ! -x "${PYTHON_BIN}" || ! -x "${RAY_BIN}" ]]; then
   exit 1
 fi
 
+if ! "${PYTHON_BIN}" -c "import openpi" >/dev/null 2>&1; then
+  echo "OpenPI is not installed in ${REPO_PATH}/.venv." >&2
+  echo "Run: bash requirements/install.sh embodied --model openpi --env maniskill_libero --venv .venv --use-mirror" >&2
+  exit 1
+fi
+
 # RLinf placement uses physical GPU IDs, so Ray must discover all GPUs.
 unset CUDA_VISIBLE_DEVICES
 "${RAY_BIN}" stop >/dev/null 2>&1 || true
