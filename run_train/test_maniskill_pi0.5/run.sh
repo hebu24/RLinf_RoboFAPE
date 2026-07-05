@@ -4,8 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG_NAME="maniskill_ppo_openpi_pi05"
-PYTHON_BIN="${REPO_PATH}/.venv/bin/python"
-RAY_BIN="${REPO_PATH}/.venv/bin/ray"
+VENV_DIR="/opt/kairan/envs/rlinf"
+PYTHON_BIN="${VENV_DIR}/bin/python"
+RAY_BIN="${VENV_DIR}/bin/ray"
 
 export EMBODIED_PATH="${SCRIPT_DIR}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
@@ -14,13 +15,12 @@ export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 
 if [[ ! -x "${PYTHON_BIN}" || ! -x "${RAY_BIN}" ]]; then
-  echo "Missing ${REPO_PATH}/.venv; activate or reinstall the project environment." >&2
+  echo "Missing Python or Ray in ${VENV_DIR}." >&2
   exit 1
 fi
 
 if ! "${PYTHON_BIN}" -c "import openpi" >/dev/null 2>&1; then
-  echo "OpenPI is not installed in ${REPO_PATH}/.venv." >&2
-  echo "Run: bash requirements/install.sh embodied --model openpi --env maniskill_libero --venv .venv --use-mirror" >&2
+  echo "OpenPI is not installed in ${VENV_DIR}." >&2
   exit 1
 fi
 

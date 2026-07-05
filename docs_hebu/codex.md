@@ -33,7 +33,7 @@ actor:
 
 ## 启动训练
 
-使用 GPU 6，以较小并行参数启动单卡同步 PPO：
+使用 `/opt/kairan/envs/rlinf` 环境和 GPU 6，以较小并行参数启动单卡同步 PPO：
 
 watch -n 1 nvidia-smi
 
