@@ -33,14 +33,17 @@ actor:
 
 ## 启动训练
 
-启动单机 Ray head，再运行同步 PPO：
+使用 GPU 6，以较小并行参数启动单卡同步 PPO：
+
+watch -n 1 nvidia-smi
 
 ```bash
-ray start --head
-bash examples/embodiment/run_embodiment.sh maniskill_ppo_openpi_pi05
+bash run_train/test_maniskill_pi0.5/run.sh
 ```
 
-创建目录： `logs/...-maniskill_ppo_openpi_pi05/` 日志目录
+测试配置位于 `run_train/test_maniskill_pi0.5/config/`，训练环境数为 32，评估环境数为 16，global batch size 为 512。
+
+创建目录： `logs/<时间>-maniskill_ppo_openpi_pi05-gpu6/` 日志目录
 启动训练： `examples/embodiment/train_embodied_agent.py` 
 
 ## Hydra 配置组成
