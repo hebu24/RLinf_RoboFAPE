@@ -64,7 +64,7 @@ env:
   group_name: "EnvGroup"
   train:
     rollout_epoch: 1
-    total_num_envs: 8
+    total_num_envs: 16
     auto_reset: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 80
@@ -102,7 +102,7 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 32
-  global_batch_size: 128
+  global_batch_size: 256
   seed: 0
   enable_offload: False
   model:
