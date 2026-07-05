@@ -38,10 +38,11 @@ actor:
 watch -n 1 nvidia-smi
 
 ```bash
+source /opt/kairan/envs/rlinf/bin/activate
 bash run_train/test_maniskill_pi0.5/run.sh
 ```
 
-测试配置位于 `run_train/test_maniskill_pi0.5/config/`，训练环境数为 32，评估环境数为 16，global batch size 为 512。
+测试配置位于 `run_train/test_maniskill_pi0.5/config/`，固定使用物理 GPU 6；训练环境数为 8，评估环境数为 4，global batch size 为 128。
 
 创建目录： `logs/<时间>-maniskill_ppo_openpi_pi05-gpu6/` 日志目录
 启动训练： `examples/embodiment/train_embodied_agent.py` 

@@ -4,21 +4,31 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG_NAME="maniskill_ppo_openpi_pi05"
+PYTHON_BIN="${REPO_PATH}/.venv/bin/python"
+RAY_BIN="${REPO_PATH}/.venv/bin/ray"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
 export EMBODIED_PATH="${SCRIPT_DIR}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 
-ray stop >/dev/null 2>&1 || true
-ray start --head --num-gpus=1
+if [[ ! -x "${PYTHON_BIN}" || ! -x "${RAY_BIN}" ]]; then
+  echo "Missing ${REPO_PATH}/.venv; activate or reinstall the project environment." >&2
+  exit 1
+fi
 
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H%M%S')-${CONFIG_NAME}-gpu${CUDA_VISIBLE_DEVICES}"
+# RLinf placement uses physical GPU IDs, so Ray must discover all GPUs.
+unset CUDA_VISIBLE_DEVICES
+"${RAY_BIN}" stop >/dev/null 2>&1 || true
+RAY_TMP_DIR="${REPO_PATH}/logs/ray_tmp"
+mkdir -p "${RAY_TMP_DIR}"
+"${RAY_BIN}" start --head --temp-dir="${RAY_TMP_DIR}"
+
+LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H%M%S')-${CONFIG_NAME}-gpu6"
 mkdir -p "${LOG_DIR}"
 
-python "${REPO_PATH}/examples/embodiment/train_embodied_agent.py" \
+"${PYTHON_BIN}" "${REPO_PATH}/examples/embodiment/train_embodied_agent.py" \
   --config-path "${SCRIPT_DIR}/config" \
   --config-name "${CONFIG_NAME}" \
   runner.logger.log_path="${LOG_DIR}" \
