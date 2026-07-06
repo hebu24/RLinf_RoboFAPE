@@ -65,20 +65,32 @@ class ManiSkillInputs(transforms.DataTransformFn):
         """
 
         base_image = _parse_image(data["observation/image"])
+        wrist_image = data.get(
+            "observation/extra_view_image", data.get("observation/wrist_image")
+        )
+        if wrist_image is not None:
+            wrist_image = np.asarray(wrist_image)
+            if wrist_image.ndim == 4:
+                wrist_image = wrist_image[0]
+            wrist_image = _parse_image(wrist_image)
+            wrist_image_mask = np.True_
+        else:
+            wrist_image = np.zeros_like(base_image)
+            wrist_image_mask = np.False_
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
             "state": data["observation/state"],
             "image": {
                 "base_0_rgb": base_image,
-                "left_wrist_0_rgb": np.zeros_like(base_image),
+                "left_wrist_0_rgb": wrist_image,
                 # Pad any non-existent images with zero-arrays of the appropriate shape.
                 "right_wrist_0_rgb": np.zeros_like(base_image),
                 # Pad any non-existent images with zero-arrays of the appropriate shape.
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.False_,
+                "left_wrist_0_rgb": wrist_image_mask,
                 "right_wrist_0_rgb": np.False_,
             },
         }

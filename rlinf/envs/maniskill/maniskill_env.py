@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, OrderedDict, Union
+from collections import OrderedDict
+from typing import Optional, Union
 
 import gymnasium as gym
 import numpy as np
@@ -113,7 +114,19 @@ class ManiskillEnv(gym.Env):
 
     @property
     def instruction(self):
-        return self.env.unwrapped.get_language_instruction()
+        instruction_getter = getattr(
+            self.env.unwrapped, "get_language_instruction", None
+        )
+        if callable(instruction_getter):
+            return instruction_getter()
+        task_description = getattr(self.cfg, "task_description", None)
+        if task_description is not None:
+            return [str(task_description)] * self.num_envs
+        return [""] * self.num_envs
+
+    def _base_reset_options(self):
+        reset_options = getattr(self.cfg, "reset_options", {})
+        return OmegaConf.to_container(reset_options, resolve=True) or {}
 
     def _init_reset_state_ids(self):
         self._generator = torch.Generator()
@@ -155,7 +168,9 @@ class ManiskillEnv(gym.Env):
             elif self.env.unwrapped.obs_mode == "rgb":
                 sensor_data = raw_obs.pop("sensor_data")
                 raw_obs.pop("sensor_param")
-                if self.use_full_state:
+                if hasattr(self.env.unwrapped, "get_pi05_proprio"):
+                    state = self.env.unwrapped.get_pi05_proprio()
+                elif self.use_full_state:
                     state = self._get_full_state_obs()
                 else:
                     state = common.flatten_state_dict(
@@ -173,7 +188,9 @@ class ManiskillEnv(gym.Env):
                 return {
                     "main_images": main_images,
                     "extra_view_images": extra_view_images,
+                    "wrist_images": None,
                     "states": state,
+                    "task_descriptions": self.instruction,
                 }
 
         # Default
@@ -281,6 +298,13 @@ class ManiskillEnv(gym.Env):
                 if self.use_fixed_reset_state_ids
                 else {}
             )
+        else:
+            options = dict(options)
+        base_options = self._base_reset_options()
+        if base_options:
+            merged_options = dict(base_options)
+            merged_options.update(options)
+            options = merged_options
         raw_obs, infos = self.env.reset(seed=seed, options=options)
         self._show_goal_site_visual()
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
