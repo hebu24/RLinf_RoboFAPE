@@ -5,8 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG_NAME="${CONFIG_NAME:-maniskill_peg_insertion_vertical_ppo_openpi_pi05}"
 VENV_DIR="${VENV_DIR:-/opt/kairan/envs/rlinf}"
+GPU_ID="${GPU_ID:-0}"
 PYTHON_BIN="${VENV_DIR}/bin/python"
 RAY_BIN="${VENV_DIR}/bin/ray"
+
+if [[ ! "${GPU_ID}" =~ ^[0-9]+$ ]]; then
+  echo "GPU_ID must be a non-negative integer, got: ${GPU_ID}" >&2
+  exit 1
+fi
 
 export EMBODIED_PATH="${SCRIPT_DIR}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
@@ -33,10 +39,12 @@ mkdir -p "${RAY_TMP_DIR}"
 
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H%M%S')-${CONFIG_NAME}"
 mkdir -p "${LOG_DIR}"
+PLACEMENT_OVERRIDE="cluster.component_placement={actor\\,env\\,rollout:${GPU_ID}}"
 
 "${PYTHON_BIN}" "${REPO_PATH}/examples/embodiment/train_embodied_agent.py" \
   --config-path "${SCRIPT_DIR}/config" \
   --config-name "${CONFIG_NAME}" \
   runner.logger.log_path="${LOG_DIR}" \
+  "${PLACEMENT_OVERRIDE}" \
   "$@" \
   2>&1 | tee "${LOG_DIR}/run_embodiment.log"
