@@ -125,8 +125,12 @@ class ManiskillEnv(gym.Env):
         return [""] * self.num_envs
 
     def _base_reset_options(self):
-        reset_options = getattr(self.cfg, "reset_options", {})
-        return OmegaConf.to_container(reset_options, resolve=True) or {}
+        reset_options = getattr(self.cfg, "reset_options", None)
+        if reset_options is None:
+            return {}
+        if OmegaConf.is_config(reset_options):
+            return OmegaConf.to_container(reset_options, resolve=True) or {}
+        return dict(reset_options)
 
     def _init_reset_state_ids(self):
         self._generator = torch.Generator()
