@@ -157,10 +157,12 @@ class PegInsertionVerticalEnv(BaseEnv):
         self,
         *args,
         robot_uids="panda_wristcam",
+        obj_set: str | None = None,
         robot_init_qpos_noise=0.02,
         render_randomization_spec=None,
         **kwargs,
     ):
+        self.obj_set = obj_set
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.render_randomization_spec = render_randomization_spec
         if robot_uids == "panda_wristcam":

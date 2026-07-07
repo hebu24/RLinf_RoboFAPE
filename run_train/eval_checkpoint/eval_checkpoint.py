@@ -149,6 +149,8 @@ def build_config(args: argparse.Namespace, hydra_overrides: list[str]) -> DictCo
         cfg.env.eval.init_params.max_episode_steps = args.max_episode_steps
         if args.obj_set:
             cfg.env.eval.init_params.obj_set = args.obj_set
+        elif "obj_set" in cfg.env.eval.init_params:
+            del cfg.env.eval.init_params.obj_set
         if args.task_description:
             cfg.env.eval.task_description = args.task_description
         if args.obs_mode:
