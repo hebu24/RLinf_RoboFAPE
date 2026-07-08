@@ -661,7 +661,9 @@ class PegInsertionVerticalEnv(BaseEnv):
             device=self.device,
             dtype=torch.float32,
         )
-        gripper = self.agent.robot.get_qpos().to(torch.float32)[:, -1:] * 2
+        # 8-dim: [tcp_xyz(3), euler_sxyz(3), finger0(1), finger1(1)]
+        # Raw finger qpos (no *2) to align with 25Main SFT norm_stats.
+        gripper = self.agent.robot.get_qpos().to(torch.float32)[:, -2:]
         return torch.cat([pos, euler, gripper], dim=1)
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
