@@ -142,6 +142,7 @@ logs/<run>/checkpoints/global_step_50/actor
 ```bash
 cd /home/hebu/code/robofape/RLinf_RoboFAPE
 
+# Optional: stop all running ray jobs
 /opt/kairan/envs/rlinf/bin/ray stop
 
 VENV_DIR=/opt/kairan/envs/rlinf \
@@ -169,6 +170,7 @@ bash run_train/eval_checkpoint/run_peginsertion.sh
 | `SAVE_VIDEO` | `true` | 是否保存视频。 |
 | `IGNORE_TERMINATIONS` | `true` | 成功后是否继续跑到 rollout 长度。 |
 | `FIXED_RESET_STATE_IDS` | `false` | 是否固定 reset state id。 |
+| `EVAL_ACTION_SCALE` | `1.0` | 动作缩放。 |
 
 评测输出目录：
 

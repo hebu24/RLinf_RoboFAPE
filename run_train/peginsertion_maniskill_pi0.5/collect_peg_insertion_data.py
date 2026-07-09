@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse,json,os,os.path as osp,sys,time,traceback
+import argparse,json,os,os.path as osp,sys,time,traceback,multiprocessing as mp
 from pathlib import Path
 from typing import List
 import cv2,gymnasium as gym,numpy as np,pandas as pd,torch
@@ -22,6 +22,21 @@ from solutions.solve_PegInsertionVertical import solve_peginsertionvertical
 TASK="insert the blue peg vertically into the orange hole"
 FPS=20;IW=224;IH=224;RW=640;RH=480
 SDIM=8;ADIM=7;CSIZE=1000
+def _compute_stats(df):
+    s={}; a=np.stack(df["action"].values)
+    s["action"]={"mean":a.mean(0).tolist(),"std":a.std(0).tolist(),"max":a.max(0).tolist(),"min":a.min(0).tolist(),"count":[len(a)]}
+    st=np.stack(df["observation.state"].values)
+    s["observation.state"]={"mean":st.mean(0).tolist(),"std":st.std(0).tolist(),"max":st.max(0).tolist(),"min":st.min(0).tolist(),"count":[len(st)]}
+    for fld in ["timestamp","frame_index","episode_index","index","task_index"]:
+        v=df[fld].values
+        s[fld]={"mean":[float(v.mean())],"std":[float(v.std())],"max":[int(v.max())] if fld!="timestamp" else [float(v.max())],"min":[int(v.min())] if fld!="timestamp" else [float(v.min())],"count":[len(v)]}
+    return s
+
+def _build_features():
+    feat={"action":{"dtype":"float32","shape":[ADIM],"names":[f"action_{i}" for i in range(ADIM)],"fps":float(FPS)},"observation.state":{"dtype":"float32","shape":[SDIM],"names":[f"joint_{i}" for i in range(SDIM)],"fps":float(FPS)},"timestamp":{"dtype":"float32","shape":[1],"names":None,"fps":float(FPS)},"frame_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"episode_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task":{"dtype":"string","shape":[1],"names":None,"fps":float(FPS)}}
+    for c,h,w in [("top",IH,IW),("wrist",IH,IW),("render",RH,RW)]:
+        feat[f"observation.images.{c}"]={"dtype":"video","shape":[h,w,3],"names":["height","width","channels"],"info":{"video.fps":float(FPS),"video.height":h,"video.width":w,"video.channels":3,"video.codec":"mp4v","video.pix_fmt":"yuv420p","video.is_depth_map":False,"has_audio":False}}
+    return feat
 
 class ObservationRecorder:
     def __init__(self, env):
@@ -108,7 +123,7 @@ class LeRobotWriter:
         pq.write_table(pa.Table.from_pandas(edf),osp.join(self.od,"meta","episodes","chunk-000","file-000.parquet"))
         tdf=pd.DataFrame({"task_index":[0]},index=[self.task]); tdf.index.name=None
         tdf.to_parquet(osp.join(self.od,"meta","tasks.parquet"),index=True)
-        stats=self._stats(cdf)
+        stats=_compute_stats(cdf)
         with open(osp.join(self.od,"meta","stats.json"),"w") as f: json.dump(stats,f,indent=2)
         TF=len(cdf); TE=len(self.eps)
         feat={"action":{"dtype":"float32","shape":[ADIM],"names":[f"action_{i}" for i in range(ADIM)],"fps":float(FPS)},"observation.state":{"dtype":"float32","shape":[SDIM],"names":[f"joint_{i}" for i in range(SDIM)],"fps":float(FPS)},"timestamp":{"dtype":"float32","shape":[1],"names":None,"fps":float(FPS)},"frame_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"episode_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task":{"dtype":"string","shape":[1],"names":None,"fps":float(FPS)}}
@@ -128,15 +143,28 @@ class LeRobotWriter:
             s[fld]={"mean":[float(v.mean())],"std":[float(v.std())],"max":[int(v.max())] if fld!="timestamp" else [float(v.max())],"min":[int(v.min())] if fld!="timestamp" else [float(v.min())],"count":[len(v)]}
         return s
 
-def collect_data(args):
-    outdir=osp.abspath(args.output_dir); os.makedirs(outdir,exist_ok=True)
-    writer=LeRobotWriter(outdir); seed=args.seed
-    passed=0; attempts=0; fmp=0; fsucc=0; t0=time.time()
-    # Create env ONCE and reuse for all episodes
-    env=gym.make("PegInsertionVertical-v1",num_envs=1,obs_mode="rgb",robot_uids="panda_wristcam",control_mode="pd_joint_pos",sim_backend="cpu",render_mode="all",reward_mode="normalized_dense",max_episode_steps=600,sensor_configs=dict(shader_pack="default"),human_render_camera_configs=dict(shader_pack="default"))
-    recorder=ObservationRecorder(env)
-    pbar=tqdm(total=args.num_traj,desc="Collecting")
-    while passed<args.num_traj:
+def _make_env(gpu_id=0, max_retries=5, retry_delay=10.0):
+    """Create env bound to a specific Vulkan render GPU, with retry on ErrorDeviceLost."""
+    render_backend=f"gpu:{gpu_id}"
+    last_err=None
+    for attempt in range(max_retries):
+        try:
+            env=gym.make("PegInsertionVertical-v1",num_envs=1,obs_mode="rgb",robot_uids="panda_wristcam",control_mode="pd_joint_pos",sim_backend="cpu",render_backend=render_backend,render_mode="all",reward_mode="normalized_dense",max_episode_steps=600,sensor_configs=dict(shader_pack="default"),human_render_camera_configs=dict(shader_pack="default"))
+            return env
+        except RuntimeError as e:
+            last_err=e
+            if "ErrorDeviceLost" in str(e) or "vk" in str(e).lower():
+                print(f"  [gpu{gpu_id}] Vulkan error attempt {attempt+1}/{max_retries}, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                continue
+            raise
+    raise last_err
+
+def _collect_episodes(num_traj, base_seed, writer, progress_prefix="", gpu_id=0):
+    env=_make_env(gpu_id=gpu_id); recorder=ObservationRecorder(env)
+    seed=base_seed; passed=0; attempts=0; fmp=0; fsucc=0; t0=time.time()
+    pbar=tqdm(total=num_traj,desc=progress_prefix or "Collecting",position=0,leave=True)
+    while passed<num_traj:
         attempts+=1
         recorder.start()
         try:
@@ -151,12 +179,12 @@ def collect_data(args):
                 seed+=1; recorder.stop()
                 continue
         except Exception as e:
-            print(f"Error seed={seed}: {e}"); traceback.print_exc(); fmp+=1; seed+=1; recorder.stop()
+            print(f"{progress_prefix}Error seed={seed}: {e}"); traceback.print_exc(); fmp+=1; seed+=1; recorder.stop()
             continue
         recorder.stop()
         records=recorder.records
         if not records:
-            print(f"No records seed={seed}"); seed+=1; continue
+            print(f"{progress_prefix}No records seed={seed}"); seed+=1; continue
         acts=compute_ee_delta_actions(records)
         states=np.stack([r["pre"]["state"] for r in records])
         bf=np.stack([r["pre"]["base_camera_rgb"] for r in records])
@@ -165,19 +193,109 @@ def collect_data(args):
         writer.add_episode(acts,states,bf,wf,rf)
         passed+=1; pbar.update(1)
         el=time.time()-t0; rate=passed/el if el>0 else 0
-        pbar.set_postfix(dict(succ=f"{passed/attempts:.2%}",fmp=fmp,fs=fsucc,epl=len(records),r=f"{rate:.1f}e/s"))
+        pbar.set_postfix(dict(succ=f"{passed/attempts:.2%}" if attempts else "n/a",fmp=fmp,fs=fsucc,epl=len(records),r=f"{rate:.1f}e/s"))
         seed+=1
-    pbar.close(); writer.finalize()
+    pbar.close()
     try: env.close()
     except: pass
+    return passed, attempts
+def _collect_worker(worker_id, num_traj, base_seed, shard_dir, gpu_id=0, startup_delay=0.0):
+    if startup_delay>0: time.sleep(startup_delay)
+    writer=LeRobotWriter(shard_dir)
+    pfx=f"[w{worker_id}/gpu{gpu_id}] "
+    passed, attempts=_collect_episodes(num_traj, base_seed, writer, progress_prefix=pfx, gpu_id=gpu_id)
+    writer.finalize()
+    return worker_id, shard_dir, passed, attempts
+
+def merge_shards(final_dir, shard_dirs):
+    import shutil, pyarrow as pa, pyarrow.parquet as pq
+    final_dir=osp.abspath(final_dir)
+    os.makedirs(final_dir,exist_ok=True)
+    os.makedirs(osp.join(final_dir,"data","chunk-000"),exist_ok=True)
+    os.makedirs(osp.join(final_dir,"meta","episodes","chunk-000"),exist_ok=True)
+    for c in ["top","wrist","render"]:
+        os.makedirs(osp.join(final_dir,"videos",f"observation.images.{c}","chunk-000"),exist_ok=True)
+    all_dfs=[]; global_epi=0; global_idx=0; eps_meta=[]
+    for sd in shard_dirs:
+        dp=osp.join(sd,"data","chunk-000","file-000.parquet")
+        if not osp.exists(dp):
+            print(f"merge: skip empty shard {sd}"); continue
+        df=pd.read_parquet(dp)
+        n_eps=int(df["episode_index"].max())+1 if len(df) else 0
+        if n_eps==0: continue
+        for li in range(n_eps):
+            gi=global_epi+li
+            for c in ["top","wrist","render"]:
+                src=osp.join(sd,"videos",f"observation.images.{c}","chunk-000",f"file-{li:03d}.mp4")
+                dst=osp.join(final_dir,"videos",f"observation.images.{c}","chunk-000",f"file-{gi:03d}.mp4")
+                if osp.exists(src): shutil.copy2(src,dst)
+        sub=df.copy()
+        sub["episode_index"]=sub["episode_index"]-int(sub["episode_index"].min())+global_epi
+        sub["index"]=np.arange(global_idx,global_idx+len(sub),dtype=np.int64)
+        all_dfs.append(sub)
+        for li in range(n_eps):
+            sub_e=sub[sub["episode_index"]==global_epi+li]
+            T=len(sub_e)
+            eps_meta.append({"episode_index":global_epi+li,"data/chunk_index":0,"data/file_index":0,"dataset_from_index":int(sub_e["index"].min()),"dataset_to_index":int(sub_e["index"].max())+1,"tasks":[TASK],"length":T})
+        global_epi+=n_eps; global_idx+=len(sub)
+    if not all_dfs:
+        print("merge: no episodes found in any shard"); return
+    cdf=pd.concat(all_dfs,ignore_index=True); cdf["task"]=cdf["task"].astype("string")
+    sch=pa.schema([pa.field("action",pa.list_(pa.float32())),pa.field("observation.state",pa.list_(pa.float32())),pa.field("timestamp",pa.float32()),pa.field("frame_index",pa.int64()),pa.field("episode_index",pa.int64()),pa.field("index",pa.int64()),pa.field("task_index",pa.int64()),pa.field("task",pa.string())])
+    pq.write_table(pa.Table.from_pandas(cdf,schema=sch),osp.join(final_dir,"data","chunk-000","file-000.parquet"))
+    edf=pd.DataFrame(eps_meta)
+    pq.write_table(pa.Table.from_pandas(edf),osp.join(final_dir,"meta","episodes","chunk-000","file-000.parquet"))
+    tdf=pd.DataFrame({"task_index":[0]},index=[TASK]); tdf.index.name=None
+    tdf.to_parquet(osp.join(final_dir,"meta","tasks.parquet"),index=True)
+    stats=_compute_stats(cdf)
+    with open(osp.join(final_dir,"meta","stats.json"),"w") as f: json.dump(stats,f,indent=2)
+    TF=len(cdf); TE=global_epi
+    feat=_build_features()
+    dsz=sum(f.stat().st_size for f in Path(final_dir).rglob("data/*.parquet"))
+    info={"codebase_version":"v3.0","robot_type":"panda_wristcam","total_episodes":TE,"total_frames":TF,"total_tasks":1,"total_videos":TE*3,"total_chunks":1,"chunks_size":CSIZE,"fps":FPS,"data_files_size_in_mb":int(dsz/(1024*1024)),"splits":{"train":f"0:{TE}"},"data_path":"data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet","video_path":"videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4","features":feat}
+    with open(osp.join(final_dir,"meta","info.json"),"w") as f: json.dump(info,f,indent=2)
+    print(f"Merged dataset: {TE} eps, {TF} frames -> {final_dir}")
+
+def collect_data(args):
+    outdir=osp.abspath(args.output_dir)
+    if args.num_workers<=1:
+        os.makedirs(outdir,exist_ok=True)
+        writer=LeRobotWriter(outdir)
+        passed, attempts=_collect_episodes(args.num_traj, args.seed, writer)
+        writer.finalize()
+        sr=f"{passed/attempts:.1%}" if attempts else "n/a"
+        print(f"Done! {passed}/{attempts} ({sr}), out={outdir}")
+        return
+    nw=args.num_workers
+    per=args.num_traj//nw; rem=args.num_traj%nw
+    counts=[per+(1 if i<rem else 0) for i in range(nw)]
+    shard_root=osp.join(outdir,"_shards"); os.makedirs(shard_root,exist_ok=True)
+    shard_dirs=[osp.join(shard_root,f"shard_{i:03d}") for i in range(nw)]
+    seeds=[args.seed+i*100000 for i in range(nw)]
+    t0=time.time()
+    gpu_ids=[int(x) for x in args.gpu_ids.split(",") if x.strip()!=""]
+    ng=len(gpu_ids)
+    stagger=args.worker_stagger
+    ctx=mp.get_context("fork")
+    with ctx.Pool(nw) as pool:
+        results=pool.starmap(_collect_worker,[(i,counts[i],seeds[i],shard_dirs[i],gpu_ids[i%ng],i*stagger) for i in range(nw)])
     el=time.time()-t0
-    print(f"Done! {passed}/{attempts} ({passed/attempts:.1%}), time={el:.1f}s, out={outdir}")
+    total_p=sum(r[2] for r in results); total_a=sum(r[3] for r in results)
+    sr=f"{total_p/total_a:.1%}" if total_a else "n/a"
+    print(f"All workers done in {el:.1f}s. Total: {total_p}/{total_a} ({sr})")
+    merge_shards(outdir, shard_dirs)
+    print(f"Done! {total_p} episodes, time={el:.1f}s, out={outdir}")
+
+
 
 def main():
     p=argparse.ArgumentParser(description="Collect PegInsertionVertical data")
     p.add_argument("--num-traj",type=int,default=500)
     p.add_argument("--output-dir",type=str,default="/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical")
     p.add_argument("--seed",type=int,default=0)
+    p.add_argument("--num-workers",type=int,default=1,help="number of parallel worker processes (each uses 1 CPU core)")
+    p.add_argument("--gpu-ids",type=str,default="0",help="comma-separated GPU ids for Vulkan rendering, distributed round-robin across workers (e.g. 0,1,2,3)")
+    p.add_argument("--worker-stagger",type=float,default=5.0,help="seconds between worker startups to avoid Vulkan GPU contention")
     args=p.parse_args(); collect_data(args)
 
 if __name__=="__main__": main()
