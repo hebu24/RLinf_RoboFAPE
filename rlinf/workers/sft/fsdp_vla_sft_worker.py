@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import os
 from typing import Any
 
@@ -103,6 +104,36 @@ class FSDPVlaSftWorker(FSDPSftWorker):
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         super().save_checkpoint(save_path, step)
+
+        # OpenPI checkpoints need norm_stats.json colocated with model weights so
+        # downstream rollout/eval can load it via load_norm_stats(ckpt_dir, asset_id).
+        # FSDP only shards model/optimizer state, so copy norm_stats.json from the
+        # base model directory into the checkpoint.
+        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.OPENPI:
+            if self._rank == 0:
+                import glob
+                import shutil
+
+                asset_id = getattr(self.data_config, "asset_id", None)
+                model_path = self.cfg.actor.model.model_path
+                src_norm_stats = None
+                if asset_id is not None:
+                    candidate = os.path.join(model_path, asset_id, "norm_stats.json")
+                    if os.path.exists(candidate):
+                        src_norm_stats = candidate
+                if src_norm_stats is None:
+                    matches = sorted(glob.glob(os.path.join(model_path, "**", "norm_stats.json"), recursive=True))
+                    if matches:
+                        src_norm_stats = matches[0]
+                if src_norm_stats is not None and asset_id is not None:
+                    dst_dir = os.path.join(save_path, asset_id)
+                    os.makedirs(dst_dir, exist_ok=True)
+                    dst_norm_stats = os.path.join(dst_dir, "norm_stats.json")
+                    shutil.copy2(src_norm_stats, dst_norm_stats)
+                    logging.info(f"Copied norm_stats.json from {src_norm_stats} to {dst_norm_stats}")
+                else:
+                    logging.warning(f"Could not find norm_stats.json under model_path={model_path} with asset_id={asset_id}; rollout/eval will fail to load norm stats.")
+            torch.distributed.barrier()
 
         if isinstance(self.data_loader, StatefulDataLoader):
             state = self.data_loader.state_dict()

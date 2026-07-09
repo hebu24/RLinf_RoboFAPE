@@ -142,11 +142,14 @@ logs/<run>/checkpoints/global_step_50/actor
 ```bash
 cd /home/hebu/code/robofape/RLinf_RoboFAPE
 
+/opt/kairan/envs/rlinf/bin/ray stop
+
 VENV_DIR=/opt/kairan/envs/rlinf \
-CHECKPOINT_PATH=/path/to/checkpoints/global_step_50/actor \
-GPU_IDS=0 \
-NUM_EVAL_EPISODES=25 \
-NUM_ENVS=5 \
+CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260708-20:25:28-peg_insertion_sft_openpi_pi05/peg_insertion_sft/checkpoints/global_step_1000/actor \
+GPU_IDS=4-7 \
+NUM_EVAL_EPISODES=4 \
+NUM_ENVS=4 \
+EVAL_ACTION_SCALE=10.0 \
 SAVE_VIDEO=true \
 bash run_train/eval_checkpoint/run_peginsertion.sh
 ```

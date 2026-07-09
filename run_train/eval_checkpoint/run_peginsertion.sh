@@ -27,6 +27,7 @@ OBS_MODE="${OBS_MODE:-}"
 CONTROL_MODE="${CONTROL_MODE:-}"
 SIM_BACKEND="${SIM_BACKEND:-}"
 INIT_PARAMS_JSON="${INIT_PARAMS_JSON:-{}}"
+EVAL_ACTION_SCALE="${EVAL_ACTION_SCALE:-1.0}"
 
 PYTHON_BIN="${VENV_DIR}/bin/python"
 RAY_BIN="${VENV_DIR}/bin/ray"
@@ -49,6 +50,9 @@ export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
 export HYDRA_FULL_ERROR=1
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
+
+# Raise fd limit so raylet can manage many worker connections on multi-GPU runs.
+ulimit -n 1048576 2>/dev/null || true
 
 # RLinf placement uses physical GPU IDs, so Ray must discover all GPUs.
 unset CUDA_VISIBLE_DEVICES
@@ -76,6 +80,7 @@ CMD=(
   --seed "${SEED}"
   --gpu-ids "${GPU_IDS}"
   --init-params-json "${INIT_PARAMS_JSON}"
+  --action-scale "${EVAL_ACTION_SCALE}"
 )
 
 [[ -n "${OBS_MODE}" ]] && CMD+=(--obs-mode "${OBS_MODE}")

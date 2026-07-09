@@ -54,6 +54,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--control-mode")
     parser.add_argument("--sim-backend")
     parser.add_argument("--init-params-json", default="{}")
+    parser.add_argument("--action-scale", type=float, default=1.0)
     parser.add_argument(
         "--save-video", action=argparse.BooleanOptionalAction, default=True
     )
@@ -141,6 +142,7 @@ def build_config(args: argparse.Namespace, hydra_overrides: list[str]) -> DictCo
         cfg.env.eval.seed = args.seed
         cfg.env.eval.max_episode_steps = args.max_episode_steps
         cfg.env.eval.max_steps_per_rollout_epoch = args.max_episode_steps
+        cfg.env.eval.action_scale = args.action_scale
         cfg.env.eval.video_cfg.save_video = args.save_video
         cfg.env.eval.video_cfg.video_base_dir = str(
             Path(args.log_dir).expanduser().resolve() / "video" / "eval"

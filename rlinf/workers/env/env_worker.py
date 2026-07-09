@@ -472,6 +472,7 @@ class EnvWorker(Worker):
             model_type=self.model_cfg.model_type,
             num_action_chunks=self.model_cfg.num_action_chunks,
             action_dim=self.model_cfg.action_dim,
+            action_scale=self.cfg.env.eval.get("action_scale", 1.0),
             policy=self.model_cfg.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
         )

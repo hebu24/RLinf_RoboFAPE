@@ -191,7 +191,7 @@ class ManiskillEnv(gym.Env):
                 )
                 return {
                     "main_images": main_images,
-                    "extra_view_images": extra_view_images,
+                    "extra_view_images": None,
                     "wrist_images": None,
                     "states": state,
                     "task_descriptions": self.instruction,
@@ -424,7 +424,8 @@ class ManiskillEnv(gym.Env):
 
     # render utils
     def capture_image(self, infos=None):
-        img = self.env.render()
+        raw_obs = self.env.unwrapped.get_obs()
+        img = raw_obs["sensor_data"]["base_camera"]["rgb"]
         img = common.to_numpy(img)
         if len(img.shape) == 3:
             img = img[None]

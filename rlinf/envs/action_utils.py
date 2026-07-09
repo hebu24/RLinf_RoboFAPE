@@ -26,10 +26,14 @@ def prepare_actions_for_maniskill(
     action_scale,
     policy,
 ) -> torch.Tensor:
-    if "panda" in policy:
-        return raw_chunk_actions
     # TODO only suitable for action_dim = 7
     reshaped_actions = raw_chunk_actions.reshape(-1, action_dim)
+    if "panda" in policy:
+        chunk_actions = reshaped_actions.copy()
+        chunk_actions[:, :6] *= action_scale
+        return torch.tensor(chunk_actions, dtype=torch.float32).cuda().reshape(
+            -1, num_action_chunks, action_dim
+        )
     batch_size = reshaped_actions.shape[0]
     raw_actions = {
         "world_vector": np.array(reshaped_actions[:, :3]),
