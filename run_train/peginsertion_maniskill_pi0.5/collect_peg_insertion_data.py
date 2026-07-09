@@ -176,12 +176,22 @@ def _collect_episodes(num_traj, base_seed, writer, progress_prefix="", gpu_id=0)
                 er=env.unwrapped.evaluate(); success=bool(er["success"].item())
             if not success:
                 if rv!=-1: fsucc+=1
-                seed+=1; recorder.stop()
-                continue
+                seed+=1; recorder.stop(); continue
         except Exception as e:
-            print(f"{progress_prefix}Error seed={seed}: {e}"); traceback.print_exc(); fmp+=1; seed+=1; recorder.stop()
+            errstr=str(e)
+            print(f"{progress_prefix}Error seed={seed}: {e}")
+            if "ErrorDeviceLost" in errstr or "vk" in errstr.lower():
+                # Vulkan GPU device lost (runtime contention): recreate env and retry same seed
+                traceback.print_exc()
+                try: env.close()
+                except: pass
+                print(f"{progress_prefix}Recreating env on gpu{gpu_id} after Vulkan error...")
+                time.sleep(5.0)
+                env=_make_env(gpu_id=gpu_id); recorder=ObservationRecorder(env)
+                recorder.stop()
+                continue
+            traceback.print_exc(); fmp+=1; seed+=1; recorder.stop()
             continue
-        recorder.stop()
         records=recorder.records
         if not records:
             print(f"{progress_prefix}No records seed={seed}"); seed+=1; continue
@@ -276,9 +286,19 @@ def collect_data(args):
     gpu_ids=[int(x) for x in args.gpu_ids.split(",") if x.strip()!=""]
     ng=len(gpu_ids)
     stagger=args.worker_stagger
+    # Per-GPU startup counter: workers on DIFFERENT gpus start simultaneously,
+    # workers on the SAME gpu stagger to avoid Vulkan init contention.
+    gpu_counter={g:0 for g in gpu_ids}
+    worker_args=[]
+    for i in range(nw):
+        g=gpu_ids[i%ng]
+        delay=gpu_counter[g]*stagger
+        gpu_counter[g]+=1
+        worker_args.append((i,counts[i],seeds[i],shard_dirs[i],g,delay))
+    print(f"Launching {nw} workers across {ng} GPU(s) {gpu_ids} (stagger={stagger}s per-GPU)")
     ctx=mp.get_context("fork")
     with ctx.Pool(nw) as pool:
-        results=pool.starmap(_collect_worker,[(i,counts[i],seeds[i],shard_dirs[i],gpu_ids[i%ng],i*stagger) for i in range(nw)])
+        results=pool.starmap(_collect_worker,worker_args)
     el=time.time()-t0
     total_p=sum(r[2] for r in results); total_a=sum(r[3] for r in results)
     sr=f"{total_p/total_a:.1%}" if total_a else "n/a"

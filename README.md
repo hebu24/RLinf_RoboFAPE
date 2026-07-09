@@ -3,10 +3,10 @@
 cd /opt/yingxi/RLinf_RoboFAPE
 
 /opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/collect_peg_insertion_data.py \
-  --num-traj 2500 \
+  --num-traj 6400 \
   --output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical \
   --seed 0 \
-  --num-workers 4 \
+  --num-workers 128 \
   --gpu-ids 4,5,6,7 \
   --worker-stagger 5.0
 ```
