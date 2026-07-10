@@ -22,3 +22,4 @@ PKG-INFO
 *.egg-info/
 .claude/settings.json
 run_train/peginsertion_maniskill_pi0.5/data/
+ray_tmp/*

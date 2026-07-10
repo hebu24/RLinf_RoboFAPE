@@ -7,7 +7,7 @@ cd /opt/yingxi/RLinf_RoboFAPE
   --output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_3200 \
   --seed 0 \
   --num-workers 32 \
-  --gpu-ids 4,5,6,7 \
+  --gpu-ids 0,1,2,3 \
   --worker-stagger 5.0
 ```
 
