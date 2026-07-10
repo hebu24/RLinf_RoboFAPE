@@ -53,6 +53,7 @@ from rlinf.models.embodiment.openpi.dataconfig.libero_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.maniskill_dataconfig import (
     LeRobotManiSkillDataConfig,
     LeRobotManiSkillPegInsertionDataConfig,
+    LeRobotManiSkillPegInsertionWristDataConfig,
 )
 from rlinf.models.embodiment.openpi.dataconfig.metaworld_dataconfig import (
     LeRobotMetaworldDataConfig,
@@ -157,6 +158,30 @@ _CONFIGS = [
             pi05=True, action_horizon=10, discrete_state_input=False
         ),
         data=LeRobotManiSkillPegInsertionDataConfig(
+            repo_id="physical-intelligence/maniskill",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_maniskill/assets"),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        seed=0,
+        batch_size=256,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=8,
+        num_train_steps=5_000,
+        log_interval=5,
+        save_interval=250,
+    ),
+    TrainConfig(
+        name="pi05_maniskill_peg_insertion_wrist",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False
+        ),
+        data=LeRobotManiSkillPegInsertionWristDataConfig(
             repo_id="physical-intelligence/maniskill",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_maniskill/assets"),

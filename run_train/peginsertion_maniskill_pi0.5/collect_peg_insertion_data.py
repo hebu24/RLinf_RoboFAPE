@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse,json,os,os.path as osp,sys,time,traceback,multiprocessing as mp
+import argparse,json,os,os.path as osp,sys,time,traceback,shutil,multiprocessing as mp
 from pathlib import Path
 from typing import List
 import cv2,gymnasium as gym,numpy as np,pandas as pd,torch
@@ -20,11 +20,14 @@ import types as _types; _ts=_types.ModuleType("tasks"); _ts.task_PegInsertionVer
 from solutions.solve_PegInsertionVertical import solve_peginsertionvertical
 
 TASK="insert the blue peg vertically into the orange hole"
+TASK_DESCRIPTIONS = json.load(
+    open("/home/gpu4/yingxi/RoboFPE/mani_envs/data_collection/task_descriptions/peg_insertion_vertical.json")
+)["PegInsertionVertical-v1"]
 FPS=20;IW=224;IH=224;RW=640;RH=480
 SDIM=8;ADIM=7;CSIZE=1000
 def _compute_stats(df):
-    s={}; a=np.stack(df["action"].values)
-    s["action"]={"mean":a.mean(0).tolist(),"std":a.std(0).tolist(),"max":a.max(0).tolist(),"min":a.min(0).tolist(),"count":[len(a)]}
+    s={}; a=np.stack(df["actions"].values if "actions" in df.columns else df["action"].values)
+    s["actions"]={"mean":a.mean(0).tolist(),"std":a.std(0).tolist(),"max":a.max(0).tolist(),"min":a.min(0).tolist(),"count":[len(a)]}
     st=np.stack(df["observation.state"].values)
     s["observation.state"]={"mean":st.mean(0).tolist(),"std":st.std(0).tolist(),"max":st.max(0).tolist(),"min":st.min(0).tolist(),"count":[len(st)]}
     for fld in ["timestamp","frame_index","episode_index","index","task_index"]:
@@ -33,7 +36,7 @@ def _compute_stats(df):
     return s
 
 def _build_features():
-    feat={"action":{"dtype":"float32","shape":[ADIM],"names":[f"action_{i}" for i in range(ADIM)],"fps":float(FPS)},"observation.state":{"dtype":"float32","shape":[SDIM],"names":[f"joint_{i}" for i in range(SDIM)],"fps":float(FPS)},"timestamp":{"dtype":"float32","shape":[1],"names":None,"fps":float(FPS)},"frame_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"episode_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task":{"dtype":"string","shape":[1],"names":None,"fps":float(FPS)}}
+    feat={"actions":{"dtype":"float32","shape":[ADIM],"names":[f"action_{i}" for i in range(ADIM)],"fps":float(FPS)},"observation.state":{"dtype":"float32","shape":[SDIM],"names":[f"joint_{i}" for i in range(SDIM)],"fps":float(FPS)},"timestamp":{"dtype":"float32","shape":[1],"names":None,"fps":float(FPS)},"frame_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"episode_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task":{"dtype":"string","shape":[1],"names":None,"fps":float(FPS)}}
     for c,h,w in [("top",IH,IW),("wrist",IH,IW),("render",RH,RW)]:
         feat[f"observation.images.{c}"]={"dtype":"video","shape":[h,w,3],"names":["height","width","channels"],"info":{"video.fps":float(FPS),"video.height":h,"video.width":w,"video.channels":3,"video.codec":"mp4v","video.pix_fmt":"yuv420p","video.is_depth_map":False,"has_audio":False}}
     return feat
@@ -93,19 +96,39 @@ def compute_ee_delta_actions(records):
 
 class LeRobotWriter:
     def __init__(self, outdir, task=TASK):
-        self.od=osp.abspath(outdir); self.task=task
+        self.od=osp.abspath(outdir)
         self.eps=[]; self.dfs=[]; self.gi=0
+        # 多 task 支持
+        self.task_to_idx={}; self.all_tasks=[]
         os.makedirs(self.od,exist_ok=True)
         os.makedirs(osp.join(self.od,"data","chunk-000"),exist_ok=True)
         os.makedirs(osp.join(self.od,"meta","episodes","chunk-000"),exist_ok=True)
         for c in ["top","wrist","render"]:
             os.makedirs(osp.join(self.od,"videos",f"observation.images.{c}","chunk-000"),exist_ok=True)
+
+    def _get_task_idx(self, task):
+        if task not in self.task_to_idx:
+            self.task_to_idx[task]=len(self.all_tasks)
+            self.all_tasks.append(task)
+        return self.task_to_idx[task]
+
+    def add_episode(self,acts,states,bf,wf,rf):
+        import random as _r
+        task=_r.choice(TASK_DESCRIPTIONS)
+        ti=self._get_task_idx(task)
+        ei=len(self.eps); T=len(acts); ts=np.arange(T,dtype=np.float32)/FPS
+        df=pd.DataFrame({"action":[r.tolist() for r in acts],"observation.state":[r.tolist() for r in states],"timestamp":ts,"frame_index":np.arange(T,dtype=np.int64),"episode_index":np.full(T,ei,dtype=np.int64),"index":np.arange(self.gi,self.gi+T,dtype=np.int64),"task_index":np.full(T,ti,dtype=np.int64),"task":[task]*T})
+        self.dfs.append(df)
+        self.eps.append({"episode_index":ei,"data/chunk_index":0,"data/file_index":0,"dataset_from_index":self.gi,"dataset_to_index":self.gi+T,"tasks":[task],"length":T})
+        self.gi+=T; self._wv(bf,ei,"top"); self._wv(wf,ei,"wrist"); self._wv(rf,ei,"render"); return ei
+
     def add_episode(self,acts,states,bf,wf,rf):
         ei=len(self.eps); T=len(acts); ts=np.arange(T,dtype=np.float32)/FPS
-        df=pd.DataFrame({"action":[r.tolist() for r in acts],"observation.state":[r.tolist() for r in states],"timestamp":ts,"frame_index":np.arange(T,dtype=np.int64),"episode_index":np.full(T,ei,dtype=np.int64),"index":np.arange(self.gi,self.gi+T,dtype=np.int64),"task_index":np.zeros(T,dtype=np.int64),"task":[self.task]*T})
+        df=pd.DataFrame({"actions":[r.tolist() for r in acts],"observation.state":[r.tolist() for r in states],"timestamp":ts,"frame_index":np.arange(T,dtype=np.int64),"episode_index":np.full(T,ei,dtype=np.int64),"index":np.arange(self.gi,self.gi+T,dtype=np.int64),"task_index":np.zeros(T,dtype=np.int64),"task":[self.task]*T})
         self.dfs.append(df)
         self.eps.append({"episode_index":ei,"data/chunk_index":0,"data/file_index":0,"dataset_from_index":self.gi,"dataset_to_index":self.gi+T,"tasks":[self.task],"length":T})
         self.gi+=T; self._wv(bf,ei,"top"); self._wv(wf,ei,"wrist"); self._wv(rf,ei,"render"); return ei
+
     def _wv(self,frames,ei,cn):
         vp=osp.join(self.od,"videos",f"observation.images.{cn}","chunk-000",f"file-{ei:03d}.mp4")
         h,w=frames.shape[1],frames.shape[2]; fc=cv2.VideoWriter_fourcc(*"mp4v")
@@ -117,7 +140,7 @@ class LeRobotWriter:
         if not self.eps: print("WARNING: no episodes"); return
         import pyarrow as pa, pyarrow.parquet as pq
         cdf=pd.concat(self.dfs,ignore_index=True); cdf["task"]=cdf["task"].astype("string")
-        sch=pa.schema([pa.field("action",pa.list_(pa.float32())),pa.field("observation.state",pa.list_(pa.float32())),pa.field("timestamp",pa.float32()),pa.field("frame_index",pa.int64()),pa.field("episode_index",pa.int64()),pa.field("index",pa.int64()),pa.field("task_index",pa.int64()),pa.field("task",pa.string())])
+        sch=pa.schema([pa.field("actions",pa.list_(pa.float32())),pa.field("observation.state",pa.list_(pa.float32())),pa.field("timestamp",pa.float32()),pa.field("frame_index",pa.int64()),pa.field("episode_index",pa.int64()),pa.field("index",pa.int64()),pa.field("task_index",pa.int64()),pa.field("task",pa.string())])
         pq.write_table(pa.Table.from_pandas(cdf,schema=sch),osp.join(self.od,"data","chunk-000","file-000.parquet"))
         edf=pd.DataFrame(self.eps)
         pq.write_table(pa.Table.from_pandas(edf),osp.join(self.od,"meta","episodes","chunk-000","file-000.parquet"))
@@ -126,7 +149,7 @@ class LeRobotWriter:
         stats=_compute_stats(cdf)
         with open(osp.join(self.od,"meta","stats.json"),"w") as f: json.dump(stats,f,indent=2)
         TF=len(cdf); TE=len(self.eps)
-        feat={"action":{"dtype":"float32","shape":[ADIM],"names":[f"action_{i}" for i in range(ADIM)],"fps":float(FPS)},"observation.state":{"dtype":"float32","shape":[SDIM],"names":[f"joint_{i}" for i in range(SDIM)],"fps":float(FPS)},"timestamp":{"dtype":"float32","shape":[1],"names":None,"fps":float(FPS)},"frame_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"episode_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task":{"dtype":"string","shape":[1],"names":None,"fps":float(FPS)}}
+        feat={"actions":{"dtype":"float32","shape":[ADIM],"names":[f"action_{i}" for i in range(ADIM)],"fps":float(FPS)},"observation.state":{"dtype":"float32","shape":[SDIM],"names":[f"joint_{i}" for i in range(SDIM)],"fps":float(FPS)},"timestamp":{"dtype":"float32","shape":[1],"names":None,"fps":float(FPS)},"frame_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"episode_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task_index":{"dtype":"int64","shape":[1],"names":None,"fps":float(FPS)},"task":{"dtype":"string","shape":[1],"names":None,"fps":float(FPS)}}
         for c,h,w in [("top",IH,IW),("wrist",IH,IW),("render",RH,RW)]:
             feat[f"observation.images.{c}"]={"dtype":"video","shape":[h,w,3],"names":["height","width","channels"],"info":{"video.fps":float(FPS),"video.height":h,"video.width":w,"video.channels":3,"video.codec":"mp4v","video.pix_fmt":"yuv420p","video.is_depth_map":False,"has_audio":False}}
         dsz=sum(f.stat().st_size for f in Path(self.od).rglob("data/*.parquet"))
@@ -134,8 +157,8 @@ class LeRobotWriter:
         with open(osp.join(self.od,"meta","info.json"),"w") as f: json.dump(info,f,indent=2)
         print(f"Dataset: {TE} eps, {TF} frames -> {self.od}")
     def _stats(self,df):
-        s={}; a=np.stack(df["action"].values)
-        s["action"]={"mean":a.mean(0).tolist(),"std":a.std(0).tolist(),"max":a.max(0).tolist(),"min":a.min(0).tolist(),"count":[len(a)]}
+        s={}; a=np.stack(df["actions"].values if "actions" in df.columns else df["action"].values)
+        s["actions"]={"mean":a.mean(0).tolist(),"std":a.std(0).tolist(),"max":a.max(0).tolist(),"min":a.min(0).tolist(),"count":[len(a)]}
         st=np.stack(df["observation.state"].values)
         s["observation.state"]={"mean":st.mean(0).tolist(),"std":st.std(0).tolist(),"max":st.max(0).tolist(),"min":st.min(0).tolist(),"count":[len(st)]}
         for fld in ["timestamp","frame_index","episode_index","index","task_index"]:
@@ -219,57 +242,76 @@ def _collect_worker(worker_id, num_traj, base_seed, shard_dir, gpu_id=0, startup
     return worker_id, shard_dir, passed, attempts
 
 def merge_shards(final_dir, shard_dirs):
+    import pyarrow as pa, pyarrow.parquet as pq
     final_dir=osp.abspath(final_dir)
     os.makedirs(final_dir,exist_ok=True)
-    # Clean stale files from previous runs to avoid video/episode count mismatch
     for sub in ["data","meta","videos"]:
         p=osp.join(final_dir,sub)
         if osp.exists(p): shutil.rmtree(p)
-    os.makedirs(osp.join(final_dir,"data","chunk-000"),exist_ok=True)
-    os.makedirs(osp.join(final_dir,"meta","episodes","chunk-000"),exist_ok=True)
-    for c in ["top","wrist","render"]:
-        os.makedirs(osp.join(final_dir,"videos",f"observation.images.{c}","chunk-000"),exist_ok=True)
-    all_dfs=[]; global_epi=0; global_idx=0; eps_meta=[]
+    os.makedirs(osp.join(final_dir,"meta"),exist_ok=True)
+    all_dfs=[]; global_epi=0; global_idx=0
+    global_task_to_idx={}; global_all_tasks=[]
     for sd in shard_dirs:
         dp=osp.join(sd,"data","chunk-000","file-000.parquet")
         if not osp.exists(dp):
             print(f"merge: skip empty shard {sd}"); continue
         df=pd.read_parquet(dp)
+        if "action" in df.columns and "actions" not in df.columns:
+            df=df.rename(columns={"action":"actions"})
         n_eps=int(df["episode_index"].max())+1 if len(df) else 0
         if n_eps==0: continue
         for li in range(n_eps):
-            gi=global_epi+li
+            gi=global_epi+li; chunk=gi//CSIZE
             for c in ["top","wrist","render"]:
                 src=osp.join(sd,"videos",f"observation.images.{c}","chunk-000",f"file-{li:03d}.mp4")
-                dst=osp.join(final_dir,"videos",f"observation.images.{c}","chunk-000",f"file-{gi:03d}.mp4")
+                vdir=osp.join(final_dir,"videos",f"chunk-{chunk:03d}",f"observation.images.{c}")
+                os.makedirs(vdir,exist_ok=True)
+                dst=osp.join(vdir,f"episode_{gi:06d}.mp4")
                 if osp.exists(src): shutil.copy2(src,dst)
         sub=df.copy()
         sub["episode_index"]=sub["episode_index"]-int(sub["episode_index"].min())+global_epi
         sub["index"]=np.arange(global_idx,global_idx+len(sub),dtype=np.int64)
+        # 重映射 task_index 到全局
+        for old_ti in sub["task_index"].unique():
+            mask=sub["task_index"]==old_ti
+            task_str=sub.loc[mask,"task"].iloc[0]
+            if task_str not in global_task_to_idx:
+                global_task_to_idx[task_str]=len(global_all_tasks)
+                global_all_tasks.append(task_str)
+            sub.loc[mask,"task_index"]=global_task_to_idx[task_str]
         all_dfs.append(sub)
-        for li in range(n_eps):
-            sub_e=sub[sub["episode_index"]==global_epi+li]
-            T=len(sub_e)
-            eps_meta.append({"episode_index":global_epi+li,"data/chunk_index":0,"data/file_index":0,"dataset_from_index":int(sub_e["index"].min()),"dataset_to_index":int(sub_e["index"].max())+1,"tasks":[TASK],"length":T})
         global_epi+=n_eps; global_idx+=len(sub)
     if not all_dfs:
         print("merge: no episodes found in any shard"); return
     cdf=pd.concat(all_dfs,ignore_index=True); cdf["task"]=cdf["task"].astype("string")
-    sch=pa.schema([pa.field("action",pa.list_(pa.float32())),pa.field("observation.state",pa.list_(pa.float32())),pa.field("timestamp",pa.float32()),pa.field("frame_index",pa.int64()),pa.field("episode_index",pa.int64()),pa.field("index",pa.int64()),pa.field("task_index",pa.int64()),pa.field("task",pa.string())])
-    pq.write_table(pa.Table.from_pandas(cdf,schema=sch),osp.join(final_dir,"data","chunk-000","file-000.parquet"))
-    edf=pd.DataFrame(eps_meta)
-    pq.write_table(pa.Table.from_pandas(edf),osp.join(final_dir,"meta","episodes","chunk-000","file-000.parquet"))
-    tdf=pd.DataFrame({"task_index":[0]},index=[TASK]); tdf.index.name=None
-    tdf.to_parquet(osp.join(final_dir,"meta","tasks.parquet"),index=True)
+    n_tasks=len(global_all_tasks)
+    sch=pa.schema([pa.field("actions",pa.list_(pa.float32())),pa.field("observation.state",pa.list_(pa.float32())),pa.field("observation.state_tcp",pa.list_(pa.float32())),pa.field("timestamp",pa.float32()),pa.field("frame_index",pa.int64()),pa.field("episode_index",pa.int64()),pa.field("index",pa.int64()),pa.field("task_index",pa.int64()),pa.field("task",pa.string())])
+    ep_ids=sorted(cdf["episode_index"].unique()); total_chunks=0
+    for eid in ep_ids:
+        eid=int(eid); chunk=eid//CSIZE
+        if chunk+1>total_chunks: total_chunks=chunk+1
+        cdir=osp.join(final_dir,"data",f"chunk-{chunk:03d}"); os.makedirs(cdir,exist_ok=True)
+        ep_df=cdf[cdf["episode_index"]==eid].reset_index(drop=True)
+        pq.write_table(pa.Table.from_pandas(ep_df,schema=sch,preserve_index=False),osp.join(cdir,f"episode_{eid:06d}.parquet"))
+
+    nl=chr(10)
+    with open(osp.join(self.od,"meta","tasks.jsonl"),"w") as f:
+        for i,task in enumerate(self.all_tasks):
+            f.write(json.dumps({"task_index":i,"task":task})+nl)
+    with open(osp.join(final_dir,"meta","episodes.jsonl"),"w") as f:
+        for eid in ep_ids:
+            ep_data=cdf[cdf["episode_index"]==eid]
+            T=len(ep_data); task=ep_data["task"].iloc[0]
+            f.write(json.dumps({"episode_index":int(eid),"tasks":[task],"length":T})+nl)
     stats=_compute_stats(cdf)
     with open(osp.join(final_dir,"meta","stats.json"),"w") as f: json.dump(stats,f,indent=2)
-    TF=len(cdf); TE=global_epi
+    TF=len(cdf); TE=int(global_epi); total_chunks=int(total_chunks); n_tasks=int(n_tasks)
     feat=_build_features()
-    dsz=sum(f.stat().st_size for f in Path(final_dir).rglob("data/*.parquet"))
-    info={"codebase_version":"v3.0","robot_type":"panda_wristcam","total_episodes":TE,"total_frames":TF,"total_tasks":1,"total_videos":TE*3,"total_chunks":1,"chunks_size":CSIZE,"fps":FPS,"data_files_size_in_mb":int(dsz/(1024*1024)),"splits":{"train":f"0:{TE}"},"data_path":"data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet","video_path":"videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4","features":feat}
+    dsz=sum(f.stat().st_size for f in Path(final_dir).rglob("data/**/*.parquet"))
+    info={"codebase_version":"v2.0","robot_type":"panda_wristcam","total_episodes":TE,"total_frames":TF,"total_tasks":n_tasks,"total_videos":TE*3,"total_chunks":total_chunks,"chunks_size":CSIZE,"fps":FPS,"data_files_size_in_mb":int(dsz/(1024*1024)),"splits":{"train":f"0:{TE}"},"data_path":"data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet","video_path":"videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4","features":feat}
     with open(osp.join(final_dir,"meta","info.json"),"w") as f: json.dump(info,f,indent=2)
-    print(f"Merged dataset: {TE} eps, {TF} frames -> {final_dir}")
-
+    print(f"Merged dataset: {TE} eps, {TF} frames, {n_tasks} tasks -> {final_dir}")
+    
 def collect_data(args):
     outdir=osp.abspath(args.output_dir)
     if args.num_workers<=1:
@@ -285,7 +327,7 @@ def collect_data(args):
     counts=[per+(1 if i<rem else 0) for i in range(nw)]
     shard_root=osp.join(outdir,"_shards")
     if osp.exists(shard_root):
-        import shutil; shutil.rmtree(shard_root)
+        shutil.rmtree(shard_root)
     os.makedirs(shard_root,exist_ok=True)
     shard_dirs=[osp.join(shard_root,f"shard_{i:03d}") for i in range(nw)]
     seeds=[args.seed+i*100000 for i in range(nw)]

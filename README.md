@@ -36,7 +36,7 @@ cd /home/hebu/code/robofape/RLinf_RoboFAPE
 /opt/kairan/envs/rlinf/bin/ray stop
 
 VENV_DIR=/opt/kairan/envs/rlinf \
-CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260709-15:07:21-peg_insertion_sft_openpi_pi05/peg_insertion_sft/checkpoints/global_step_8000/actor \
+CHECKPOINT_PATH=/opt/yingxi/rlinf/RLinf-Pi05-ManiSkill-25Main-RL-FlowSDE/actor \
 GPU_IDS=0-3 \
 NUM_EVAL_EPISODES=4 \
 NUM_ENVS=4 \

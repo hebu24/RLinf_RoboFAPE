@@ -104,6 +104,61 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotManiSkillPegInsertionWristDataConfig(LeRobotManiSkillDataConfig):
+    """DataConfig for PegInsertionVertical finetuning with wrist camera.
+
+    Differences from LeRobotManiSkillPegInsertionDataConfig:
+    - image: base (observation.images.top) + wrist (observation.images.wrist).
+      The wrist image is repacked to ``observation/wrist_image`` so that
+      ``ManiSkillInputs`` maps it to ``left_wrist_0_rgb`` and enables the
+      corresponding image mask.
+    - state: uses observation.state_tcp (8-dim TCP proprio).
+    - action: already delta, so extra_delta_transform stays False (inherited).
+    """
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.top",
+                        "observation/wrist_image": "observation.images.wrist",
+                        "observation/state": "observation.state_tcp",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                maniskill_policy.ManiSkillInputs(model_type=model_config.model_type)
+            ],
+            outputs=[maniskill_policy.ManiSkillOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotManiSkillPegInsertionDataConfig(LeRobotManiSkillDataConfig):
     """DataConfig for PegInsertionVertical finetuning.
 

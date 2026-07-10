@@ -20,7 +20,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "peg_insertion_sft"
+    experiment_name: "peg_insertion_sft_wrist"
     logger_backends: ["tensorboard"]
 
   max_epochs: -1
@@ -28,8 +28,8 @@ runner:
   val_check_interval: -1
   save_interval: 2000
 
-  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_8000'. If not None, it will be used to resume training.
-  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
+  resume_dir: null
+  ckpt_path: null
 
 data:
   train_data_paths: "/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_3200"
@@ -49,8 +49,8 @@ actor:
     action_dim: 7
     add_value_head: False
     openpi:
-      config_name: "pi05_maniskill_peg_insertion"
-      num_images_in_input: 1
+      config_name: "pi05_maniskill_peg_insertion_wrist"
+      num_images_in_input: 2
       train_expert_only: True
       detach_critic_input: True
 
@@ -69,7 +69,7 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "no_shard"   
+    sharding_strategy: "full_shard"
     use_orig_params: False
     gradient_checkpointing: False
     mixed_precision:

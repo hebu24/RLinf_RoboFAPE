@@ -36,7 +36,7 @@ def process_episode(uw, ep_df):
     states_tcp = np.zeros((T, SDIM_TCP), dtype=np.float32)
     poses_pos = np.zeros((T, 3), dtype=np.float64)
     poses_R = np.zeros((T, 3, 3), dtype=np.float64)
-    orig_actions = np.stack(ep_df["action"].values)
+    orig_actions = np.stack(ep_df["actions"] if "actions" in ep_df.columns else ep_df["action"].values)
     for t in range(T):
         qpos8 = np.asarray(ep_df["observation.state"].iloc[t], dtype=np.float32)
         proprio, Tmat = fk_proprio(uw, qpos8)
@@ -60,8 +60,20 @@ def main():
     p.add_argument("--data-dir", default="/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical")
     args = p.parse_args()
     dd = osp.abspath(args.data_dir)
+    import glob
     pq_path = osp.join(dd, "data", "chunk-000", "file-000.parquet")
-    df = pd.read_parquet(pq_path)
+    if osp.exists(pq_path):
+        df = pd.read_parquet(pq_path)
+    else:
+        pq_files = sorted(glob.glob(osp.join(dd, "data", "chunk-*", "episode_*.parquet")))
+        df = pd.concat([pd.read_parquet(f) for f in pq_files], ignore_index=True)
+    import glob
+    pq_path = osp.join(dd, "data", "chunk-000", "file-000.parquet")
+    if osp.exists(pq_path):
+        df = pd.read_parquet(pq_path)
+    else:
+        pq_files = sorted(glob.glob(osp.join(dd, "data", "chunk-*", "episode_*.parquet")))
+        df = pd.concat([pd.read_parquet(f) for f in pq_files], ignore_index=True)
     print(f"Loaded {len(df)} frames, {df[chr(101)+chr(112)+chr(105)+chr(115)+chr(111)+chr(100)+chr(101)+chr(95)+chr(105)+chr(110)+chr(100)+chr(101)+chr(120)].nunique()} episodes")
     env = make_env()
     uw = env.unwrapped
@@ -75,10 +87,10 @@ def main():
         all_actions.extend(acts.tolist())
     env.close()
     df["observation.state_tcp"] = all_state_tcp
-    df["action"] = all_actions
+    df["actions"] = all_actions
     import pyarrow as pa, pyarrow.parquet as pq
     schema = pa.schema([
-        pa.field("action", pa.list_(pa.float32())),
+        pa.field("actions", pa.list_(pa.float32())),
         pa.field("observation.state", pa.list_(pa.float32())),
         pa.field("observation.state_tcp", pa.list_(pa.float32())),
         pa.field("timestamp", pa.float32()),
@@ -88,12 +100,19 @@ def main():
         pa.field("task_index", pa.int64()),
         pa.field("task", pa.string()),
     ])
-    table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
-    pq.write_table(table, pq_path)
+    if osp.exists(pq_path):
+        table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+        pq.write_table(table, pq_path)
+    else:
+        for eid in ep_ids:
+            eid=int(eid); chunk=eid//1000
+            cdir=osp.join(dd,"data",f"chunk-{chunk:03d}"); os.makedirs(cdir,exist_ok=True)
+            ep_df=df[df["episode_index"]==eid].reset_index(drop=True)
+            pq.write_table(pa.Table.from_pandas(ep_df,schema=schema,preserve_index=False),osp.join(cdir,f"episode_{eid:06d}.parquet"))
     stats_path = osp.join(dd, "meta", "stats.json")
     stats = json.load(open(stats_path))
-    a = np.stack(df["action"].values)
-    stats["action"] = {"mean": a.mean(0).tolist(), "std": a.std(0).tolist(), "max": a.max(0).tolist(), "min": a.min(0).tolist(), "count": [len(a)]}
+    a = np.stack(df["actions"].values)
+    stats["actions"] = {"mean": a.mean(0).tolist(), "std": a.std(0).tolist(), "max": a.max(0).tolist(), "min": a.min(0).tolist(), "count": [len(a)]}
     st = np.stack(df["observation.state_tcp"].values)
     stats["observation.state_tcp"] = {"mean": st.mean(0).tolist(), "std": st.std(0).tolist(), "max": st.max(0).tolist(), "min": st.min(0).tolist(), "count": [len(st)]}
     json.dump(stats, open(stats_path, "w"), indent=2)
