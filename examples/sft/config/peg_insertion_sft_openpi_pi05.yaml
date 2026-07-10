@@ -28,6 +28,9 @@ runner:
   val_check_interval: -1
   save_interval: 2000
 
+  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_8000'. If not None, it will be used to resume training.
+  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
+
 data:
   train_data_paths: "/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical"
 

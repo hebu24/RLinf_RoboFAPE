@@ -193,6 +193,7 @@ def _collect_episodes(num_traj, base_seed, writer, progress_prefix="", gpu_id=0)
             traceback.print_exc(); fmp+=1; seed+=1; recorder.stop()
             continue
         records=recorder.records
+        recorder.stop()
         if not records:
             print(f"{progress_prefix}No records seed={seed}"); seed+=1; continue
         acts=compute_ee_delta_actions(records)
@@ -218,9 +219,12 @@ def _collect_worker(worker_id, num_traj, base_seed, shard_dir, gpu_id=0, startup
     return worker_id, shard_dir, passed, attempts
 
 def merge_shards(final_dir, shard_dirs):
-    import shutil, pyarrow as pa, pyarrow.parquet as pq
     final_dir=osp.abspath(final_dir)
     os.makedirs(final_dir,exist_ok=True)
+    # Clean stale files from previous runs to avoid video/episode count mismatch
+    for sub in ["data","meta","videos"]:
+        p=osp.join(final_dir,sub)
+        if osp.exists(p): shutil.rmtree(p)
     os.makedirs(osp.join(final_dir,"data","chunk-000"),exist_ok=True)
     os.makedirs(osp.join(final_dir,"meta","episodes","chunk-000"),exist_ok=True)
     for c in ["top","wrist","render"]:
@@ -279,7 +283,10 @@ def collect_data(args):
     nw=args.num_workers
     per=args.num_traj//nw; rem=args.num_traj%nw
     counts=[per+(1 if i<rem else 0) for i in range(nw)]
-    shard_root=osp.join(outdir,"_shards"); os.makedirs(shard_root,exist_ok=True)
+    shard_root=osp.join(outdir,"_shards")
+    if osp.exists(shard_root):
+        import shutil; shutil.rmtree(shard_root)
+    os.makedirs(shard_root,exist_ok=True)
     shard_dirs=[osp.join(shard_root,f"shard_{i:03d}") for i in range(nw)]
     seeds=[args.seed+i*100000 for i in range(nw)]
     t0=time.time()

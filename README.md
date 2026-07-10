@@ -3,10 +3,10 @@
 cd /opt/yingxi/RLinf_RoboFAPE
 
 /opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/collect_peg_insertion_data.py \
-  --num-traj 6400 \
-  --output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical \
+  --num-traj 3200 \
+  --output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_3200 \
   --seed 0 \
-  --num-workers 128 \
+  --num-workers 32 \
   --gpu-ids 4,5,6,7 \
   --worker-stagger 5.0
 ```
@@ -14,6 +14,9 @@ cd /opt/yingxi/RLinf_RoboFAPE
 ## Finetune SFT
 ```bash
 bash sft_finetune.sh
+
+# Resume training
+RESUME_DIR=/opt/yingxi/RLinf_RoboFAPE/logs/20260709-15:07:21-peg_insertion_sft_openpi_pi05/peg_insertion_sft/checkpoints/global_step_8000 bash sft_finetune.sh
 ```
 
 ## Checkpoint 测试
@@ -33,8 +36,8 @@ cd /home/hebu/code/robofape/RLinf_RoboFAPE
 /opt/kairan/envs/rlinf/bin/ray stop
 
 VENV_DIR=/opt/kairan/envs/rlinf \
-CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260708-20:25:28-peg_insertion_sft_openpi_pi05/peg_insertion_sft/checkpoints/global_step_1000/actor \
-GPU_IDS=4-7 \
+CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260709-15:07:21-peg_insertion_sft_openpi_pi05/peg_insertion_sft/checkpoints/global_step_8000/actor \
+GPU_IDS=0-3 \
 NUM_EVAL_EPISODES=4 \
 NUM_ENVS=4 \
 EVAL_ACTION_SCALE=10.0 \

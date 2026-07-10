@@ -1,5 +1,6 @@
 cd /opt/yingxi/RLinf_RoboFAPE && \
 export PATH=/opt/kairan/envs/rlinf/bin:$PATH && \
-CUDA_VISIBLE_DEVICES=2,5,6,7 bash examples/sft/run_vla_sft.sh \
+export RAY_TMPDIR=/opt/yingxi/RLinf_RoboFAPE/ray_tmp && \
+CUDA_VISIBLE_DEVICES=4,5,6,7 bash examples/sft/run_vla_sft.sh \
   peg_insertion_sft_openpi_pi05 \
-  ${RESUME_DIR:+runner.resume_dir=${RESUME_DIR}}
+  "${RESUME_DIR:+runner.resume_dir=${RESUME_DIR}}"
