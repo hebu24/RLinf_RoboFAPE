@@ -26,6 +26,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from rlinf.config import validate_cfg
 from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
 from rlinf.scheduler import Cluster
+from rlinf.utils.metric_utils import compute_evaluate_metrics
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -55,6 +56,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--sim-backend")
     parser.add_argument("--init-params-json", default="{}")
     parser.add_argument("--action-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--save-episode-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--save-video", action=argparse.BooleanOptionalAction, default=True
     )
@@ -255,7 +261,7 @@ def _json_value(value: Any) -> Any:
     return value
 
 
-def evaluate(cfg: DictConfig) -> dict[str, Any]:
+def _run_eval(cfg: DictConfig) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     cluster = Cluster(cluster_cfg=cfg.cluster)
     placement = HybridComponentPlacement(cfg, cluster)
     rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
@@ -270,12 +276,73 @@ def evaluate(cfg: DictConfig) -> dict[str, Any]:
     )
     runner = EmbodiedEvalRunner(cfg=cfg, rollout=rollout_group, env=env_group)
     runner.init_workers()
-    metrics = {key: _json_value(value) for key, value in runner.evaluate().items()}
+    env_handle = runner.env.evaluate(
+        input_channel=runner.env_channel,
+        rollout_channel=runner.rollout_channel,
+    )
+    rollout_handle = runner.rollout.evaluate(
+        input_channel=runner.rollout_channel,
+        output_channel=runner.env_channel,
+    )
+    env_results = env_handle.wait()
+    env_decoupled_mode = cfg.runner.get("enable_decoupled_mode", False)
+    if not env_decoupled_mode:
+        rollout_handle.wait()
+    eval_metrics_list = [results for results in env_results if results is not None]
+    metrics = {
+        key: _json_value(value)
+        for key, value in compute_evaluate_metrics(eval_metrics_list).items()
+    }
     prefixed_metrics = {f"eval/{key}": value for key, value in metrics.items()}
     runner.logger.info(prefixed_metrics)
     runner.metric_logger.log(step=0, data=prefixed_metrics)
     runner.metric_logger.finish()
+    return metrics, eval_metrics_list
+
+
+def _serialize_episode_metrics(
+    eval_metrics_list: list[dict[str, Any]],
+) -> dict[str, Any]:
+    episode_metrics: dict[str, Any] = {}
+    for key in ("success_once", "return", "reward", "max_reward", "episode_len"):
+        shards = [metrics[key] for metrics in eval_metrics_list if key in metrics]
+        if not shards:
+            continue
+        values = []
+        for shard in shards:
+            if hasattr(shard, "detach"):
+                shard = shard.detach().cpu()
+            if hasattr(shard, "reshape"):
+                shard = shard.reshape(-1)
+            if hasattr(shard, "tolist"):
+                values.extend(shard.tolist())
+            else:
+                values.append(shard)
+        episode_metrics[key] = values
+    episode_metrics["num_trajectories"] = (
+        len(episode_metrics.get("return", []))
+        or len(episode_metrics.get("reward", []))
+        or len(episode_metrics.get("success_once", []))
+    )
+    return episode_metrics
+
+
+def evaluate(cfg: DictConfig) -> dict[str, Any]:
+    metrics, _ = _run_eval(cfg)
     return metrics
+
+
+def save_episode_metrics(
+    eval_metrics_list: list[dict[str, Any]],
+    log_dir: Path,
+) -> Path:
+    episode_metrics = _serialize_episode_metrics(eval_metrics_list)
+    episode_metrics_path = log_dir / "trajectory_metrics.json"
+    episode_metrics_path.write_text(
+        json.dumps(episode_metrics, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return episode_metrics_path
 
 
 def main() -> None:
@@ -284,7 +351,12 @@ def main() -> None:
     resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
     print(json.dumps(resolved_cfg, indent=2))
 
-    metrics = evaluate(cfg)
+    metrics, eval_metrics_list = _run_eval(cfg)
+    if args.save_episode_metrics:
+        episode_metrics_path = save_episode_metrics(
+            eval_metrics_list, Path(cfg.runner.logger.log_path)
+        )
+        print(f"Episode metrics: {episode_metrics_path}")
     summary = {
         "checkpoint_path": str(Path(args.checkpoint_path).expanduser().resolve()),
         "task_id": args.task_id,

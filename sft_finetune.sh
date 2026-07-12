@@ -4,7 +4,7 @@ set -euo pipefail
 cd /opt/yingxi/RLinf_RoboFAPE
 
 export PATH=/opt/kairan/envs/rlinf/bin:$PATH
-export RAY_TMPDIR=/opt/yingxi/RLinf_RoboFAPE/ray_tmp
+export RAY_TMPDIR=/tmp/ray_sft
 export CUDA_LAUNCH_BLOCKING=1
 
 DATA_DIR="${DATA_DIR:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200}"

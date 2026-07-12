@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "peginsertion_maniskill_pi0.5_sft_eval"
+    experiment_name: "peginsertion_maniskill_pi0.5_sft_eval_wrist"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1
@@ -68,7 +68,7 @@ env:
     total_num_envs: 1
     auto_reset: True
     use_fixed_reset_state_ids: False
-    use_wrist_image: False
+    use_wrist_image: True
     max_episode_steps: 600
     max_steps_per_rollout_epoch: 600
     reset_options:
@@ -78,10 +78,8 @@ env:
     total_num_envs: 25
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 600
-    max_steps_per_rollout_epoch: 600
     use_fixed_reset_state_ids: False
-    use_wrist_image: False
+    use_wrist_image: True
     group_size: ${algorithm.group_size}
     is_eval: True
     reset_options:
@@ -116,8 +114,8 @@ actor:
     action_dim: 7
     num_steps: 5
     openpi:
-      config_name: "pi05_maniskill_peg_insertion"
-      num_images_in_input: 1
+      config_name: "pi05_maniskill_peg_insertion_wrist"
+      num_images_in_input: 2
       action_horizon: 10
       action_chunk: ${..num_action_chunks}
       action_env_dim: ${..action_dim}

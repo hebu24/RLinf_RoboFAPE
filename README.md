@@ -74,6 +74,8 @@ After the 10-episode smoke gate passes, collect the full dataset:
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
+/opt/kairan/envs/rlinf/bin/ray stop 
+
 MPLCONFIGDIR=/tmp/matplotlib \
 /opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/collect_peg_insertion_controller_data.py \
   --num-traj 3200 \
@@ -139,6 +141,18 @@ DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/
 bash sft_finetune.sh
 ```
 
+Wrist SFT:
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200 \
+bash sft_finetune_wrist.sh
+```
+
+The SFT wrappers set `RAY_TMPDIR` under `/tmp` to avoid Ray socket path length
+limits on long repo paths.
+
 The base SFT config uses:
 
 ```text
@@ -149,7 +163,20 @@ action_horizon: 10
 add_value_head: False
 ```
 
-## 5. Evaluate SFT Checkpoint
+The wrist SFT config uses:
+
+```text
+config_name: pi05_maniskill_peg_insertion_wrist
+num_images_in_input: 2
+num_action_chunks: 10
+action_horizon: 10
+add_value_head: False
+```
+
+It also sets `env.train.use_wrist_image: true` and `env.eval.use_wrist_image: true`
+so ManiSkill's `hand_camera` is routed into `wrist_images`.
+
+## 4. Evaluate SFT Checkpoint
 
 Use the actor checkpoint produced by SFT:
 
@@ -163,10 +190,10 @@ Run evaluation with `EVAL_ACTION_SCALE=1.0`:
 cd /opt/yingxi/RLinf_RoboFAPE
 
 VENV_DIR=/opt/kairan/envs/rlinf \
-CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/<run>/peg_insertion_sft/checkpoints/global_step_<N>/actor \
-GPU_IDS=0-3 \
-NUM_EVAL_EPISODES=25 \
-NUM_ENVS=5 \
+CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260712-17:15:54-peg_insertion_sft_openpi_pi05-3200/peg_insertion_sft/checkpoints/global_step_20000/actor \
+GPU_IDS=0 \
+NUM_EVAL_EPISODES=8 \
+NUM_ENVS=1 \
 EVAL_ACTION_SCALE=1.0 \
 SAVE_VIDEO=true \
 bash run_train/eval_checkpoint/run_peginsertion.sh
@@ -177,6 +204,54 @@ bash run_train/eval_checkpoint/run_peginsertion.sh
 generic `pi05_maniskill` configs, wrong image counts, and wrong action horizons
 for `PegInsertionVertical-v1`.
 
+### Wrist checkpoint evaluation
+
+Use the wrist eval wrapper for checkpoints trained with `sft_finetune_wrist.sh`:
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+VENV_DIR=/opt/kairan/envs/rlinf \
+CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints/global_step_20000/actor \
+GPU_IDS=0-3 \
+NUM_EVAL_EPISODES=8 \
+NUM_ENVS=4 \
+EVAL_ACTION_SCALE=1.0 \
+SAVE_VIDEO=true \
+bash run_train/eval_checkpoint/run_peginsertion_wrist.sh
+```
+
+`run_peginsertion_wrist.sh` defaults to
+`maniskill_peg_insertion_vertical_wrist_sft_eval_openpi_pi05`.  The eval guard
+rejects generic `pi05_maniskill` configs, wrong image counts, and wrong action
+horizons for `PegInsertionVertical-v1`.  The saved eval videos show the base
+camera and wrist camera side by side.
+
+To evaluate every `global_step_*/actor` checkpoint under a wrist SFT run, run:
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+MPLCONFIGDIR=/tmp/matplotlib \
+/opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
+  --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
+  --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_eval_sweep \
+  --num-eval-episodes 4 \
+  --num-envs 2 \
+  --gpu-ids 2,3 \
+  --action-scale 1.0
+```
+
+The sweep writes:
+
+| Path | Content |
+|---|---|
+| `wrist_sweep_metrics.csv` | Per-checkpoint step, mean success rate, and mean trajectory max reward. |
+| `wrist_sweep_metrics.json` | Same metrics plus checkpoint/log paths. |
+| `wrist_sweep_curves.png` | Mean success-rate and mean max-reward curves. |
+| `success_rate_vs_step.png` | Mean SR vs. training step. |
+| `max_reward_vs_step.png` | Mean trajectory max reward vs. training step. |
+
 Key output files:
 
 | Path | Content |
@@ -185,7 +260,7 @@ Key output files:
 | `logs/<timestamp>-eval-PegInsertionVertical-v1/evaluation_summary.json` | Evaluation summary. |
 | `logs/<timestamp>-eval-PegInsertionVertical-v1/video/eval/` | Evaluation videos. |
 
-## 6. PPO / RL From SFT
+## 5. PPO / RL From SFT
 
 Only start RL after the SFT checkpoint passes the SFT eval sanity check above.
 The peg PPO config is aligned to the same controller-domain interface:

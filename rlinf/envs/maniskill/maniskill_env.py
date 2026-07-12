@@ -264,6 +264,9 @@ class ManiskillEnv(gym.Env):
         self.returns = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.float32
         )
+        self.max_rewards = torch.full(
+            (self.num_envs,), -float("inf"), device=self.device, dtype=torch.float32
+        )
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -274,16 +277,19 @@ class ManiskillEnv(gym.Env):
                 self.success_once[mask] = False
                 self.fail_once[mask] = False
                 self.returns[mask] = 0
+                self.max_rewards[mask] = -float("inf")
         else:
             self.prev_step_reward[:] = 0
             if self.record_metrics:
                 self.success_once[:] = False
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
+                self.max_rewards[:] = -float("inf")
 
     def _record_metrics(self, step_reward, infos):
         episode_info = {}
         self.returns += step_reward
+        self.max_rewards = torch.maximum(self.max_rewards, step_reward)
         if "success" in infos:
             self.success_once = self.success_once | infos["success"]
             episode_info["success_once"] = self.success_once.clone()
@@ -293,6 +299,7 @@ class ManiskillEnv(gym.Env):
         episode_info["return"] = self.returns.clone()
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        episode_info["max_reward"] = self.max_rewards.clone()
         infos["episode"] = episode_info
         return infos
 
@@ -432,23 +439,36 @@ class ManiskillEnv(gym.Env):
     # render utils
     def capture_image(self, infos=None):
         raw_obs = self.env.unwrapped.get_obs()
-        img = raw_obs["sensor_data"]["base_camera"]["rgb"]
-        img = common.to_numpy(img)
-        if len(img.shape) == 3:
-            img = img[None]
+        sensor_data = raw_obs["sensor_data"]
+        base_img = common.to_numpy(sensor_data["base_camera"]["rgb"])
+        wrist_img = None
+        if bool(getattr(self.cfg, "use_wrist_image", False)) and "hand_camera" in sensor_data:
+            wrist_img = common.to_numpy(sensor_data["hand_camera"]["rgb"])
+
+        if len(base_img.shape) == 3:
+            base_img = base_img[None]
+        if wrist_img is not None and len(wrist_img.shape) == 3:
+            wrist_img = wrist_img[None]
+
+        frames = []
+        for i in range(len(base_img)):
+            frame = base_img[i]
+            if wrist_img is not None:
+                if wrist_img.shape[0] > i:
+                    frame = np.concatenate([frame, wrist_img[i]], axis=1)
+                else:
+                    frame = np.concatenate([frame, wrist_img[0]], axis=1)
+            frames.append(frame)
 
         if infos is not None:
-            for i in range(len(img)):
+            for i in range(len(frames)):
                 info_item = {
                     k: v if np.size(v) == 1 else v[i] for k, v in infos.items()
                 }
-                img[i] = put_info_on_image(img[i], info_item)
-        if len(img.shape) > 3:
-            if len(img) == 1:
-                img = img[0]
-            else:
-                img = tile_images(img, nrows=int(np.sqrt(self.num_envs)))
-        return img
+                frames[i] = put_info_on_image(frames[i], info_item)
+        if len(frames) > 1:
+            return tile_images(frames, nrows=int(np.sqrt(self.num_envs)))
+        return frames[0]
 
     def render(self, info, rew=None):
         if self.video_cfg.info_on_video:
