@@ -8,7 +8,7 @@ export RAY_TMPDIR=/tmp/ray_sft_wrist
 export CUDA_LAUNCH_BLOCKING=1
 
 DATA_DIR="${DATA_DIR:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200}"
-GPU_IDS="${GPU_IDS:-0,1,2,3}"
+GPU_IDS="${GPU_IDS:-4,5,6,7}"
 
 IFS=',' read -r -a GPU_ID_ARRAY <<< "${GPU_IDS}"
 if ((${#GPU_ID_ARRAY[@]} == 0)); then

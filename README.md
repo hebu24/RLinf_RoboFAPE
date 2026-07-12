@@ -78,8 +78,8 @@ cd /opt/yingxi/RLinf_RoboFAPE
 
 MPLCONFIGDIR=/tmp/matplotlib \
 /opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/collect_peg_insertion_controller_data.py \
-  --num-traj 3200 \
-  --output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200 \
+  --num-traj 12800 \
+  --output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_12800 \
   --seed 0 \
   --num-workers 32 \
   --gpu-ids 0,1,2,3 \

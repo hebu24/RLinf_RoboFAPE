@@ -25,12 +25,51 @@ import json
 import multiprocessing as mp
 import os
 import os.path as osp
+import random
 import shutil
 import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Any
+
+
+def _early_arg_value(name: str, default: str | None = None) -> str | None:
+    prefix = f"{name}="
+    for index, arg in enumerate(sys.argv[1:]):
+        if arg == name and index + 2 <= len(sys.argv[1:]):
+            return sys.argv[index + 2]
+        if arg.startswith(prefix):
+            return arg[len(prefix) :]
+    return default
+
+
+def _early_configure_cuda_visible_devices() -> None:
+    """Constrain CUDA before importing torch, ManiSkill, or SAPIEN.
+
+    The CLI accepts physical nvidia-smi ids.  Once CUDA_VISIBLE_DEVICES is set,
+    worker render backends are remapped to local ids later in main().
+    """
+    render_prefix = (_early_arg_value("--render-backend-prefix", "cuda") or "cuda").lower()
+    if render_prefix not in {"", "default", "cuda", "sapien_cuda"}:
+        return
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return
+
+    gpu_ids = _early_arg_value("--gpu-ids")
+    if not gpu_ids:
+        return
+    visible = ",".join(value.strip() for value in gpu_ids.split(",") if value.strip())
+    if not visible:
+        return
+
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible
+    os.environ["RLINF_COLLECTOR_SET_CUDA_VISIBLE_DEVICES"] = "1"
+    os.environ["RLINF_COLLECTOR_PHYSICAL_GPU_IDS"] = visible
+
+
+_early_configure_cuda_visible_devices()
 
 # SAPIEN only checks /usr/share/vulkan/icd.d/nvidia_icd.json before falling back
 # to its bundled, older NVIDIA ICD. On this machine the real driver ICD lives in
@@ -95,10 +134,10 @@ from rlinf.envs.maniskill.peg_insertion_pi05 import (
     split_target_delta_model_actions,
 )
 
-TASK = "insert the blue peg vertically into the orange hole"
-TASK_DESC_PATH = (
-    "/home/gpu4/yingxi/RoboFPE/mani_envs/data_collection/"
-    "task_descriptions/peg_insertion_vertical.json"
+from peg_insertion_prompts import (
+    DEFAULT_NUM_PROMPTS,
+    DEFAULT_PROMPT_SEED,
+    generate_prompts,
 )
 FPS = 20
 IMAGE_SIZE = 224
@@ -114,16 +153,7 @@ class TrackingPlanError(RuntimeError):
     """Raised when a reference cannot be represented as controller actions."""
 
 
-def _load_task_descriptions() -> list[str]:
-    try:
-        data = json.load(open(TASK_DESC_PATH, encoding="utf-8"))
-        values = data.get("PegInsertionVertical-v1", [])
-        return values or [TASK]
-    except Exception:
-        return [TASK]
-
-
-TASK_DESCRIPTIONS = _load_task_descriptions()
+TASK_DESCRIPTIONS = generate_prompts(DEFAULT_NUM_PROMPTS, DEFAULT_PROMPT_SEED)
 
 
 def _as_numpy(value) -> np.ndarray:
@@ -241,6 +271,15 @@ def _render_backend_from_gpu_id(gpu_id: int, render_backend_prefix: str) -> str 
     return f"{render_backend_prefix}:{gpu_id}"
 
 
+def _gpu_label(gpu_id: int, render_backend_prefix: str) -> str:
+    prefix = render_backend_prefix.lower()
+    if prefix in {"", "default", "cuda", "sapien_cuda"}:
+        visible = [value.strip() for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if value.strip()]
+        if 0 <= gpu_id < len(visible):
+            return f"{gpu_id}/physical{visible[gpu_id]}"
+    return str(gpu_id)
+
+
 def _make_env(
     control_mode: str,
     gpu_id: int,
@@ -283,6 +322,7 @@ def _make_env_with_retry(
     max_retries: int = 2,
 ):
     last_err = None
+    gpu_label = _gpu_label(gpu_id, render_backend_prefix)
     for attempt in range(max_retries):
         try:
             return _make_env(
@@ -296,7 +336,7 @@ def _make_env_with_retry(
             if "ErrorDeviceLost" not in str(exc) and "vk" not in str(exc).lower():
                 raise
             print(
-                f"[gpu{gpu_id}] Vulkan error creating {control_mode} env "
+                f"[gpu{gpu_label}] Vulkan error creating {control_mode} env "
                 f"attempt {attempt + 1}/{max_retries}; retrying..."
             )
             time.sleep(5.0)
@@ -914,13 +954,14 @@ def _collect_episodes(
     ctrl_dry_fail = 0
     ctrl_capture_fail = 0
     render_backend = _render_backend_from_gpu_id(gpu_id, render_backend_prefix)
+    gpu_label = _gpu_label(gpu_id, render_backend_prefix)
     pbar = tqdm(total=num_traj, desc=progress_prefix or "Collect controller data")
     reference_env = None
     controller_dry_env = None
     controller_capture_env = None
     try:
         print(
-            f"{progress_prefix}Creating persistent ManiSkill envs on gpu{gpu_id} "
+            f"{progress_prefix}Creating persistent ManiSkill envs on gpu{gpu_label} "
             f"render_backend={render_backend}: pd_joint_pos(no-image), "
             "pd_ee_target_delta_pose(no-image dry-run), "
             "pd_ee_target_delta_pose(RGB capture)"
@@ -944,7 +985,7 @@ def _collect_episodes(
             capture_images=True,
         )
         print(
-            f"{progress_prefix}Persistent envs ready on gpu{gpu_id}; "
+            f"{progress_prefix}Persistent envs ready on gpu{gpu_label}; "
             "subsequent attempts will use reset(seed=...) only. "
             "RGB capture runs only after no-image controller dry-run succeeds."
         )
@@ -965,6 +1006,7 @@ def _collect_episodes(
                 "attempt": attempts,
                 "passed_before": passed,
                 "gpu_id": gpu_id,
+                "gpu_label": gpu_label,
                 "render_backend": render_backend,
             }
             try:
@@ -1084,7 +1126,7 @@ def _collect_episodes(
                     seed += 1
                     continue
                 assert base is not None and wrist is not None and render is not None
-                task = TASK_DESCRIPTIONS[seed % len(TASK_DESCRIPTIONS)]
+                task = random.Random(seed).choice(TASK_DESCRIPTIONS)
                 episode_index = writer.add_episode(rows, base, wrist, render, task)
                 passed += 1
                 attempt_record.update(
@@ -1121,7 +1163,7 @@ def _collect_episodes(
                 ):
                     pbar.close()
                     raise RuntimeError(
-                        f"Fatal environment/render backend error on gpu{gpu_id}: {exc}. "
+                        f"Fatal environment/render backend error on gpu{gpu_label}: {exc}. "
                         "Persistent-env collector will not recreate ManiSkill envs "
                         "inside the same process because repeated svulkan2 renderer "
                         "create/close can poison Vulkan state."
@@ -1144,7 +1186,7 @@ def _collect_episodes(
     finally:
         pbar.close()
         print(
-            f"{progress_prefix}Closing persistent ManiSkill envs on gpu{gpu_id}; "
+            f"{progress_prefix}Closing persistent ManiSkill envs on gpu{gpu_label}; "
             f"passed={passed}, attempts={attempts}, ref_fail={ref_fail}, "
             f"ctrl_dry_fail={ctrl_dry_fail}, ctrl_capture_fail={ctrl_capture_fail}"
         )
@@ -1168,6 +1210,7 @@ def _collect_worker(
 ):
     if startup_delay > 0:
         time.sleep(startup_delay)
+    gpu_label = _gpu_label(gpu_id, render_backend_prefix)
     writer = LeRobotControllerWriter(shard_dir)
     result = _collect_episodes(
         num_traj,
@@ -1176,11 +1219,11 @@ def _collect_worker(
         gpu_id,
         max_attempts=max_attempts,
         render_backend_prefix=render_backend_prefix,
-        progress_prefix=f"[w{worker_id}/gpu{gpu_id}] ",
+        progress_prefix=f"[w{worker_id}/gpu{gpu_label}] ",
     )
     writer.finalize()
     print(
-        f"[w{worker_id}/gpu{gpu_id}] Worker complete: passed={result[0]}, "
+        f"[w{worker_id}/gpu{gpu_label}] Worker complete: passed={result[0]}, "
         f"attempts={result[1]}, ref_fail={result[2]}, "
         f"ctrl_dry_fail={result[3]}, ctrl_capture_fail={result[4]}"
     )
@@ -1270,6 +1313,27 @@ def _merge_shards(final_dir: str, shard_dirs: list[str]) -> None:
     )
 
 
+def _parse_gpu_ids(gpu_ids: str) -> list[int]:
+    ids = [int(value) for value in gpu_ids.split(",") if value.strip()]
+    if not ids:
+        raise ValueError("--gpu-ids must contain at least one GPU id")
+    return ids
+
+
+def _runtime_gpu_ids(requested_gpu_ids: list[int], render_backend_prefix: str) -> list[int]:
+    prefix = render_backend_prefix.lower()
+    if prefix not in {"", "default", "cuda", "sapien_cuda"}:
+        return requested_gpu_ids
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    visible_ids = _parse_gpu_ids(visible) if visible else []
+    requested_visible = visible_ids == requested_gpu_ids
+    collector_set_visible = os.environ.get("RLINF_COLLECTOR_SET_CUDA_VISIBLE_DEVICES") == "1"
+    if collector_set_visible or requested_visible:
+        return list(range(len(requested_gpu_ids)))
+    return requested_gpu_ids
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-traj", type=int, default=500)
@@ -1283,10 +1347,11 @@ def main() -> None:
     parser.add_argument("--worker-stagger", type=float, default=5.0)
     parser.add_argument(
         "--render-backend-prefix",
-        default="gpu",
+        default="cuda",
         help=(
-            "Render backend selector. Use 'gpu' for the legacy gpu:<id> Vulkan "
-            "renderer, or 'cpu' for render_backend=cpu. The legacy collector used 'gpu'."
+            "Render backend selector. Use 'cuda' to match CUDA/nvidia-smi GPU ids "
+            "(recommended), 'gpu' for the legacy Vulkan gpu:<id> device order, "
+            "or 'cpu' for render_backend=cpu."
         ),
     )
     parser.add_argument(
@@ -1307,6 +1372,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    requested_gpu_ids = _parse_gpu_ids(args.gpu_ids)
+    gpu_ids = _runtime_gpu_ids(requested_gpu_ids, args.render_backend_prefix)
+    print(
+        "GPU selection: "
+        f"requested_physical={requested_gpu_ids}, "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}, "
+        f"render_backend_prefix={args.render_backend_prefix!r}, "
+        f"runtime_backend_ids={gpu_ids}"
+    )
+
     output_dir = osp.abspath(args.output_dir)
     if args.num_workers <= 1:
         writer = LeRobotControllerWriter(output_dir)
@@ -1314,7 +1389,7 @@ def main() -> None:
             args.num_traj,
             args.seed,
             writer,
-            int(args.gpu_ids.split(",")[0]),
+            gpu_ids[0],
             max_attempts=max(args.num_traj * args.max_attempts_multiplier, args.num_traj),
             render_backend_prefix=args.render_backend_prefix,
         )
@@ -1322,9 +1397,6 @@ def main() -> None:
         print(f"Done: passed={result[0]} attempts={result[1]} out={output_dir}")
         return
 
-    gpu_ids = [int(value) for value in args.gpu_ids.split(",") if value.strip()]
-    if not gpu_ids:
-        raise ValueError("--gpu-ids must contain at least one GPU id")
     counts = [args.num_traj // args.num_workers] * args.num_workers
     for i in range(args.num_traj % args.num_workers):
         counts[i] += 1

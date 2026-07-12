@@ -6,6 +6,7 @@ import cv2,gymnasium as gym,numpy as np,pandas as pd,torch
 from tqdm import tqdm
 from transforms3d import quaternions
 from transforms3d.axangles import mat2axangle
+from peg_insertion_prompts import DEFAULT_NUM_PROMPTS, DEFAULT_PROMPT_SEED, generate_prompts
 
 # Register RLinf env FIRST (before RoboFPE solution import overrides it)
 import importlib.util as _ilu
@@ -19,10 +20,8 @@ sys.path.insert(0,osp.join(ROBOFPE,"data_collection"))
 import types as _types; _ts=_types.ModuleType("tasks"); _ts.task_PegInsertionVertical=_types.ModuleType("tasks.task_PegInsertionVertical"); _ts.task_PegInsertionVertical.PegInsertionVerticalEnv=type("PegInsertionVerticalEnv",(),{}); sys.modules["tasks"]=_ts; sys.modules["tasks.task_PegInsertionVertical"]=_ts.task_PegInsertionVertical
 from solutions.solve_PegInsertionVertical import solve_peginsertionvertical
 
-TASK="insert the blue peg vertically into the orange hole"
-TASK_DESCRIPTIONS = json.load(
-    open("/home/gpu4/yingxi/RoboFPE/mani_envs/data_collection/task_descriptions/peg_insertion_vertical.json")
-)["PegInsertionVertical-v1"]
+TASK="insert the peg into the hole"
+TASK_DESCRIPTIONS = generate_prompts(DEFAULT_NUM_PROMPTS, DEFAULT_PROMPT_SEED)
 FPS=20;IW=224;IH=224;RW=640;RH=480
 SDIM=8;ADIM=7;CSIZE=1000
 def _compute_stats(df):
@@ -98,6 +97,7 @@ class LeRobotWriter:
     def __init__(self, outdir, task=TASK):
         self.od=osp.abspath(outdir)
         self.eps=[]; self.dfs=[]; self.gi=0
+        self.task=task
         # 多 task 支持
         self.task_to_idx={}; self.all_tasks=[]
         os.makedirs(self.od,exist_ok=True)
@@ -117,16 +117,9 @@ class LeRobotWriter:
         task=_r.choice(TASK_DESCRIPTIONS)
         ti=self._get_task_idx(task)
         ei=len(self.eps); T=len(acts); ts=np.arange(T,dtype=np.float32)/FPS
-        df=pd.DataFrame({"action":[r.tolist() for r in acts],"observation.state":[r.tolist() for r in states],"timestamp":ts,"frame_index":np.arange(T,dtype=np.int64),"episode_index":np.full(T,ei,dtype=np.int64),"index":np.arange(self.gi,self.gi+T,dtype=np.int64),"task_index":np.full(T,ti,dtype=np.int64),"task":[task]*T})
+        df=pd.DataFrame({"actions":[r.tolist() for r in acts],"observation.state":[r.tolist() for r in states],"timestamp":ts,"frame_index":np.arange(T,dtype=np.int64),"episode_index":np.full(T,ei,dtype=np.int64),"index":np.arange(self.gi,self.gi+T,dtype=np.int64),"task_index":np.full(T,ti,dtype=np.int64),"task":[task]*T})
         self.dfs.append(df)
         self.eps.append({"episode_index":ei,"data/chunk_index":0,"data/file_index":0,"dataset_from_index":self.gi,"dataset_to_index":self.gi+T,"tasks":[task],"length":T})
-        self.gi+=T; self._wv(bf,ei,"top"); self._wv(wf,ei,"wrist"); self._wv(rf,ei,"render"); return ei
-
-    def add_episode(self,acts,states,bf,wf,rf):
-        ei=len(self.eps); T=len(acts); ts=np.arange(T,dtype=np.float32)/FPS
-        df=pd.DataFrame({"actions":[r.tolist() for r in acts],"observation.state":[r.tolist() for r in states],"timestamp":ts,"frame_index":np.arange(T,dtype=np.int64),"episode_index":np.full(T,ei,dtype=np.int64),"index":np.arange(self.gi,self.gi+T,dtype=np.int64),"task_index":np.zeros(T,dtype=np.int64),"task":[self.task]*T})
-        self.dfs.append(df)
-        self.eps.append({"episode_index":ei,"data/chunk_index":0,"data/file_index":0,"dataset_from_index":self.gi,"dataset_to_index":self.gi+T,"tasks":[self.task],"length":T})
         self.gi+=T; self._wv(bf,ei,"top"); self._wv(wf,ei,"wrist"); self._wv(rf,ei,"render"); return ei
 
     def _wv(self,frames,ei,cn):
@@ -144,8 +137,12 @@ class LeRobotWriter:
         pq.write_table(pa.Table.from_pandas(cdf,schema=sch),osp.join(self.od,"data","chunk-000","file-000.parquet"))
         edf=pd.DataFrame(self.eps)
         pq.write_table(pa.Table.from_pandas(edf),osp.join(self.od,"meta","episodes","chunk-000","file-000.parquet"))
-        tdf=pd.DataFrame({"task_index":[0]},index=[self.task]); tdf.index.name=None
-        tdf.to_parquet(osp.join(self.od,"meta","tasks.parquet"),index=True)
+        tasks=self.all_tasks or [self.task]
+        tdf=pd.DataFrame({"task_index":list(range(len(tasks))),"task":tasks})
+        tdf.to_parquet(osp.join(self.od,"meta","tasks.parquet"),index=False)
+        with open(osp.join(self.od,"meta","tasks.jsonl"),"w",encoding="utf-8") as f:
+            for idx,task in enumerate(tasks):
+                f.write(json.dumps({"task_index":idx,"task":task})+"\n")
         stats=_compute_stats(cdf)
         with open(osp.join(self.od,"meta","stats.json"),"w") as f: json.dump(stats,f,indent=2)
         TF=len(cdf); TE=len(self.eps)
@@ -153,7 +150,7 @@ class LeRobotWriter:
         for c,h,w in [("top",IH,IW),("wrist",IH,IW),("render",RH,RW)]:
             feat[f"observation.images.{c}"]={"dtype":"video","shape":[h,w,3],"names":["height","width","channels"],"info":{"video.fps":float(FPS),"video.height":h,"video.width":w,"video.channels":3,"video.codec":"mp4v","video.pix_fmt":"yuv420p","video.is_depth_map":False,"has_audio":False}}
         dsz=sum(f.stat().st_size for f in Path(self.od).rglob("data/*.parquet"))
-        info={"codebase_version":"v3.0","robot_type":"panda_wristcam","total_episodes":TE,"total_frames":TF,"total_tasks":1,"total_videos":TE*3,"total_chunks":1,"chunks_size":CSIZE,"fps":FPS,"data_files_size_in_mb":int(dsz/(1024*1024)),"splits":{"train":f"0:{TE}"},"data_path":"data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet","video_path":"videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4","features":feat}
+        info={"codebase_version":"v3.0","robot_type":"panda_wristcam","total_episodes":TE,"total_frames":TF,"total_tasks":len(tasks),"total_videos":TE*3,"total_chunks":1,"chunks_size":CSIZE,"fps":FPS,"data_files_size_in_mb":int(dsz/(1024*1024)),"splits":{"train":f"0:{TE}"},"data_path":"data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet","video_path":"videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4","features":feat}
         with open(osp.join(self.od,"meta","info.json"),"w") as f: json.dump(info,f,indent=2)
         print(f"Dataset: {TE} eps, {TF} frames -> {self.od}")
     def _stats(self,df):
