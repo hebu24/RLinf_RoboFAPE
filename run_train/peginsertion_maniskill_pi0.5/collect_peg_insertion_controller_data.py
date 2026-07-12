@@ -852,7 +852,8 @@ def _write_dataset_metadata(
     data_size = sum(path.stat().st_size for path in Path(outdir).rglob("data/**/*.parquet"))
     total_episodes = int(df["episode_index"].nunique())
     info = {
-        "codebase_version": "v3.0-controller-domain",
+        "codebase_version": "v2.0",
+        "dataset_variant": "peg-insertion-controller-domain-v1",
         "robot_type": "panda_wristcam",
         "total_episodes": total_episodes,
         "total_frames": int(len(df)),

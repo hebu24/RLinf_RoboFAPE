@@ -50,6 +50,9 @@ Successful rows also include target-delta plan length, split count, controller
 bound summary, and base-model normalized state/action p99/max diagnostics.
 Final `meta/stats.json` also includes `base_norm.actions.abs` and
 `base_norm.observation.state_tcp.abs` so you can check OOD ranges before SFT.
+The generated LeRobot metadata uses `codebase_version: v2.0` because the
+collector writes global `meta/stats.json`, which matches the v2.0 layout used
+by the installed LeRobot reader.
 
 Then run replay smoke on that dataset:
 
