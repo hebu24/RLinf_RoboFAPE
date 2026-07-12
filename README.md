@@ -17,31 +17,7 @@ motion-planning qpos/TCP deltas and may contain old gripper/rotation semantics,
 not the exact target-delta controller domain used for eval.
 
 ## 1. Collect Controller-Domain Data
-
-The collector first generates a successful motion-planning reference trajectory,
-then dry-runs a no-image `pd_ee_target_delta_pose` tracker.  The reference TCP
-trajectory is converted to physical target-delta actions; any step outside the
-Panda 0.1m / 0.1rad controller bounds is split into smaller controller steps
-and recorded as actual training frames. Only controller dry-runs that reach task
-success are replayed once more with RGB sensors enabled and written as training
-episodes.
-
-The default collection command uses CPU physics simulation and GPU/Vulkan
-rendering (`sim_backend="cpu"`, `render_backend="gpu:<id>"`) and avoids RGB
-observations for failed reference/controller attempts.  Each worker keeps
-persistent envs alive and loops with `reset(seed=...)` only:
-
-- one no-image `pd_joint_pos` reference env
-- one no-image `pd_ee_target_delta_pose` dry-run env
-- one RGB `pd_ee_target_delta_pose` capture env
-
-This avoids repeated svulkan2 renderer create/close cycles, which can poison
-Vulkan state and later appear as misleading `IncompatibleDriver` or "driver does
-not support Vulkan" errors.  It also avoids rendering images for failed
-controller attempts.
-
 First run a 10-episode GPU smoke collection:
-
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
@@ -105,22 +81,6 @@ MPLCONFIGDIR=/tmp/matplotlib \
   --worker-stagger 5.0
 ```
 
-CPU renderer fallback for small smoke tests:
-
-```bash
-MPLCONFIGDIR=/tmp/matplotlib \
-/opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/collect_peg_insertion_controller_data.py \
-  --num-traj 1 \
-  --output-dir /tmp/peg_controller_cpu_render_smoke \
-  --seed 0 \
-  --num-workers 1 \
-  --gpu-ids 0 \
-  --render-backend-prefix cpu
-```
-
-CPU rendering is much slower.  Use it to verify the data path or as a fallback
-when Vulkan is not exposed in the current container/session.
-
 Expected dataset fields include:
 
 | Field | Meaning |
@@ -164,22 +124,7 @@ Blocking checks:
 If this replay needs `--action-scale 2.5`, the data is still wrong for the eval
 controller.  Do not train from that dataset.
 
-## 3. Optional State-TCP Refresh
-
-Controller-domain collection already writes `observation.state_tcp`, so this
-step is normally unnecessary.  If you need to refresh proprio only, run:
-
-```bash
-/opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/convert_qpos_to_tcp_proprio.py \
-  --data-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200 \
-  --render-backend gpu:0
-```
-
-This preserves `actions` by default and writes FK deltas only to
-`debug.fk_delta_action`.  The legacy flag `--overwrite-actions-from-fk` should
-not be used for controller-domain SFT data.
-
-## 4. SFT Training
+## 3. SFT Training
 
 Train from the base pi0.5 ManiSkill checkpoint.  Do not resume a checkpoint that
 was trained on the old FK-converted data.
