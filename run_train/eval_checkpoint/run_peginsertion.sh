@@ -6,9 +6,9 @@ REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Edit these values directly, or override them with environment variables.
 VENV_DIR="${VENV_DIR:-/opt/kairan/envs/rlinf}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/opt/yingxi/rlinf/RLinf-Pi05-ManiSkill-25Main-RL-FlowNoise/checkpoints/global_step_150/actor}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
 CONFIG_DIR="${CONFIG_DIR:-${REPO_PATH}/run_train/peginsertion_maniskill_pi0.5/config}"
-CONFIG_NAME="${CONFIG_NAME:-maniskill_peg_insertion_vertical_ppo_openpi_pi05}"
+CONFIG_NAME="${CONFIG_NAME:-maniskill_peg_insertion_vertical_sft_eval_openpi_pi05}"
 TASK_ID="${TASK_ID:-PegInsertionVertical-v1}"
 OBJ_SET="${OBJ_SET:-}"
 TASK_DESCRIPTION="${TASK_DESCRIPTION:-insert the blue peg vertically into the orange hole}"
@@ -33,6 +33,10 @@ PYTHON_BIN="${VENV_DIR}/bin/python"
 RAY_BIN="${VENV_DIR}/bin/ray"
 if [[ ! -x "${PYTHON_BIN}" || ! -x "${RAY_BIN}" ]]; then
   echo "Missing Python or Ray in ${VENV_DIR}." >&2
+  exit 1
+fi
+if [[ -z "${CHECKPOINT_PATH}" ]]; then
+  echo "Set CHECKPOINT_PATH to the actor checkpoint you want to evaluate." >&2
   exit 1
 fi
 if [[ ! -e "${CHECKPOINT_PATH}" ]]; then

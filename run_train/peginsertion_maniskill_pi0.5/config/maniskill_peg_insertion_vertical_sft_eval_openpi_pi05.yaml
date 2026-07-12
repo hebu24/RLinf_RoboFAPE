@@ -24,14 +24,14 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "peginsertion_maniskill_pi0.5"
+    experiment_name: "peginsertion_maniskill_pi0.5_sft_eval"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1000
+  max_epochs: 1
   max_steps: -1
-  only_eval: False
-  val_check_interval: 10
-  save_interval: 50
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
   resume_dir: null
   ckpt_path: null
 
@@ -43,13 +43,13 @@ algorithm:
   reward_type: chunk_level
   logprob_type: chunk_level
   entropy_type: chunk_level
-  update_epoch: 5
+  update_epoch: 1
   adv_type: gae
   loss_type: actor_critic
   loss_agg_func: "token-mean"
   bootstrap_type: always
   kl_beta: 0.0
-  entropy_bonus: 0.005
+  entropy_bonus: 0.0
   clip_ratio_high: 0.2
   clip_ratio_low: 0.2
   clip_ratio_c: 3.0
@@ -65,7 +65,7 @@ env:
   group_name: "EnvGroup"
   train:
     rollout_epoch: 1
-    total_num_envs: 16
+    total_num_envs: 1
     auto_reset: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 600
@@ -96,42 +96,38 @@ rollout:
   enable_offload: False
   pipeline_stage_num: 1
   model:
-    model_path: ${oc.env:MODEL_PATH,/opt/yingxi/rlinf/RLinf-Pi05-ManiSkill-25Main-RL-FlowNoise/checkpoints/global_step_150/actor}
+    model_path: ${oc.env:MODEL_PATH,/path/to/peg-insertion-sft/checkpoints/global_step_x/actor}
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 32
-  global_batch_size: 256
+  micro_batch_size: 8
+  global_batch_size: 32
   seed: 0
   enable_offload: False
   model:
-    model_path: ${oc.env:MODEL_PATH,/opt/yingxi/rlinf/RLinf-Pi05-ManiSkill-25Main-RL-FlowNoise/checkpoints/global_step_150/actor}
+    model_path: ${oc.env:MODEL_PATH,/path/to/peg-insertion-sft/checkpoints/global_step_x/actor}
     model_type: "openpi"
-    add_value_head: True
+    add_value_head: False
     num_action_chunks: 10
     action_dim: 7
     num_steps: 5
     openpi:
-      value_after_vlm: True
       config_name: "pi05_maniskill_peg_insertion"
       num_images_in_input: 1
-      noise_method: "flow_noise"
       action_horizon: 10
       action_chunk: ${..num_action_chunks}
       action_env_dim: ${..action_dim}
-      noise_params: [0.16, 0.12, 200]
-      joint_logprob: True
+      train_expert_only: True
+      detach_critic_input: True
     policy_setup: panda-ee-target-dpose
   optim:
-    lr: 7.91e-6
-    value_lr: 1.55e-4
+    lr: 2.5e-6
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
     clip_grad: 1.0
-    critic_warmup_steps: 0
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"

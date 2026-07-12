@@ -183,7 +183,14 @@ class ManiskillEnv(gym.Env):
 
                 main_images = sensor_data["base_camera"]["rgb"]
                 sorted_images = OrderedDict(sorted(sensor_data.items()))
-                sorted_images.pop("base_camera")
+                sorted_images.pop("base_camera", None)
+                wrist_images = None
+                if bool(getattr(self.cfg, "use_wrist_image", False)) and (
+                    "hand_camera" in sorted_images
+                ):
+                    wrist_images = sorted_images.pop("hand_camera")["rgb"]
+                else:
+                    sorted_images.pop("hand_camera", None)
                 extra_view_images = (
                     torch.stack([v["rgb"] for v in sorted_images.values()], dim=1)
                     if sorted_images
@@ -191,8 +198,8 @@ class ManiskillEnv(gym.Env):
                 )
                 return {
                     "main_images": main_images,
-                    "extra_view_images": None,
-                    "wrist_images": None,
+                    "extra_view_images": extra_view_images,
+                    "wrist_images": wrist_images,
                     "states": state,
                     "task_descriptions": self.instruction,
                 }

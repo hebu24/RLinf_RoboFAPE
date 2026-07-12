@@ -26,7 +26,11 @@ from mani_skill.utils.geometry import rotation_conversions
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import SimConfig
-from transforms3d.euler import euler2quat, mat2euler
+from transforms3d.euler import euler2quat
+
+from rlinf.envs.maniskill.peg_insertion_pi05 import (
+    aligned_pi05_state_from_tcp_matrices,
+)
 
 
 def _build_vertical_box_with_hole(
@@ -77,6 +81,7 @@ def _build_table_plane(
         half_size=[half_sizes[0], half_sizes[1]],
         mat=mat,
     )
+    builder.initial_pose = sapien.Pose()
     return builder.build_static(name=name)
 
 
@@ -199,7 +204,7 @@ class PegInsertionVerticalEnv(BaseEnv):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
 
     def get_language_instruction(self):
-        return ["insert the blue peg vertically into the orange hole"] * self.num_envs
+        return ["insert the peg into the hole"] * self.num_envs
 
     def _load_scene(self, options: dict):
         self.table = _build_table_plane(
@@ -647,24 +652,11 @@ class PegInsertionVerticalEnv(BaseEnv):
         tcp_transform = (
             tcp_pose_in_root.to_transformation_matrix().detach().cpu().numpy()
         )
-
-        pos = torch.as_tensor(
-            tcp_transform[:, :3, 3], device=self.device, dtype=torch.float32
-        )
-        euler = torch.as_tensor(
-            np.stack(
-                [
-                    mat2euler(tcp_transform[i, :3, :3], "sxyz")
-                    for i in range(self.num_envs)
-                ]
-            ),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        # 8-dim: [tcp_xyz(3), euler_sxyz(3), finger0(1), finger1(1)]
-        # Raw finger qpos (no *2) to align with 25Main SFT norm_stats.
         gripper = self.agent.robot.get_qpos().to(torch.float32)[:, -2:]
-        return torch.cat([pos, euler, gripper], dim=1)
+        state = aligned_pi05_state_from_tcp_matrices(
+            tcp_transform, gripper.detach().cpu().numpy()
+        )
+        return torch.as_tensor(state, device=self.device, dtype=torch.float32)
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
         gripper_pos = self.agent.tcp.pose.p

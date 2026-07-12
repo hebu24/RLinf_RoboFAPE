@@ -89,6 +89,75 @@ def _load_init_params(raw_value: str) -> dict[str, Any]:
     return value
 
 
+def _validate_peg_insertion_eval_cfg(cfg: DictConfig, task_id: str) -> None:
+    if task_id != "PegInsertionVertical-v1":
+        return
+    wrap_obs_mode = cfg.env.eval.get("wrap_obs_mode", None)
+    if wrap_obs_mode != "simple":
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation must use "
+            "env.eval.wrap_obs_mode=simple so the policy receives base_camera "
+            "images and aligned pi0.5 proprio. Use the peg-insertion config "
+            "run_train/peginsertion_maniskill_pi0.5/config/"
+            "maniskill_peg_insertion_vertical_ppo_openpi_pi05.yaml instead of "
+            "a generic ManiSkill config."
+        )
+    model_cfg = cfg.rollout.model
+    openpi_cfg = model_cfg.get("openpi", {})
+    config_name = openpi_cfg.get("config_name", None)
+    if config_name not in {
+        "pi05_maniskill_peg_insertion",
+        "pi05_maniskill_peg_insertion_wrist",
+    }:
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation must use the peg-insertion "
+            "OpenPI config used by SFT. Expected rollout.model.openpi.config_name "
+            "to be pi05_maniskill_peg_insertion or "
+            f"pi05_maniskill_peg_insertion_wrist, got {config_name!r}. "
+            "Do not evaluate a peg-insertion SFT checkpoint with generic "
+            "pi05_maniskill transforms/norm stats."
+        )
+    num_images = int(openpi_cfg.get("num_images_in_input", -1))
+    is_wrist = config_name == "pi05_maniskill_peg_insertion_wrist"
+    expected_images = 2 if is_wrist else 1
+    if num_images != expected_images:
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation image count does not match "
+            f"{config_name}: expected num_images_in_input={expected_images}, "
+            f"got {num_images}."
+        )
+    use_wrist_image = bool(cfg.env.eval.get("use_wrist_image", False))
+    if use_wrist_image != is_wrist:
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation wrist image routing does not "
+            f"match {config_name}: expected env.eval.use_wrist_image={is_wrist}, "
+            f"got {use_wrist_image}."
+        )
+    num_action_chunks = int(model_cfg.get("num_action_chunks", -1))
+    action_horizon = int(openpi_cfg.get("action_horizon", num_action_chunks))
+    if num_action_chunks != 10 or action_horizon != 10:
+        raise ValueError(
+            "PegInsertionVertical-v1 SFT uses 10-step action chunks. Expected "
+            "rollout.model.num_action_chunks=10 and "
+            f"rollout.model.openpi.action_horizon=10, got {num_action_chunks} "
+            f"and {action_horizon}."
+        )
+    if str(model_cfg.get("policy_setup", "")) != "panda-ee-target-dpose":
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation must use "
+            "rollout.model.policy_setup=panda-ee-target-dpose so physical "
+            "target-delta TCP actions are converted for ManiSkill "
+            "pd_ee_target_delta_pose."
+        )
+    control_mode = str(cfg.env.eval.init_params.get("control_mode", ""))
+    if control_mode != "pd_ee_target_delta_pose":
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation must use "
+            "env.eval.init_params.control_mode=pd_ee_target_delta_pose. "
+            f"Got {control_mode!r}."
+        )
+
+
 def build_config(args: argparse.Namespace, hydra_overrides: list[str]) -> DictConfig:
     checkpoint_path = Path(args.checkpoint_path).expanduser().resolve()
     config_dir = Path(args.config_dir).expanduser().resolve()
@@ -176,6 +245,7 @@ def build_config(args: argparse.Namespace, hydra_overrides: list[str]) -> DictCo
         # validate_cfg derives a mode from policy_setup; an explicit CLI value wins.
         with open_dict(cfg):
             cfg.env.eval.init_params.control_mode = args.control_mode
+    _validate_peg_insertion_eval_cfg(cfg, args.task_id)
     return cfg
 
 

@@ -27,10 +27,29 @@ def prepare_actions_for_maniskill(
     policy,
 ) -> torch.Tensor:
     # TODO only suitable for action_dim = 7
+    policy = policy or "widowx_bridge"
     reshaped_actions = raw_chunk_actions.reshape(-1, action_dim)
     if "panda" in policy:
         chunk_actions = reshaped_actions.copy()
-        chunk_actions[:, :6] *= action_scale
+        if policy in [
+            "panda-ee-dpose",
+            "panda-ee-target-dpos",
+            "panda-ee-target-dpose",
+        ]:
+            from rlinf.envs.maniskill.peg_insertion_pi05 import (
+                model_action_to_panda_env_action,
+            )
+
+            # The policy predicts raw controller-space deltas:
+            # [meters, meters, meters, radians, radians, radians, gripper].
+            # ManiSkill's Panda EE pose controllers have normalize_action=True.
+            # Position uses delta / 0.1; rotation uses -delta / 0.1 because
+            # PDEEPoseController multiplies normalized rotation by rot_lower.
+            chunk_actions = model_action_to_panda_env_action(
+                chunk_actions, action_scale=action_scale
+            )
+        else:
+            chunk_actions[:, :6] *= action_scale
         return torch.tensor(chunk_actions, dtype=torch.float32).cuda().reshape(
             -1, num_action_chunks, action_dim
         )

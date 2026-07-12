@@ -16,6 +16,7 @@ outputs/*
 *.so
 .venv
 .docs-venv
+.cache/
 uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO

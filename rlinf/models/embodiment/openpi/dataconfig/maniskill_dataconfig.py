@@ -163,12 +163,15 @@ class LeRobotManiSkillPegInsertionDataConfig(LeRobotManiSkillDataConfig):
     """DataConfig for PegInsertionVertical finetuning.
 
     Differences from base LeRobotManiSkillDataConfig:
-    - state: uses observation.state_tcp (8-dim TCP proprio) instead of
-      observation.state (qpos). TCP proprio is pre-computed offline via FK.
+    - state: uses observation.state_tcp (8-dim aligned pi0.5 TCP proprio)
+      instead of observation.state (qpos). TCP proprio is pre-computed offline
+      via FK with the same helper used by online inference.
     - image: base-only (observation.images.top). wrist/render not mapped,
       so ManiSkillInputs zero-pads and masks them out.
-    - action: already delta (Euler XYZ rotation + [-1,1] gripper), so
-      extra_delta_transform stays False (inherited).
+    - action: already physical target-delta TCP action
+      ([dx, dy, dz, droll, dpitch, dyaw, gripper]) with Euler XYZ rotation for
+      ManiSkill Panda pd_ee_target_delta_pose eval, so extra_delta_transform
+      stays False (inherited).
     """
 
     @override
