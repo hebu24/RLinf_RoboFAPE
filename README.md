@@ -236,11 +236,16 @@ MPLCONFIGDIR=/tmp/matplotlib \
 /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
   --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
   --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_eval_sweep \
-  --num-eval-episodes 4 \
+  --num-eval-episodes 10 \
   --num-envs 2 \
   --gpu-ids 2,3 \
   --action-scale 1.0
 ```
+
+The sweep runs one checkpoint per GPU.  For example, `--gpu-ids 2,3` evaluates
+two checkpoints concurrently, assigns each checkpoint to one GPU, and continues
+round-robin as GPUs finish.  Videos are saved by default; pass `--no-save-video`
+for a metrics-only sweep.
 
 The sweep writes:
 

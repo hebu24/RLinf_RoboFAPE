@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -62,7 +65,18 @@ def parse_args() -> argparse.Namespace:
             "cumulative reward; 'reward' is trajectory average reward."
         ),
     )
-    parser.add_argument("--save-video", action="store_true")
+    parser.add_argument(
+        "--save-video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save evaluation videos for every checkpoint.",
+    )
+    parser.add_argument(
+        "--manage-ray",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Start one shared Ray head for the whole sweep.",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -93,6 +107,26 @@ def parse_args() -> argparse.Namespace:
         help="Extra Hydra override passed through to eval_checkpoint.py.",
     )
     return parser.parse_args()
+
+
+def parse_gpu_ids(raw_value: str) -> list[str]:
+    gpu_ids: list[str] = []
+    for piece in raw_value.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            start_raw, end_raw = piece.split("-", 1)
+            start = int(start_raw)
+            end = int(end_raw)
+            if end < start:
+                raise ValueError(f"Invalid GPU range: {piece}")
+            gpu_ids.extend(str(gpu_id) for gpu_id in range(start, end + 1))
+        else:
+            gpu_ids.append(piece)
+    if not gpu_ids:
+        raise ValueError("--gpu-ids must contain at least one GPU id")
+    return gpu_ids
 
 
 def discover_checkpoints(checkpoint_dir: Path) -> list[tuple[int, Path]]:
@@ -165,14 +199,19 @@ def run_eval_for_checkpoint(
     *,
     checkpoint_path: Path,
     step: int,
+    gpu_id: str,
+    worker_slot: int,
     log_dir: Path,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     trajectory_metrics_path = log_dir / "trajectory_metrics.json"
     if args.resume and trajectory_metrics_path.exists():
-        return summarize_episode_metrics(
+        row = summarize_episode_metrics(
             step, checkpoint_path, trajectory_metrics_path, args.reward_key
         )
+        row["gpu_id"] = gpu_id
+        row["log_dir"] = str(log_dir)
+        return row
 
     env = os.environ.copy()
     env.update(
@@ -180,27 +219,34 @@ def run_eval_for_checkpoint(
             "VENV_DIR": args.venv_dir,
             "CHECKPOINT_PATH": str(checkpoint_path),
             "LOG_DIR": str(log_dir),
-            "GPU_IDS": args.gpu_ids,
+            "GPU_IDS": gpu_id,
             "NUM_EVAL_EPISODES": str(args.num_eval_episodes),
             "NUM_ENVS": str(args.num_envs),
             "MAX_EPISODE_STEPS": str(args.max_episode_steps),
             "SEED": str(args.seed),
             "EVAL_ACTION_SCALE": str(args.action_scale),
             "SAVE_VIDEO": "true" if args.save_video else "false",
+            "MANAGE_RAY": "false",
             "RAY_TMP_DIR": f"/tmp/ray_eval_wrist_{os.getpid()}_{step}",
         }
     )
+    unique_suffix = f"{os.getpid()}_{worker_slot}_{step}"
     cmd = [
         "bash",
         str(REPO_PATH / "run_train/eval_checkpoint/run_peginsertion_wrist.sh"),
         "--save-episode-metrics",
+        f"env.group_name=EnvGroupEval{unique_suffix}",
+        f"rollout.group_name=RolloutGroupEval{unique_suffix}",
         *args.hydra_override,
     ]
-    print(f"[step {step}] evaluating {checkpoint_path}", flush=True)
+    print(f"[gpu {gpu_id} step {step}] evaluating {checkpoint_path}", flush=True)
     subprocess.run(cmd, cwd=REPO_PATH, env=env, check=True)
-    return summarize_episode_metrics(
+    row = summarize_episode_metrics(
         step, checkpoint_path, trajectory_metrics_path, args.reward_key
     )
+    row["gpu_id"] = gpu_id
+    row["log_dir"] = str(log_dir)
+    return row
 
 
 def write_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
@@ -275,6 +321,86 @@ def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     print(f"Wrote {reward_path}")
 
 
+def start_shared_ray(args: argparse.Namespace) -> None:
+    ray_bin = Path(args.venv_dir).expanduser().resolve() / "bin" / "ray"
+    if not ray_bin.exists():
+        raise FileNotFoundError(f"Ray binary does not exist: {ray_bin}")
+    ray_tmp_dir = Path(f"/tmp/ray_eval_wrist_sweep_{os.getpid()}")
+    ray_tmp_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run([str(ray_bin), "stop"], check=False, stdout=subprocess.DEVNULL)
+    subprocess.run(
+        [str(ray_bin), "start", "--head", f"--temp-dir={ray_tmp_dir}"],
+        check=True,
+    )
+
+
+def stop_shared_ray(args: argparse.Namespace) -> None:
+    ray_bin = Path(args.venv_dir).expanduser().resolve() / "bin" / "ray"
+    if ray_bin.exists():
+        subprocess.run([str(ray_bin), "stop"], check=False, stdout=subprocess.DEVNULL)
+
+
+def run_checkpoint_sweep(
+    checkpoints: list[tuple[int, Path]],
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    rows: list[dict[str, Any]] = []
+    completed: dict[int, dict[str, Any]] = {}
+    rows_lock = threading.Lock()
+    task_queue: queue.Queue[tuple[int, Path]] = queue.Queue()
+    for item in checkpoints:
+        task_queue.put(item)
+
+    def gpu_worker(worker_slot: int, gpu_id: str) -> None:
+        nonlocal rows
+        while True:
+            try:
+                step, checkpoint_path = task_queue.get_nowait()
+            except queue.Empty:
+                return
+            log_dir = output_dir / f"global_step_{step}"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                row = run_eval_for_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    step=step,
+                    gpu_id=gpu_id,
+                    worker_slot=worker_slot,
+                    log_dir=log_dir,
+                    args=args,
+                )
+            except Exception as exc:
+                if not args.continue_on_error:
+                    raise
+                row = {
+                    "step": step,
+                    "checkpoint_path": str(checkpoint_path),
+                    "gpu_id": gpu_id,
+                    "error": str(exc),
+                }
+                print(f"[gpu {gpu_id} step {step}] failed: {exc}", file=sys.stderr)
+            finally:
+                task_queue.task_done()
+
+            with rows_lock:
+                completed[step] = row
+                rows = [completed[item_step] for item_step in sorted(completed)]
+                write_rows(rows, output_dir)
+                plot_rows(rows, output_dir)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
+        futures = [
+            executor.submit(gpu_worker, worker_slot, gpu_id)
+            for worker_slot, gpu_id in enumerate(gpu_ids)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+
+    return rows
+
+
 def main() -> None:
     args = parse_args()
     if args.num_eval_episodes <= 0 or args.num_envs <= 0:
@@ -300,29 +426,13 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    rows: list[dict[str, Any]] = []
-    for step, checkpoint_path in checkpoints:
-        log_dir = output_dir / f"global_step_{step}"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            row = run_eval_for_checkpoint(
-                checkpoint_path=checkpoint_path,
-                step=step,
-                log_dir=log_dir,
-                args=args,
-            )
-        except Exception as exc:
-            if not args.continue_on_error:
-                raise
-            row = {
-                "step": step,
-                "checkpoint_path": str(checkpoint_path),
-                "error": str(exc),
-            }
-            print(f"[step {step}] failed: {exc}", file=sys.stderr)
-        rows.append(row)
-        write_rows(rows, output_dir)
-        plot_rows(rows, output_dir)
+    if args.manage_ray:
+        start_shared_ray(args)
+    try:
+        run_checkpoint_sweep(checkpoints, output_dir, args)
+    finally:
+        if args.manage_ray:
+            stop_shared_ray(args)
 
 
 if __name__ == "__main__":

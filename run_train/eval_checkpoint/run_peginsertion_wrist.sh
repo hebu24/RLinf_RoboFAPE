@@ -43,6 +43,11 @@ if [[ ! -e "${CHECKPOINT_PATH}" ]]; then
   echo "Checkpoint does not exist: ${CHECKPOINT_PATH}" >&2
   exit 1
 fi
+if [[ "$(basename "${CHECKPOINT_PATH}")" == "checkpoints" ]]; then
+  echo "CHECKPOINT_PATH must point to one global_step_<N>/actor directory, not the checkpoints root." >&2
+  echo "Use sweep_peginsertion_wrist.py --checkpoint-dir ${CHECKPOINT_PATH} to evaluate all steps." >&2
+  exit 1
+fi
 if ! "${PYTHON_BIN}" -c "import openpi" >/dev/null 2>&1; then
   echo "OpenPI is not installed in ${VENV_DIR}." >&2
   exit 1
@@ -60,11 +65,14 @@ ulimit -n 1048576 2>/dev/null || true
 
 # RLinf placement uses physical GPU IDs, so Ray must discover all GPUs.
 unset CUDA_VISIBLE_DEVICES
-"${RAY_BIN}" stop >/dev/null 2>&1 || true
-RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray_eval_wrist}"
-mkdir -p "${RAY_TMP_DIR}"
-"${RAY_BIN}" start --head --temp-dir="${RAY_TMP_DIR}"
-trap '"${RAY_BIN}" stop >/dev/null 2>&1 || true' EXIT
+MANAGE_RAY="${MANAGE_RAY:-true}"
+if [[ "${MANAGE_RAY}" == "true" ]]; then
+  "${RAY_BIN}" stop >/dev/null 2>&1 || true
+  RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray_eval_wrist}"
+  mkdir -p "${RAY_TMP_DIR}"
+  "${RAY_BIN}" start --head --temp-dir="${RAY_TMP_DIR}"
+  trap '"${RAY_BIN}" stop >/dev/null 2>&1 || true' EXIT
+fi
 
 LOG_DIR="${LOG_DIR:-${REPO_PATH}/logs/$(date +'%Y%m%d-%H%M%S')-eval-${TASK_ID}}"
 mkdir -p "${LOG_DIR}"
