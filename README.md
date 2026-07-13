@@ -236,8 +236,99 @@ OPENPI_CONFIG_NAME  openpi config used for norm_stats (default: pi05_maniskill_p
 RESUME_DIR          optional checkpoint dir to resume from (same as sft_finetune.sh)
 ```
 
-For the wrist variant, set both `CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist` and
-`OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist`.
+For the wrist variant, run in a detached tmux session so it survives SSH disconnect.
+It starts its own Ray head on port `6379` (`SFT_RAY_PORT`), isolated from any eval
+sweep on `6380`; GPUs 4-7 are disjoint from the eval's 0-3 so they don't OOM each
+other. Safe to run concurrently with the §4 insert-only sweep — neither calls a bare
+`ray stop`; teardown is scoped to each script's own port.
+
+```bash
+tmux new-session -d -s sft_pi05_wrist "cd /opt/yingxi/RLinf_RoboFAPE && \
+  DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_12800 \
+  GPU_IDS=4,5,6,7 \
+  CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist \
+  OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist \
+  PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist \
+  PYTHONUNBUFFERED=1 bash sft_finetune_pi05base.sh 2>&1 \
+    | tee /opt/yingxi/RLinf_RoboFAPE/logs/sft_pi05base_wrist_tmux.log"
+tmux attach -t sft_pi05_wrist   # detach: Ctrl-b d
+```
+
+### 3.2 Actual-EE-delta training (use_target=False eval)
+
+Variant whose SFT labels are **actual-EE frame-to-frame deltas** so they match
+the `use_target=False` eval regime (`pd_ee_delta_pose`, closed-loop: each delta
+integrates from the actual EE). This is the closed-loop counterpart to the
+default target-delta workflow and is more robust to drift (small-range retry
+instead of large-range OOD departure).
+
+The fastest path is to **convert the existing 3200 dataset** (which already
+stores `debug.tcp_after` per step from a `use_target=True` collection run):
+labels are rewritten from target-delta to actual-EE-delta in place, videos are
+symlinked, and `stats.json` is recomputed.
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+/opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/convert_controller_to_actual_ee.py \
+  --src  /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200 \
+  --dst  /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_actual_ee_3200
+```
+
+To collect fresh actual-EE-delta data instead (execution still uses
+`use_target=True` for high tracking success; labels are derived from the
+recorded post-step TCP), run the variant collector:
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+MPLCONFIGDIR=/tmp/matplotlib \
+/opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/collect_peg_insertion_actual_ee_delta.py \
+  --num-traj 3200 \
+  --output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_actual_ee_3200 \
+  --seed 0 \
+  --gpu-ids 0
+```
+
+Train on the actual-EE-delta dataset **from the generic `pi05_base` with
+freshly-computed norm_stats** (the actual-EE-delta action distribution differs
+from the target-delta/base stats, so norm_stats must be recomputed). Reuse
+`sft_finetune_pi05base.sh` (§3.1) with the actual-EE config/data/asset dirs;
+it symlinks `pi05_base` weights, computes `norm_stats.json` from the
+actual-EE-delta dataset, and writes both into a dedicated prepared-base dir:
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_actual_ee_3200 \
+CONFIG_NAME=peg_insertion_sft_openpi_pi05_actual_ee \
+OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_actual_ee \
+PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_actual_ee \
+EXPERIMENT_NAME=peg_insertion_sft_actual_ee \
+GPU_IDS=0,1,2,3 \
+bash sft_finetune_pi05base.sh
+```
+
+`PREPARED_BASE` is kept separate (`pi05_base_peg_actual_ee` vs the target-delta
+`pi05_base_peg`) so the two norm_stats files do not overwrite each other.
+`FORCE_NORM_STATS=1` recomputes; otherwise the cached `norm_stats.json` is
+reused. The SFT config (`examples/sft/config/peg_insertion_sft_openpi_pi05_actual_ee.yaml`) uses:
+
+```text
+config_name: pi05_maniskill_peg_insertion_actual_ee
+num_images_in_input: 2          # wrist variant
+num_action_chunks: 10
+action_horizon: 10
+add_value_head: False
+```
+
+Action label semantics (also written to the dataset `meta/info.json`):
+
+```text
+policy output: [dx, dy, dz, droll, dpitch, dyaw, gripper]   # actual-EE-delta
+rotation: Euler XYZ
+execution controller: ManiSkill pd_ee_target_delta_pose (use_target=True, for tracking success)
+label source: actions[t] = tcp_after[t+1] - tcp_after[t]  (from recorded post-step TCP)
+required eval controller: pd_ee_delta_pose (use_target=False, closed-loop)
+required eval action scale: 1.0
+```
 
 ## 4. Evaluate SFT Checkpoint
 
@@ -401,62 +492,46 @@ To sweep every `global_step_*/actor` checkpoint under a wrist SFT run in
 insert-only mode, pass `--run-script`:
 
 ```bash
-cd /opt/yingxi/RLinf_RoboFAPE
-
-# Own Ray head on port 6380, disjoint GPUs from SFT (SFT on 4-7, sweep on 0-3 here).
-MPLCONFIGDIR=/tmp/matplotlib \
-/opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
-  --ray-port 6380 \
-  --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
-  --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
-  --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep \
-  --num-eval-episodes 10 \
-  --num-envs 1 \
-  --gpu-ids 0,1,2,3 \
-  --action-scale 1.0
+tmux new-session -d -s eval_sweep "cd /opt/yingxi/RLinf_RoboFAPE && \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
+    --ray-port 6380 \
+    --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
+    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
+    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep \
+    --num-eval-episodes 10 --num-envs 1 --gpu-ids 0,1,2,3 --action-scale 1.0 \
+    2>&1 | tee /opt/yingxi/RLinf_RoboFAPE/logs/eval_sweep_insert_only_tmux.log"
+tmux attach -t eval_sweep   # detach: Ctrl-b d
 ```
 
 Per-episode planning adds a CPU solve (~seconds) per episode, so insert-only
 sweeps are slower than full-task sweeps at the same episode count.
 
-### Actual-EE wrist checkpoint evaluation
+### Actual-EE-delta checkpoint evaluation
 
-The actual-EE-delta variant trains on actual end-effector delta labels
-(`collect_peg_insertion_actual_ee_delta.py` / `convert_controller_to_actual_ee.py`)
-and evaluates with `policy_setup=panda-ee-dpose -> pd_ee_delta_pose`
-(`use_target=False`, closed-loop: each delta integrates from the actual EE).
-`run_peginsertion_actual_ee.sh` is a thin wrapper over `run_peginsertion_wrist.sh`
-that only swaps the config to
-`maniskill_peg_insertion_vertical_sft_eval_openpi_pi05_actual_ee`, so it inherits
-the section-4 Ray isolation verbatim (own head on `EVAL_RAY_PORT`/`--ray-port`,
-scoped teardown, no bare `ray stop`). `sft_finetune_actual_ee.sh` is the matching
-trainer on its own `SFT_RAY_PORT=6381` (distinct from the wrist SFT's 6379).
-
-Train (own Ray head on port 6381, isolated from wrist SFT 6379 and eval 6380/6390):
-
-```bash
-cd /opt/yingxi/RLinf_RoboFAPE
-
-DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_actual_ee_3200 \
-GPU_IDS=0,1,2,3 \
-bash sft_finetune_actual_ee.sh
-```
-
-Single checkpoint eval (own Ray head on port 6380, disjoint GPUs from SFT):
+Evaluate checkpoints trained with `sft_finetune_pi05base.sh` (actual-EE-delta
+config, §3.2) under the `use_target=False` regime (`pd_ee_delta_pose`,
+closed-loop). Use the `run_peginsertion_actual_ee.sh` wrapper, which points at
+`maniskill_peg_insertion_vertical_sft_eval_openpi_pi05_actual_ee` (sets
+`policy_setup: panda-ee-dpose`). `eval_checkpoint.py` accepts both
+`panda-ee-target-dpose` and `panda-ee-dpose`.
 
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
 VENV_DIR=/opt/kairan/envs/rlinf \
-CHECKPOINT_PATH=/path/to/actual-ee-sft/checkpoints/global_step_N/actor \
-GPU_IDS=0-3 NUM_EVAL_EPISODES=8 NUM_ENVS=4 EVAL_ACTION_SCALE=1.0 \
-SAVE_VIDEO=true MANAGE_RAY=true EVAL_RAY_PORT=6380 \
+CHECKPOINT_PATH=/path/to/peg-insertion-actual-ee-sft/checkpoints/global_step_N/actor \
+GPU_IDS=0-3 \
+NUM_EVAL_EPISODES=8 \
+NUM_ENVS=4 \
+EVAL_ACTION_SCALE=1.0 \
+SAVE_VIDEO=true \
+MANAGE_RAY=true \
+EVAL_RAY_PORT=6380 \
 bash run_train/eval_checkpoint/run_peginsertion_actual_ee.sh
 ```
 
-Sweep every `global_step_*/actor` checkpoint (own Ray head on port 6390; the sweep
-forces `MANAGE_RAY=false` per checkpoint so each subprocess attaches to the 6390
-head via `RAY_ADDRESS`):
+To sweep every `global_step_*/actor` checkpoint under an actual-EE SFT run:
 
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
@@ -465,16 +540,20 @@ MPLCONFIGDIR=/tmp/matplotlib \
 /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
   --run-script run_train/eval_checkpoint/run_peginsertion_actual_ee.sh \
   --ray-port 6390 \
-  --checkpoint-dir /path/to/actual-ee-sft/checkpoints \
-  --output-dir /path/to/actual_ee_eval_sweep \
-  --num-eval-episodes 10 --num-envs 1 --gpu-ids 4,5,7 --action-scale 1.0 \
+  --checkpoint-dir /path/to/peg-insertion-actual-ee-sft/checkpoints \
+  --output-dir  /path/to/actual_ee_eval_sweep \
+  --num-eval-episodes 10 \
+  --num-envs 1 \
+  --gpu-ids 4,5,7 \
+  --action-scale 1.0 \
   --resume --continue-on-error
 ```
 
-> Avoid GPU 6 for ManiSkill eval here — its Vulkan renderer hangs. The three ports
-> (SFT `6381`, single-eval `6380`, sweep `6390`) are distinct, so training + eval +
-> sweep can all run concurrently without one `ray stop`-ing the other (and none
-> calls a bare `ray stop`).
+Avoid `--gpu-ids 6` on this host: GPU6's Vulkan renderer intermittently hangs
+(`ErrorDeviceLost` / camera-group creation failure). `--ray-port 6390` keeps the
+sweep's Ray head disjoint from SFT (6379) and the target-delta eval sweeps
+(6380). `--resume` skips checkpoints that already wrote `trajectory_metrics.json`;
+`--continue-on-error` records a failed checkpoint and continues.
 
 ## 5. PPO / RL From SFT
 
