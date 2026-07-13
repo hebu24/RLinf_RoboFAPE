@@ -960,25 +960,6 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
-        # Real-time chunking knobs (eval-only). Defaults preserve open-loop behavior.
-        _eval_execute_chunks = int(
-            cfg.env.eval.get("execute_action_chunks", model_cfg.num_action_chunks)
-        )
-        _eval_ensemble_m = float(cfg.env.eval.get("temporal_ensemble_weight", 0.0))
-        assert 1 <= _eval_execute_chunks <= model_cfg.num_action_chunks, (
-            f"env.eval.execute_action_chunks must be in "
-            f"[1, {model_cfg.num_action_chunks}], got {_eval_execute_chunks}"
-        )
-        assert _eval_ensemble_m >= 0.0, (
-            f"env.eval.temporal_ensemble_weight must be >= 0, "
-            f"got {_eval_ensemble_m}"
-        )
-        assert (
-            cfg.env.eval.max_steps_per_rollout_epoch % _eval_execute_chunks == 0
-        ), (
-            f"env.eval.max_steps_per_rollout_epoch must be divisible by "
-            f"env.eval.execute_action_chunks ({_eval_execute_chunks})"
-        )
 
     if not only_eval:
         assert cfg.env.train.total_num_envs > 0, (

@@ -31,7 +31,7 @@ from rlinf.data.embodied_io_struct import (
     convert_trajectories_to_batch,
 )
 from rlinf.envs import get_env_cls
-from rlinf.envs.action_utils import TemporalEnsembleBuffer, prepare_actions
+from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
@@ -136,30 +136,9 @@ class EnvWorker(Worker):
             )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
-            # Real-time chunking: execute only the first k actions of each predicted
-            # chunk before re-querying the model. k defaults to num_action_chunks
-            # (current open-loop behavior). With temporal_ensemble_weight m > 0,
-            # overlapping predictions are time-weighted-blended (ACT) before the
-            # (linear) panda action conversion. See TemporalEnsembleBuffer.
-            self.eval_execute_chunks = int(
-                self.cfg.env.eval.get(
-                    "execute_action_chunks", self.model_cfg.num_action_chunks
-                )
-            )
-            self.eval_ensemble_m = float(
-                self.cfg.env.eval.get("temporal_ensemble_weight", 0.0)
-            )
-            assert 1 <= self.eval_execute_chunks <= self.model_cfg.num_action_chunks, (
-                f"env.eval.execute_action_chunks must be in "
-                f"[1, {self.model_cfg.num_action_chunks}], got {self.eval_execute_chunks}"
-            )
-            assert self.eval_ensemble_m >= 0.0, (
-                f"env.eval.temporal_ensemble_weight must be >= 0, "
-                f"got {self.eval_ensemble_m}"
-            )
             self.n_eval_chunk_steps = (
                 self.cfg.env.eval.max_steps_per_rollout_epoch
-                // self.eval_execute_chunks
+                // self.model_cfg.num_action_chunks
             )
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
@@ -177,11 +156,6 @@ class EnvWorker(Worker):
                 torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
-            # Per-stage temporal-ensemble state for eval real-time chunking (m > 0).
-            # Created lazily in env_evaluate_step once the env device is known, because
-            # eval envs are constructed per stage after __init__.
-            self.eval_ensemble_buffers: list = [None] * self.stage_num
-            self.eval_ensemble_step: list[int] = [0] * self.stage_num
         self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
 
         if self.env_decoupled_mode:
@@ -492,50 +466,12 @@ class EnvWorker(Worker):
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to evaluate the environment.
-
-        Real-time chunking: when env.eval.execute_action_chunks (k) <
-        num_action_chunks, only the first k actions of the predicted chunk are
-        executed before the model is re-queried. When
-        env.eval.temporal_ensemble_weight (m) > 0, the k executed actions are
-        time-weighted blends of all overlapping buffered predictions (ACT-style
-        temporal ensembling), closing the within-chunk open loop and smoothing
-        chunk-boundary discontinuity. Defaults (k = num_action_chunks, m = 0)
-        reproduce the original open-loop behavior.
         """
-        k = self.eval_execute_chunks
-        m = self.eval_ensemble_m
-        env = self.eval_env_list[stage_id]
-
-        if m > 0:
-            # Temporal ensembling: blend overlapping predictions across the k
-            # executed steps. Buffer holds raw (post-Unnormalize) model actions.
-            if self.eval_ensemble_buffers[stage_id] is None:
-                num_envs = env.num_envs
-                device = env.device
-                self.eval_ensemble_buffers[stage_id] = TemporalEnsembleBuffer(
-                    horizon=self.model_cfg.num_action_chunks,
-                    m=m,
-                    num_envs=num_envs,
-                    device=device,
-                )
-            buffer = self.eval_ensemble_buffers[stage_id]
-            base_step = self.eval_ensemble_step[stage_id]
-            buffer.push(raw_actions, predict_step=base_step)
-            # Build the k blended raw actions [B, k, D] by aging the buffer.
-            blended = []
-            for s in range(k):
-                blended.append(buffer.current_action(base_step + s))
-            blended_chunk = torch.stack(blended, dim=1)  # [B, k, D]
-            exec_raw = blended_chunk
-        else:
-            # Pure slicing: execute the first k raw actions directly.
-            exec_raw = raw_actions[:, :k, :]
-
         chunk_actions = prepare_actions(
-            raw_chunk_actions=exec_raw,
+            raw_chunk_actions=raw_actions,
             env_type=self.cfg.env.eval.env_type,
             model_type=self.model_cfg.model_type,
-            num_action_chunks=k,
+            num_action_chunks=self.model_cfg.num_action_chunks,
             action_dim=self.model_cfg.action_dim,
             action_scale=self.cfg.env.eval.get("action_scale", 1.0),
             policy=self.model_cfg.get("policy_setup", None),
@@ -544,7 +480,7 @@ class EnvWorker(Worker):
         env_info = {}
 
         obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
-            env.chunk_step(chunk_actions)
+            self.eval_env_list[stage_id].chunk_step(chunk_actions)
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -568,15 +504,6 @@ class EnvWorker(Worker):
             prev = self.eval_prev_done[stage_id].to(current_dones.device)
             newly_done = current_dones & ~prev
             self.eval_prev_done[stage_id] = prev | current_dones
-
-        if m > 0:
-            # Advance the global step; drop stale predictions for reset envs so
-            # the next chunk's blend does not mix in pre-reset predictions.
-            self.eval_ensemble_step[stage_id] += k
-            if newly_done.any():
-                buffer.mark_reset(
-                    newly_done, step=self.eval_ensemble_step[stage_id]
-                )
 
         if newly_done.any():
             if "final_info" in infos:

@@ -82,6 +82,12 @@ env:
     use_wrist_image: True
     group_size: ${algorithm.group_size}
     is_eval: True
+    # Real-time chunking: predict the full 10-step chunk each query but execute
+    # only the first k actions before re-querying, closing the within-chunk
+    # open loop. temporal_ensemble_weight > 0 time-weighted-blends overlapping
+    # predictions (ACT) for smoothness. A/B against k=10, m=0 for the baseline.
+    execute_action_chunks: 5
+    temporal_ensemble_weight: 0.01
     reset_options:
       randomize_initial_poses: False
     video_cfg:
