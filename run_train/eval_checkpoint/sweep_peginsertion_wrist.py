@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: I001
 """Evaluate every wrist PegInsertion checkpoint and plot metrics by step."""
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import json
 import os
 import queue
 import re
+import resource
 import subprocess
 import sys
 import threading
@@ -50,6 +52,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--venv-dir", default="/opt/kairan/envs/rlinf")
     parser.add_argument("--gpu-ids", default="0-3")
+    parser.add_argument(
+        "--ray-num-cpus",
+        type=int,
+        default=None,
+        help=(
+            "CPUs exposed by the shared Ray head. Defaults to max(8, 4 per "
+            "evaluation GPU) to avoid an oversized idle worker pool."
+        ),
+    )
     parser.add_argument("--num-eval-episodes", type=int, default=10)
     parser.add_argument("--num-envs", type=int, default=5)
     parser.add_argument("--max-episode-steps", type=int, default=600)
@@ -321,15 +332,40 @@ def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     print(f"Wrote {reward_path}")
 
 
+def raise_file_descriptor_limit(minimum: int = 65536) -> None:
+    """Raise RLIMIT_NOFILE before Ray inherits the sweep process limits."""
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target_limit = min(max(soft_limit, minimum), hard_limit)
+    if target_limit > soft_limit:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard_limit))
+    if target_limit < minimum:
+        raise RuntimeError(
+            f"Ray needs at least {minimum} open files for a concurrent sweep, but "
+            f"this shell hard limit is {hard_limit}. Raise it before launching."
+        )
+    print(f"Ray file descriptor limit: {target_limit}", flush=True)
+
+
 def start_shared_ray(args: argparse.Namespace) -> None:
+    raise_file_descriptor_limit()
     ray_bin = Path(args.venv_dir).expanduser().resolve() / "bin" / "ray"
     if not ray_bin.exists():
         raise FileNotFoundError(f"Ray binary does not exist: {ray_bin}")
     ray_tmp_dir = Path(f"/tmp/ray_eval_wrist_sweep_{os.getpid()}")
     ray_tmp_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run([str(ray_bin), "stop"], check=False, stdout=subprocess.DEVNULL)
+    gpu_count = len(parse_gpu_ids(args.gpu_ids))
+    ray_num_cpus = args.ray_num_cpus or max(8, 4 * gpu_count)
+    if ray_num_cpus <= 0:
+        raise ValueError("--ray-num-cpus must be positive")
     subprocess.run(
-        [str(ray_bin), "start", "--head", f"--temp-dir={ray_tmp_dir}"],
+        [
+            str(ray_bin),
+            "start",
+            "--head",
+            f"--temp-dir={ray_tmp_dir}",
+            f"--num-cpus={ray_num_cpus}",
+        ],
         check=True,
     )
 

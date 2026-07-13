@@ -54,11 +54,21 @@ export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 
 # RLinf placement uses physical GPU IDs, so Ray must discover all GPUs.
 unset CUDA_VISIBLE_DEVICES
-"${RAY_BIN}" stop >/dev/null 2>&1 || true
-RAY_TMP_DIR="${REPO_PATH}/logs/ray_tmp"
-mkdir -p "${RAY_TMP_DIR}"
-"${RAY_BIN}" start --head --temp-dir="${RAY_TMP_DIR}"
-trap '"${RAY_BIN}" stop >/dev/null 2>&1 || true' EXIT
+# Attach to an existing training cluster by default. Never stop an existing Ray.
+MANAGE_RAY="${MANAGE_RAY:-false}"
+_EVAL_STARTED_RAY=false
+if [[ "${MANAGE_RAY}" == "true" ]]; then
+  if "${RAY_BIN}" status >/dev/null 2>&1; then
+    echo "Reusing the existing Ray cluster; evaluation will not stop it."
+  else
+    RAY_TMP_DIR="${RAY_TMP_DIR:-${REPO_PATH}/logs/ray_tmp}"
+    mkdir -p "${RAY_TMP_DIR}"
+    "${RAY_BIN}" start --head --temp-dir="${RAY_TMP_DIR}"
+    _EVAL_STARTED_RAY=true
+    export RLINF_EVAL_STARTED_RAY=1
+    trap 'if [[ "${_EVAL_STARTED_RAY}" == "true" ]]; then "${RAY_BIN}" stop >/dev/null 2>&1 || true; fi' EXIT
+  fi
+fi
 
 LOG_DIR="${LOG_DIR:-${REPO_PATH}/logs/$(date +'%Y%m%d-%H%M%S')-eval-${TASK_ID}}"
 mkdir -p "${LOG_DIR}"

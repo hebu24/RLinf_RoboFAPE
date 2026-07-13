@@ -63,15 +63,23 @@ export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 # Raise fd limit so raylet can manage many worker connections on multi-GPU runs.
 ulimit -n 1048576 2>/dev/null || true
 
-# RLinf placement uses physical GPU IDs, so Ray must discover all GPUs.
-unset CUDA_VISIBLE_DEVICES
-MANAGE_RAY="${MANAGE_RAY:-true}"
+# Attach to an existing training cluster by default (MANAGE_RAY=false).
+# Stopping/restarting Ray here would terminate an SFT job running on the same host.
+# Set MANAGE_RAY=true to let this script manage its own Ray cluster (only starts
+# a new one if no cluster is running; never stops an existing one).
+MANAGE_RAY="${MANAGE_RAY:-false}"
+_EVAL_STARTED_RAY=false
 if [[ "${MANAGE_RAY}" == "true" ]]; then
-  "${RAY_BIN}" stop >/dev/null 2>&1 || true
-  RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray_eval_wrist}"
-  mkdir -p "${RAY_TMP_DIR}"
-  "${RAY_BIN}" start --head --temp-dir="${RAY_TMP_DIR}"
-  trap '"${RAY_BIN}" stop >/dev/null 2>&1 || true' EXIT
+  if "${RAY_BIN}" status >/dev/null 2>&1; then
+    echo "Reusing the existing Ray cluster; evaluation will not stop it."
+  else
+    RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray_eval_wrist}"
+    mkdir -p "${RAY_TMP_DIR}"
+    "${RAY_BIN}" start --head --temp-dir="${RAY_TMP_DIR}"
+    _EVAL_STARTED_RAY=true
+    export RLINF_EVAL_STARTED_RAY=1
+    trap 'if [[ "${_EVAL_STARTED_RAY}" == "true" ]]; then "${RAY_BIN}" stop >/dev/null 2>&1 || true; fi' EXIT
+  fi
 fi
 
 LOG_DIR="${LOG_DIR:-${REPO_PATH}/logs/$(date +'%Y%m%d-%H%M%S')-eval-${TASK_ID}}"

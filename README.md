@@ -82,7 +82,7 @@ MPLCONFIGDIR=/tmp/matplotlib \
   --output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_12800 \
   --seed 0 \
   --num-workers 32 \
-  --gpu-ids 0,1,2,3 \
+  --gpu-ids 4,5,6,7 \
   --worker-stagger 5.0
 ```
 
@@ -234,11 +234,11 @@ cd /opt/yingxi/RLinf_RoboFAPE
 
 MPLCONFIGDIR=/tmp/matplotlib \
 /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
-  --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
-  --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_eval_sweep \
+  --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
+  --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_eval_sweep \
   --num-eval-episodes 10 \
-  --num-envs 2 \
-  --gpu-ids 2,3 \
+  --num-envs 1 \
+  --gpu-ids 0,1,2,3 \
   --action-scale 1.0
 ```
 

@@ -279,6 +279,19 @@ class Channel:
         else:
             self._local_channel_id = None
 
+    def close(self) -> None:
+        """Close this channel and release its backing Ray actors."""
+        if self._local_channel is not None:
+            Channel.local_channel_map.pop(self._local_channel_id, None)
+            self._local_channel = None
+            return
+        if self._channel_worker_group is not None:
+            self._channel_worker_group.close()
+            self._channel_worker_group = None
+        self._main_channel_worker_actor = None
+        self._channel_actors_by_rank.clear()
+        self._key_to_channel_rank_cache.clear()
+
     @property
     def is_local(self):
         """Check if the channel is a local channel."""

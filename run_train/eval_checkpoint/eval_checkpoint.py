@@ -16,9 +16,11 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
+import ray
 import torch.multiprocessing as mp
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -262,42 +264,62 @@ def _json_value(value: Any) -> Any:
 
 
 def _run_eval(cfg: DictConfig) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    cluster = Cluster(cluster_cfg=cfg.cluster)
-    placement = HybridComponentPlacement(cfg, cluster)
-    rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
-        cluster,
-        name=cfg.rollout.group_name,
-        placement_strategy=placement.get_strategy("rollout"),
-    )
-    env_group = EnvWorker.create_group(cfg).launch(
-        cluster,
-        name=cfg.env.group_name,
-        placement_strategy=placement.get_strategy("env"),
-    )
-    runner = EmbodiedEvalRunner(cfg=cfg, rollout=rollout_group, env=env_group)
-    runner.init_workers()
-    env_handle = runner.env.evaluate(
-        input_channel=runner.env_channel,
-        rollout_channel=runner.rollout_channel,
-    )
-    rollout_handle = runner.rollout.evaluate(
-        input_channel=runner.rollout_channel,
-        output_channel=runner.env_channel,
-    )
-    env_results = env_handle.wait()
-    env_decoupled_mode = cfg.runner.get("enable_decoupled_mode", False)
-    if not env_decoupled_mode:
-        rollout_handle.wait()
-    eval_metrics_list = [results for results in env_results if results is not None]
-    metrics = {
-        key: _json_value(value)
-        for key, value in compute_evaluate_metrics(eval_metrics_list).items()
-    }
-    prefixed_metrics = {f"eval/{key}": value for key, value in metrics.items()}
-    runner.logger.info(prefixed_metrics)
-    runner.metric_logger.log(step=0, data=prefixed_metrics)
-    runner.metric_logger.finish()
-    return metrics, eval_metrics_list
+    rollout_group = None
+    env_group = None
+    runner = None
+    try:
+        cluster = Cluster(cluster_cfg=cfg.cluster)
+        placement = HybridComponentPlacement(cfg, cluster)
+        rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
+            cluster,
+            name=cfg.rollout.group_name,
+            placement_strategy=placement.get_strategy("rollout"),
+        )
+        env_group = EnvWorker.create_group(cfg).launch(
+            cluster,
+            name=cfg.env.group_name,
+            placement_strategy=placement.get_strategy("env"),
+        )
+        runner = EmbodiedEvalRunner(cfg=cfg, rollout=rollout_group, env=env_group)
+        runner.init_workers()
+        env_handle = runner.env.evaluate(
+            input_channel=runner.env_channel,
+            rollout_channel=runner.rollout_channel,
+        )
+        rollout_handle = runner.rollout.evaluate(
+            input_channel=runner.rollout_channel,
+            output_channel=runner.env_channel,
+        )
+        env_results = env_handle.wait()
+        env_decoupled_mode = cfg.runner.get("enable_decoupled_mode", False)
+        if not env_decoupled_mode:
+            rollout_handle.wait()
+        eval_metrics_list = [results for results in env_results if results is not None]
+        metrics = {
+            key: _json_value(value)
+            for key, value in compute_evaluate_metrics(eval_metrics_list).items()
+        }
+        prefixed_metrics = {f"eval/{key}": value for key, value in metrics.items()}
+        runner.logger.info(prefixed_metrics)
+        runner.metric_logger.log(step=0, data=prefixed_metrics)
+        return metrics, eval_metrics_list
+    finally:
+        if runner is not None:
+            runner.metric_logger.finish()
+        if env_group is not None:
+            env_group.close()
+        if rollout_group is not None:
+            rollout_group.close()
+        if runner is not None:
+            runner.env_channel.close()
+            runner.rollout_channel.close()
+        if ray.is_initialized():
+            # Only shut down if this process started the Ray cluster.
+            # If Ray was already running before we connected (address="auto"),
+            # shutting down would kill the shared training cluster.
+            _driver_started_ray = os.environ.get("RLINF_EVAL_STARTED_RAY", "") == "1"
+            if _driver_started_ray:
+                ray.shutdown()
 
 
 def _serialize_episode_metrics(
