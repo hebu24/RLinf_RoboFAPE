@@ -26,6 +26,7 @@ cd /opt/yingxi/RLinf_RoboFAPE
 export PYTHONPATH=/opt/yingxi/RLinf_RoboFAPE:${PYTHONPATH:-}
 export PATH=/opt/kairan/envs/rlinf/bin:$PATH
 export RAY_TMPDIR=/tmp/ray_sft_pi05base
+export SFT_RAY_PORT="${SFT_RAY_PORT:-6379}"
 export CUDA_LAUNCH_BLOCKING=1
 
 # --- inputs ---
@@ -33,6 +34,9 @@ DATA_DIR="${DATA_DIR:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskil
 PI05_BASE="${PI05_BASE:-/opt/zhangchenyu/weights/pi05_base}"
 PREPARED_BASE="${PREPARED_BASE:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
+# logger experiment name (default keeps the original behavior; override for the
+# actual-EE-delta variant so its logs/checkpoints are distinguishable).
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_sft_pi05base}"
 
 # Hydra config (examples/sft/config/<NAME>.yaml) and the matching openpi config_name
 # used to compute norm_stats. Override both together for the wrist variant.
@@ -90,21 +94,40 @@ else
 fi
 
 export SFT_COMPONENT_PLACEMENT
-unset RAY_ADDRESS
+# SFT runs its OWN detached Ray head on SFT_RAY_PORT (default 6379), isolated from
+# any eval sweep cluster (port 6380). Never a bare `ray stop` (that kills ALL ray on
+# the host, incl. eval); teardown is scoped to SFT_RAY_PORT only.
+export RAY_ADDRESS="127.0.0.1:${SFT_RAY_PORT}"
 unset CUDA_VISIBLE_DEVICES
 
+_sft_scoped_ray_kill() {
+  pkill -9 -f "gcs_server.*--gcs_server_port=${SFT_RAY_PORT}"  >/dev/null 2>&1 || true
+  pkill -9 -f "raylet.*--gcs-address=[^ ]*:${SFT_RAY_PORT}"    >/dev/null 2>&1 || true
+  pkill -9 -f "dashboard.*--gcs-address=[^ ]*:${SFT_RAY_PORT}" >/dev/null 2>&1 || true
+  sleep 2
+}
+
 echo "[pi05base] Physical GPU_IDS=${GPU_IDS}; cluster.component_placement=${SFT_COMPONENT_PLACEMENT}"
+echo "[pi05base] SFT Ray head: port=${SFT_RAY_PORT}, temp_dir=${RAY_TMPDIR}, RAY_ADDRESS=${RAY_ADDRESS}"
 
 if [[ "${SFT_STOP_RAY_BEFORE_START:-1}" == "1" ]]; then
-  echo "[pi05base] Stopping existing Ray before SFT so Ray redetects physical GPU resources."
-  ray stop --force >/dev/null 2>&1 || true
+  echo "[pi05base] Clearing stale SFT Ray on port ${SFT_RAY_PORT} (scoped; does not touch other clusters)."
+  _sft_scoped_ray_kill
 fi
+
+# On SFT exit (incl. ray-start failure or interrupt), tear down ONLY the SFT head
+# (port SFT_RAY_PORT), never other clusters. Armed before `ray start` so a failed
+# start is cleaned up too.
+trap '_sft_scoped_ray_kill' EXIT
+
+# Start the SFT detached head. The driver + workers attach to it via RAY_ADDRESS.
+ray start --head --port="${SFT_RAY_PORT}" --temp-dir="${RAY_TMPDIR}"
 
 # --- (d) launch the existing Hydra SFT entrypoint, overriding model_path + experiment_name ---
 bash examples/sft/run_vla_sft.sh \
   "$CONFIG_NAME" \
   data.train_data_paths="${DATA_DIR}" \
   actor.model.model_path="${PREPARED_BASE}" \
-  runner.logger.experiment_name="peg_insertion_sft_pi05base" \
+  runner.logger.experiment_name="${EXPERIMENT_NAME}" \
   cluster.component_placement="{actor\\,env\\,rollout:${SFT_COMPONENT_PLACEMENT}}" \
   "${RESUME_DIR:+runner.resume_dir=${RESUME_DIR}}"

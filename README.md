@@ -247,11 +247,32 @@ Use the actor checkpoint produced by SFT:
 logs/<run>/peg_insertion_sft/checkpoints/global_step_<N>/actor
 ```
 
+### Ray isolation: run eval concurrently with SFT training
+
+SFT (`sft_finetune*.sh`) and eval each own a dedicated Ray head on a distinct GCS
+port, so neither can kill the other (the node-wide `ray stop` is gone; teardown is
+scoped to each script's own port). Defaults:
+
+- SFT head → port `6379` (`SFT_RAY_PORT`, temp-dir `/tmp/ray_sft*`).
+- Eval head → port `6380` (`EVAL_RAY_PORT` for single-eval, `--ray-port` for the
+  sweep; temp-dir `/tmp/ray_eval_wrist*`).
+
+Two rules for concurrent SFT + eval:
+
+1. **Disjoint GPUs** — Ray isolation does not isolate GPU memory. Keep SFT and eval
+   on different GPUs (e.g. SFT `GPU_IDS=4,5,6,7`, eval `--gpu-ids 0,1,2,3`), otherwise
+   they OOM each other.
+2. **Single-checkpoint eval needs `MANAGE_RAY=true`** — the default
+   `MANAGE_RAY=false` only attaches and errors if no 6380 head is up. The sweep
+   manages its own 6380 head automatically; override either port if needed
+   (`EVAL_RAY_PORT=6381` / `--ray-port 6381`).
+
 Run evaluation with `EVAL_ACTION_SCALE=1.0`:
 
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
+# Concurrent with SFT: own Ray head on port 6380, disjoint GPUs.
 VENV_DIR=/opt/kairan/envs/rlinf \
 CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260712-17:15:54-peg_insertion_sft_openpi_pi05-3200/peg_insertion_sft/checkpoints/global_step_20000/actor \
 GPU_IDS=0 \
@@ -259,6 +280,8 @@ NUM_EVAL_EPISODES=8 \
 NUM_ENVS=1 \
 EVAL_ACTION_SCALE=1.0 \
 SAVE_VIDEO=true \
+MANAGE_RAY=true \
+EVAL_RAY_PORT=6380 \
 bash run_train/eval_checkpoint/run_peginsertion.sh
 ```
 
@@ -274,6 +297,7 @@ Use the wrist eval wrapper for checkpoints trained with `sft_finetune_wrist.sh`:
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
+# Concurrent with SFT: own Ray head on port 6380, disjoint GPUs.
 VENV_DIR=/opt/kairan/envs/rlinf \
 CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints/global_step_20000/actor \
 GPU_IDS=0-3 \
@@ -281,6 +305,8 @@ NUM_EVAL_EPISODES=8 \
 NUM_ENVS=4 \
 EVAL_ACTION_SCALE=1.0 \
 SAVE_VIDEO=true \
+MANAGE_RAY=true \
+EVAL_RAY_PORT=6380 \
 bash run_train/eval_checkpoint/run_peginsertion_wrist.sh
 ```
 
@@ -295,8 +321,10 @@ To evaluate every `global_step_*/actor` checkpoint under a wrist SFT run, run:
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
+# Own Ray head on port 6380, disjoint GPUs from SFT (SFT on 0-3, sweep on 4-7 here).
 MPLCONFIGDIR=/tmp/matplotlib \
 /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
+  --ray-port 6380 \
   --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
   --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_eval_sweep_rtc \
   --num-eval-episodes 10 \
@@ -349,7 +377,17 @@ Use the insert-only launcher for checkpoints trained with `sft_finetune_wrist.sh
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
-VENV_DIR=/opt/kairan/envs/rlinf CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints/global_step_20000/actor GPU_IDS=0-3 NUM_EVAL_EPISODES=8 NUM_ENVS=4 EVAL_ACTION_SCALE=1.0 SAVE_VIDEO=true bash run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh
+# Concurrent with SFT: own Ray head on port 6380, disjoint GPUs.
+VENV_DIR=/opt/kairan/envs/rlinf \
+CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints/global_step_20000/actor \
+GPU_IDS=0-3 \
+NUM_EVAL_EPISODES=8 \
+NUM_ENVS=4 \
+EVAL_ACTION_SCALE=1.0 \
+SAVE_VIDEO=true \
+MANAGE_RAY=true \
+EVAL_RAY_PORT=6380 \
+bash run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh
 ```
 
 `run_peginsertion_wrist_insert_only.sh` defaults to
@@ -365,11 +403,78 @@ insert-only mode, pass `--run-script`:
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
-MPLCONFIGDIR=/tmp/matplotlib /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py   --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh   --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints   --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep   --num-eval-episodes 10   --num-envs 1   --gpu-ids 0,1,2,3   --action-scale 1.0
+# Own Ray head on port 6380, disjoint GPUs from SFT (SFT on 4-7, sweep on 0-3 here).
+MPLCONFIGDIR=/tmp/matplotlib \
+/opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
+  --ray-port 6380 \
+  --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
+  --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
+  --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep \
+  --num-eval-episodes 10 \
+  --num-envs 1 \
+  --gpu-ids 0,1,2,3 \
+  --action-scale 1.0
 ```
 
 Per-episode planning adds a CPU solve (~seconds) per episode, so insert-only
 sweeps are slower than full-task sweeps at the same episode count.
+
+### Actual-EE wrist checkpoint evaluation
+
+The actual-EE-delta variant trains on actual end-effector delta labels
+(`collect_peg_insertion_actual_ee_delta.py` / `convert_controller_to_actual_ee.py`)
+and evaluates with `policy_setup=panda-ee-dpose -> pd_ee_delta_pose`
+(`use_target=False`, closed-loop: each delta integrates from the actual EE).
+`run_peginsertion_actual_ee.sh` is a thin wrapper over `run_peginsertion_wrist.sh`
+that only swaps the config to
+`maniskill_peg_insertion_vertical_sft_eval_openpi_pi05_actual_ee`, so it inherits
+the section-4 Ray isolation verbatim (own head on `EVAL_RAY_PORT`/`--ray-port`,
+scoped teardown, no bare `ray stop`). `sft_finetune_actual_ee.sh` is the matching
+trainer on its own `SFT_RAY_PORT=6381` (distinct from the wrist SFT's 6379).
+
+Train (own Ray head on port 6381, isolated from wrist SFT 6379 and eval 6380/6390):
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_actual_ee_3200 \
+GPU_IDS=0,1,2,3 \
+bash sft_finetune_actual_ee.sh
+```
+
+Single checkpoint eval (own Ray head on port 6380, disjoint GPUs from SFT):
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+VENV_DIR=/opt/kairan/envs/rlinf \
+CHECKPOINT_PATH=/path/to/actual-ee-sft/checkpoints/global_step_N/actor \
+GPU_IDS=0-3 NUM_EVAL_EPISODES=8 NUM_ENVS=4 EVAL_ACTION_SCALE=1.0 \
+SAVE_VIDEO=true MANAGE_RAY=true EVAL_RAY_PORT=6380 \
+bash run_train/eval_checkpoint/run_peginsertion_actual_ee.sh
+```
+
+Sweep every `global_step_*/actor` checkpoint (own Ray head on port 6390; the sweep
+forces `MANAGE_RAY=false` per checkpoint so each subprocess attaches to the 6390
+head via `RAY_ADDRESS`):
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+MPLCONFIGDIR=/tmp/matplotlib \
+/opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
+  --run-script run_train/eval_checkpoint/run_peginsertion_actual_ee.sh \
+  --ray-port 6390 \
+  --checkpoint-dir /path/to/actual-ee-sft/checkpoints \
+  --output-dir /path/to/actual_ee_eval_sweep \
+  --num-eval-episodes 10 --num-envs 1 --gpu-ids 4,5,7 --action-scale 1.0 \
+  --resume --continue-on-error
+```
+
+> Avoid GPU 6 for ManiSkill eval here — its Vulkan renderer hangs. The three ports
+> (SFT `6381`, single-eval `6380`, sweep `6390`) are distinct, so training + eval +
+> sweep can all run concurrently without one `ray stop`-ing the other (and none
+> calls a bare `ray stop`).
 
 ## 5. PPO / RL From SFT
 

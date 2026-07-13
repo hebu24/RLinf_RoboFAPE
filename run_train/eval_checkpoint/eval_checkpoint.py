@@ -150,18 +150,22 @@ def _validate_peg_insertion_eval_cfg(cfg: DictConfig, task_id: str) -> None:
             f"rollout.model.openpi.action_horizon=10, got {num_action_chunks} "
             f"and {action_horizon}."
         )
-    if str(model_cfg.get("policy_setup", "")) != "panda-ee-target-dpose":
+    policy_setup = str(model_cfg.get("policy_setup", ""))
+    if policy_setup not in ("panda-ee-target-dpose", "panda-ee-dpose"):
         raise ValueError(
             "PegInsertionVertical-v1 evaluation must use "
-            "rollout.model.policy_setup=panda-ee-target-dpose so physical "
-            "target-delta TCP actions are converted for ManiSkill "
-            "pd_ee_target_delta_pose."
+            "rollout.model.policy_setup=panda-ee-target-dpose (use_target=True, "
+            "target-delta labels) or panda-ee-dpose (use_target=False, "
+            "actual-EE-delta labels) so physical TCP actions are converted for "
+            "the matching ManiSkill pd_ee_(target_)delta_pose controller. "
+            f"Got {policy_setup!r}."
         )
     control_mode = str(cfg.env.eval.init_params.get("control_mode", ""))
-    if control_mode != "pd_ee_target_delta_pose":
+    if control_mode not in ("pd_ee_target_delta_pose", "pd_ee_delta_pose"):
         raise ValueError(
             "PegInsertionVertical-v1 evaluation must use "
-            "env.eval.init_params.control_mode=pd_ee_target_delta_pose. "
+            "env.eval.init_params.control_mode=pd_ee_target_delta_pose or "
+            "pd_ee_delta_pose. "
             f"Got {control_mode!r}."
         )
 

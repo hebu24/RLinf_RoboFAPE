@@ -49,7 +49,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import types as _types
+from collections import deque
 from typing import Any
 
 
@@ -58,6 +60,11 @@ from typing import Any
 # ``solutions.solve_PegInsertionVertical`` does not re-register a second
 # PegInsertionVertical environment implementation.
 ROBOFPE = os.environ.get("RLINF_ROBOFPE_PATH", "/home/gpu4/yingxi/RoboFPE/mani_envs")
+
+# Every worker response is written as one line prefixed with this sentinel so the
+# parent can skip stray stdout pollution from the solver/libs (e.g. "screw plan
+# failed") that would otherwise corrupt the JSON line protocol.
+RESP_PREFIX = "RLINF_PLAN_RESP\t"
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +226,7 @@ def planner_worker_main() -> None:
             seed = int(req["seed"])
             rid = req.get("id")
         except Exception as exc:  # noqa: BLE001
-            sys.stdout.write(json.dumps({"error": f"bad request: {exc}"}) + "\n")
+            sys.stdout.write(RESP_PREFIX + json.dumps({"error": f"bad request: {exc}"}) + "\n")
             sys.stdout.flush()
             continue
         try:
@@ -257,9 +264,9 @@ def planner_worker_main() -> None:
                     f"no lifted state for seed={seed}"
                     + (f" after {MAX_RETRIES} retries: {last_err}" if last_err else "")
                 )
-            sys.stdout.write(json.dumps({"id": rid, "state": state}) + "\n")
+            sys.stdout.write(RESP_PREFIX + json.dumps({"id": rid, "state": state}) + "\n")
         except Exception as exc:  # noqa: BLE001
-            sys.stdout.write(json.dumps({"id": rid, "error": str(exc)}) + "\n")
+            sys.stdout.write(RESP_PREFIX + json.dumps({"id": rid, "error": str(exc)}) + "\n")
         sys.stdout.flush()
 
     try:
@@ -279,10 +286,17 @@ class PegInsertionLiftPlanner:
     spawned per proxy and reused across all episodes.
     """
 
-    def __init__(self, *, python_bin: str | None = None):
+    def __init__(self, *, python_bin: str | None = None, base_seed: int = 0):
         self._python_bin = python_bin or sys.executable
         self._proc: subprocess.Popen | None = None
         self._req_id = 0
+        self._base_seed = int(base_seed)
+        self._episode_counter = 0
+        # Bounded buffer of recent worker stderr lines, drained by a background
+        # thread so the stderr pipe never fills and blocks the worker (which
+        # would deadlock the stdout JSON protocol).
+        self._stderr_lines: deque[str] = deque(maxlen=200)
+        self._stderr_thread: threading.Thread | None = None
 
     def _ensure_proc(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
@@ -305,6 +319,21 @@ class PegInsertionLiftPlanner:
             env=env,
         )
         self._req_id = 0
+        # Drain stderr continuously into a bounded buffer so the worker cannot
+        # block on a full stderr pipe (which would deadlock stdout reads).
+        stderr_io = self._proc.stderr
+
+        def _drain():
+            try:
+                for line in iter(stderr_io.readline, ""):
+                    self._stderr_lines.append(line)
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._stderr_thread = threading.Thread(
+            target=_drain, name="lift-planner-stderr", daemon=True
+        )
+        self._stderr_thread.start()
         return self._proc
 
     def plan_lifted_state(self, seed: int) -> dict:
@@ -316,13 +345,21 @@ class PegInsertionLiftPlanner:
         rid = self._req_id
         proc.stdin.write(json.dumps({"id": rid, "seed": int(seed)}) + "\n")
         proc.stdin.flush()
-        line = proc.stdout.readline()
-        if not line:
-            err = proc.stderr.read() if proc.stderr else ""
-            raise RuntimeError(
-                f"PegInsertionLiftPlanner worker exited unexpectedly (seed={seed}). stderr: {err}"
-            )
-        resp = json.loads(line)
+        # Read until a sentinel-prefixed response line arrives; ignore any stray
+        # stdout pollution the solver/libs print (e.g. "screw plan failed").
+        resp = None
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                err = "".join(self._stderr_lines)
+                raise RuntimeError(
+                    f"PegInsertionLiftPlanner worker exited unexpectedly "
+                    f"(seed={seed}). Recent stderr:\n{err}"
+                )
+            if line.startswith(RESP_PREFIX):
+                resp = json.loads(line[len(RESP_PREFIX):])
+                break
+            self._stderr_lines.append("[stdout] " + line.rstrip())
         if "error" in resp:
             raise RuntimeError(f"PegInsertionLiftPlanner error: {resp['error']}")
         state = resp["state"]
@@ -330,6 +367,41 @@ class PegInsertionLiftPlanner:
             "robot_qpos": np.asarray(state["robot_qpos"], dtype=np.float32),
             "peg_pose": np.asarray(state["peg_pose"], dtype=np.float32),
             "hole_pose": np.asarray(state["hole_pose"], dtype=np.float32),
+        }
+
+    def plan_lifted_states(self, env_global_indices):
+        """Plan a grasped+lifted state for each env in the reset subset.
+
+        ``env_global_indices`` is the list of env indices ManiSkill is resetting
+        (the ``env_idx`` subset on auto-reset, or all envs on the initial reset).
+        Returns ``{robot_qpos:(b,9), peg_pose:(b,7), hole_pose:(b,7)}`` as
+        ``np.float32``. Per-env seeds are derived deterministically from the
+        base seed, a monotonic episode counter, and the global env index so
+        parallel envs and successive episodes all differ.
+        """
+        import numpy as np
+
+        self._episode_counter += 1
+        idxs = list(env_global_indices)
+        b = len(idxs)
+        robot_qpos = np.zeros((b, 9), dtype=np.float32)
+        peg_pose = np.zeros((b, 7), dtype=np.float32)
+        hole_pose = np.zeros((b, 7), dtype=np.float32)
+        for j, gi in enumerate(idxs):
+            seed = (
+                self._base_seed * 1_000_003
+                + self._episode_counter * 1_009
+                + int(gi) * 97
+                + 7
+            )
+            st = self.plan_lifted_state(seed=seed)
+            robot_qpos[j] = st["robot_qpos"]
+            peg_pose[j] = st["peg_pose"]
+            hole_pose[j] = st["hole_pose"]
+        return {
+            "robot_qpos": robot_qpos,
+            "peg_pose": peg_pose,
+            "hole_pose": hole_pose,
         }
 
     def close(self) -> None:

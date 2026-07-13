@@ -170,6 +170,10 @@ class PegInsertionVerticalEnv(BaseEnv):
         self.obj_set = obj_set
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.render_randomization_spec = render_randomization_spec
+        # Insert-only eval: a PegInsertionLiftPlanner registered via
+        # set_lift_planner(). Must be set before super().__init__ since
+        # BaseEnv construction may trigger an early _initialize_episode.
+        self._lift_planner = None
         if robot_uids == "panda_wristcam":
             kwargs["sensor_configs"] = _with_wrist_camera_sensor_config(
                 kwargs.get("sensor_configs")
@@ -443,6 +447,17 @@ class PegInsertionVerticalEnv(BaseEnv):
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         options = options or {}
+        # Insert-only eval: when pre_grasped is set and a lift planner is
+        # registered, produce a freshly motion-planned grasped+lifted state for
+        # the envs being reset (env_idx is the reset subset, incl. the
+        # auto-reset done subset) and feed it through the existing override
+        # path below. Reached by both the initial reset and every auto-reset.
+        if (
+            options.get("pre_grasped")
+            and self._lift_planner is not None
+            and options.get("peg_pose") is None
+        ):
+            options = self._inject_planned_lift_state(env_idx, options)
         with torch.device(self.device):
             b = len(env_idx)
             episode_rngs = self._batched_episode_rng[env_idx]
@@ -520,6 +535,35 @@ class PegInsertionVerticalEnv(BaseEnv):
                 qpos[:, -2:] = 0.04
             self.agent.robot.set_qpos(qpos)
             self.agent.robot.set_pose(sapien.Pose([-0.60, 0.06, 0]))
+
+    def set_lift_planner(self, planner):
+        """Register a PegInsertionLiftPlanner for insert-only evaluation.
+
+        When set, ``_initialize_episode`` (gated on ``options["pre_grasped"]``)
+        initializes each reset env with a motion-planned grasped+lifted peg.
+        Reached by both the initial reset and every auto-reset.
+        """
+        self._lift_planner = planner
+
+    def _inject_planned_lift_state(self, env_idx, options):
+        import numpy as np
+
+        if hasattr(env_idx, "detach"):
+            gi = env_idx.detach().cpu().numpy()
+        else:
+            gi = np.asarray(env_idx)
+        gi = gi.reshape(-1).astype(np.int64).tolist()
+        state = self._lift_planner.plan_lifted_states(gi)
+        merged = dict(options)
+        merged.update(
+            {
+                "peg_pose": state["peg_pose"],
+                "hole_pose": state["hole_pose"],
+                "robot_qpos": state["robot_qpos"],
+                "pre_grasped": True,
+            }
+        )
+        return merged
 
     @property
     def peg_head_pose(self):
