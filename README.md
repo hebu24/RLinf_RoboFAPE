@@ -298,7 +298,7 @@ cd /opt/yingxi/RLinf_RoboFAPE
 MPLCONFIGDIR=/tmp/matplotlib \
 /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
   --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
-  --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_eval_sweep \
+  --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_eval_sweep_rtc \
   --num-eval-episodes 10 \
   --num-envs 1 \
   --gpu-ids 4,5,6,7 \
@@ -327,6 +327,49 @@ Key output files:
 | `logs/<timestamp>-eval-PegInsertionVertical-v1/eval.log` | Resolved config and metrics. |
 | `logs/<timestamp>-eval-PegInsertionVertical-v1/evaluation_summary.json` | Evaluation summary. |
 | `logs/<timestamp>-eval-PegInsertionVertical-v1/video/eval/` | Evaluation videos. |
+
+### Insert-only wrist checkpoint evaluation
+
+The wrist SFT policy is trained on full pick-up-and-insert demonstrations, so a
+plain eval conflates the difficult pick-up phase (which suffers from BC compound
+errors) with the insert phase. The insert-only setting isolates the move-and-
+insert skill: every episode is initialized by motion-planning the **grasp +
+lift** with the existing RoboFPE solver (`PegInsertionLiftPlanner`, the same one
+used for SFT data collection), then handing the grasped, lifted peg to the
+policy. The policy is evaluated only on transport + align + descend + insert.
+
+Each episode re-runs the solver fresh on a CPU single-environment (per-episode
+planning, max variety); the lifted state `(robot_qpos, peg_pose, hole_pose)` is
+replayed kinematically into the GPU eval env via reset options, so no IK or
+hand-constructed grasp pose is needed. The obs/action config is identical to the
+wrist eval above, so the eval guard passes unchanged.
+
+Use the insert-only launcher for checkpoints trained with `sft_finetune_wrist.sh`:
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+VENV_DIR=/opt/kairan/envs/rlinf CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints/global_step_20000/actor GPU_IDS=0-3 NUM_EVAL_EPISODES=8 NUM_ENVS=4 EVAL_ACTION_SCALE=1.0 SAVE_VIDEO=true bash run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh
+```
+
+`run_peginsertion_wrist_insert_only.sh` defaults to
+`maniskill_peg_insertion_vertical_wrist_sft_eval_openpi_pi05_insert_only` and a
+200-step horizon (transport+align+insert; divisible by both `num_action_chunks`
+and `execute_action_chunks`). The saved eval videos show the peg starting
+grasped in the air with the hole offset, and the policy transporting/aligning/
+inserting (base and wrist camera side by side).
+
+To sweep every `global_step_*/actor` checkpoint under a wrist SFT run in
+insert-only mode, pass `--run-script`:
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+MPLCONFIGDIR=/tmp/matplotlib /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py   --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh   --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints   --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep   --num-eval-episodes 10   --num-envs 1   --gpu-ids 0,1,2,3   --action-scale 1.0
+```
+
+Per-episode planning adds a CPU solve (~seconds) per episode, so insert-only
+sweeps are slower than full-task sweeps at the same episode count.
 
 ## 5. PPO / RL From SFT
 

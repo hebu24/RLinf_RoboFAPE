@@ -12,9 +12,11 @@ import os
 import queue
 import re
 import resource
+import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -89,6 +91,24 @@ def parse_args() -> argparse.Namespace:
         help="Start one shared Ray head for the whole sweep.",
     )
     parser.add_argument(
+        "--ray-port",
+        type=int,
+        default=6380,
+        help=(
+            "GCS port for the sweep's detached Ray head. Must differ from the SFT "
+            "cluster's port (SFT uses 6379) so the two clusters never collide."
+        ),
+    )
+    parser.add_argument(
+        "--ray-object-store-memory",
+        type=int,
+        default=50_000_000_000,
+        help=(
+            "Object store bytes for the sweep head. Default 50G; /dev/shm is 1008G "
+            "so this is comfortable hygiene (eval needs far less than the 200G default)."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Reuse existing per-step trajectory_metrics.json files.",
@@ -116,6 +136,14 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Extra Hydra override passed through to eval_checkpoint.py.",
+    )
+    parser.add_argument(
+        "--run-script",
+        default=str(REPO_PATH / "run_train/eval_checkpoint/run_peginsertion_wrist.sh"),
+        help=(
+            "Launcher script to invoke per checkpoint. Point this at "
+            "run_peginsertion_wrist_insert_only.sh for insert-only sweeps."
+        ),
     )
     return parser.parse_args()
 
@@ -227,6 +255,7 @@ def run_eval_for_checkpoint(
     env = os.environ.copy()
     env.update(
         {
+            "RAY_ADDRESS": f"127.0.0.1:{args.ray_port}",
             "VENV_DIR": args.venv_dir,
             "CHECKPOINT_PATH": str(checkpoint_path),
             "LOG_DIR": str(log_dir),
@@ -242,9 +271,12 @@ def run_eval_for_checkpoint(
         }
     )
     unique_suffix = f"{os.getpid()}_{worker_slot}_{step}"
+    run_script = args.run_script
+    if not os.path.isabs(run_script):
+        run_script = str(REPO_PATH / run_script)
     cmd = [
         "bash",
-        str(REPO_PATH / "run_train/eval_checkpoint/run_peginsertion_wrist.sh"),
+        run_script,
         "--save-episode-metrics",
         f"env.group_name=EnvGroupEval{unique_suffix}",
         f"rollout.group_name=RolloutGroupEval{unique_suffix}",
@@ -346,14 +378,47 @@ def raise_file_descriptor_limit(minimum: int = 65536) -> None:
     print(f"Ray file descriptor limit: {target_limit}", flush=True)
 
 
+def _scoped_ray_kill(ray_port: int) -> None:
+    """Kill ONLY the Ray processes bound to ray_port (gcs_server + raylet + dashboard).
+
+    `ray stop` cannot target one cluster (it kills ALL ray on the host, incl. an SFT
+    job on 6379), so we scope by the GCS port in each process' cmdline:
+    gcs_server carries `--gcs_server_port=<port>`; raylet/dashboard carry
+    `--gcs-address=<ip>:<port>` (verified in ray/_private/services.py). A different
+    port can never be matched, so a concurrent SFT cluster is never touched.
+    """
+    patterns = [
+        f"gcs_server.*--gcs_server_port={ray_port}",
+        f"raylet.*--gcs-address=[^ ]*:{ray_port}",
+        f"dashboard.*--gcs-address=[^ ]*:{ray_port}",
+    ]
+    for pattern in patterns:
+        subprocess.run(
+            ["pkill", "-9", "-f", pattern],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    # Let the raylet release GPU resources before a new head re-registers them.
+    time.sleep(2)
+
+
 def start_shared_ray(args: argparse.Namespace) -> None:
     raise_file_descriptor_limit()
     ray_bin = Path(args.venv_dir).expanduser().resolve() / "bin" / "ray"
     if not ray_bin.exists():
         raise FileNotFoundError(f"Ray binary does not exist: {ray_bin}")
+    ray_port = int(args.ray_port)
     ray_tmp_dir = Path(f"/tmp/ray_eval_wrist_sweep_{os.getpid()}")
     ray_tmp_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run([str(ray_bin), "stop"], check=False, stdout=subprocess.DEVNULL)
+
+    # Scoped stale cleanup: only the eval port, never SFT's 6379. Never bare `ray stop`.
+    _scoped_ray_kill(ray_port)
+
+    # Pop RAY_ADDRESS first so `ray start --head` does not try to attach to a
+    # pre-existing cluster; set it back after so the driver, per-checkpoint
+    # subprocesses, and worker actors all attach to THIS head.
+    os.environ.pop("RAY_ADDRESS", None)
     gpu_count = len(parse_gpu_ids(args.gpu_ids))
     ray_num_cpus = args.ray_num_cpus or max(8, 4 * gpu_count)
     if ray_num_cpus <= 0:
@@ -363,17 +428,27 @@ def start_shared_ray(args: argparse.Namespace) -> None:
             str(ray_bin),
             "start",
             "--head",
+            f"--port={ray_port}",
             f"--temp-dir={ray_tmp_dir}",
             f"--num-cpus={ray_num_cpus}",
+            "--include-dashboard=false",
+            f"--object-store-memory={int(args.ray_object_store_memory)}",
         ],
         check=True,
     )
+    # Pin driver + subprocesses + workers to this head. Workers honor RAY_ADDRESS via
+    # ray.init(address="auto") (worker.py) and Manager.get_runtime_env_vars()
+    # (manager.py) which copies RAY_ADDRESS into the worker runtime_env.
+    os.environ["RAY_ADDRESS"] = f"127.0.0.1:{ray_port}"
 
 
 def stop_shared_ray(args: argparse.Namespace) -> None:
-    ray_bin = Path(args.venv_dir).expanduser().resolve() / "bin" / "ray"
-    if ray_bin.exists():
-        subprocess.run([str(ray_bin), "stop"], check=False, stdout=subprocess.DEVNULL)
+    # Scoped: kill ONLY the eval head on this port. Never a bare `ray stop`
+    # (that would kill an SFT cluster on 6379).
+    _scoped_ray_kill(int(args.ray_port))
+    # Clean this sweep's temp dir only.
+    ray_tmp_dir = Path(f"/tmp/ray_eval_wrist_sweep_{os.getpid()}")
+    shutil.rmtree(ray_tmp_dir, ignore_errors=True)
 
 
 def run_checkpoint_sweep(

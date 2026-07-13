@@ -60,19 +60,39 @@ ulimit -n 1048576 2>/dev/null || true
 
 # RLinf placement uses physical GPU IDs, so Ray must discover all GPUs.
 unset CUDA_VISIBLE_DEVICES
-# Attach to an existing training cluster by default. Never stop an existing Ray.
+# Eval runs on its OWN Ray cluster on EVAL_RAY_PORT (default 6380), isolated from
+# SFT training (which uses 6379). Never a bare `ray stop` (that kills ALL ray on the
+# host, incl. SFT); teardown is scoped to EVAL_RAY_PORT only.
+EVAL_RAY_PORT="${EVAL_RAY_PORT:-6380}"
+# Pin driver + worker actors to the eval cluster. An inherited RAY_ADDRESS (e.g.
+# set by sweep_peginsertion_wrist.py) takes precedence.
+export RAY_ADDRESS="${RAY_ADDRESS:-127.0.0.1:${EVAL_RAY_PORT}}"
+
+_eval_scoped_ray_kill() {
+  pkill -9 -f "gcs_server.*--gcs_server_port=${EVAL_RAY_PORT}"  >/dev/null 2>&1 || true
+  pkill -9 -f "raylet.*--gcs-address=[^ ]*:${EVAL_RAY_PORT}"    >/dev/null 2>&1 || true
+  pkill -9 -f "dashboard.*--gcs-address=[^ ]*:${EVAL_RAY_PORT}" >/dev/null 2>&1 || true
+  sleep 2
+}
+
+# MANAGE_RAY=false (default): attach to the eval cluster on EVAL_RAY_PORT (e.g. one
+# started by the sweep, or a head you started). MANAGE_RAY=true: start a dedicated
+# eval head on EVAL_RAY_PORT. Either way, only this port is ever touched.
 MANAGE_RAY="${MANAGE_RAY:-false}"
 _EVAL_STARTED_RAY=false
 if [[ "${MANAGE_RAY}" == "true" ]]; then
-  if "${RAY_BIN}" status >/dev/null 2>&1; then
-    echo "Reusing the existing Ray cluster; evaluation will not stop it."
+  if RAY_ADDRESS="127.0.0.1:${EVAL_RAY_PORT}" "${RAY_BIN}" status >/dev/null 2>&1; then
+    echo "Reusing the eval Ray cluster on port ${EVAL_RAY_PORT}; will not stop it."
   else
     RAY_TMP_DIR="${RAY_TMP_DIR:-${REPO_PATH}/logs/ray_tmp}"
     mkdir -p "${RAY_TMP_DIR}"
-    "${RAY_BIN}" start --head --temp-dir="${RAY_TMP_DIR}"
+    unset CUDA_VISIBLE_DEVICES   # so the head's raylet registers all GPUs
+    _eval_scoped_ray_kill         # clear stale eval head on this port only
+    "${RAY_BIN}" start --head --port="${EVAL_RAY_PORT}" --temp-dir="${RAY_TMP_DIR}" --include-dashboard=false
     _EVAL_STARTED_RAY=true
     export RLINF_EVAL_STARTED_RAY=1
-    trap 'if [[ "${_EVAL_STARTED_RAY}" == "true" ]]; then "${RAY_BIN}" stop >/dev/null 2>&1 || true; fi' EXIT
+    export RAY_ADDRESS="127.0.0.1:${EVAL_RAY_PORT}"
+    trap '_eval_scoped_ray_kill' EXIT
   fi
 fi
 

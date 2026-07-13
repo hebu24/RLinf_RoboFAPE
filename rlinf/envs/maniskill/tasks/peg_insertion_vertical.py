@@ -512,7 +512,12 @@ class PegInsertionVerticalEnv(BaseEnv):
 
             self.peg.set_pose(peg_pose)
             self.box.set_pose(hole_pose)
-            qpos[:, -2:] = 0.04
+            # The normal pick-up setting always starts with an open gripper.
+            # The insert-only eval supplies a pre-grasped robot_qpos (closed
+            # fingers) via reset_options.pre_grasped, so keep those fingers
+            # closed instead of forcing them open.
+            if not options.get("pre_grasped"):
+                qpos[:, -2:] = 0.04
             self.agent.robot.set_qpos(qpos)
             self.agent.robot.set_pose(sapien.Pose([-0.60, 0.06, 0]))
 

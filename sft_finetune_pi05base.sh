@@ -23,7 +23,7 @@ cd /opt/yingxi/RLinf_RoboFAPE
 
 # Resolve the repo-local rlinf package (an older installed copy at
 # /opt/kairan/RLinf shadows it otherwise and lacks the peg_insertion configs).
-export PYTHONPATH=/opt/yingxi/RLinf_RoboFAPE:${PYTHONPATH}
+export PYTHONPATH=/opt/yingxi/RLinf_RoboFAPE:${PYTHONPATH:-}
 export PATH=/opt/kairan/envs/rlinf/bin:$PATH
 export RAY_TMPDIR=/tmp/ray_sft_pi05base
 export CUDA_LAUNCH_BLOCKING=1

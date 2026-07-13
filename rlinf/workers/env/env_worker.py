@@ -370,6 +370,14 @@ class EnvWorker(Worker):
                 total_num_processes=self._world_size * self.stage_num,
                 worker_info=self.worker_info,
             )
+            if env_cfg.get("reset_options", {}) and env_cfg.reset_options.get(
+                "pre_grasped", False
+            ):
+                from rlinf.envs.wrappers import PreGraspedInitWrapper
+
+                env = PreGraspedInitWrapper(
+                    env, seed=int(getattr(env_cfg, "seed", 0)) + self._rank
+                )
             if env_cfg.video_cfg.save_video:
                 env = RecordVideo(env, env_cfg.video_cfg)
             if env_cfg.get("data_collection", None) and getattr(
