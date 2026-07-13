@@ -6,6 +6,9 @@ use_wrist_image: False
 auto_reset: True
 ignore_terminations: False
 use_rel_reward: False
+# Re-anchor the pd_ee_target_delta_pose controller's _target_pose to the actual EE pose
+# once per action chunk during eval, preventing open-loop target drift into OOD.
+sync_target_pose_per_chunk: True
 reward_mode: raw
 action_scale: 1.0
 seed: 0

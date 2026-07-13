@@ -25,8 +25,50 @@ from mani_skill.utils.structs.types import Array
 from mani_skill.utils.visualization.misc import put_info_on_image, tile_images
 from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
+from rlinf.utils.logging import get_logger
 
 __all__ = ["ManiskillEnv"]
+
+_logger = get_logger()
+
+
+def _arm_controller(env):
+    """Return the arm sub-controller of a ManiSkill agent's combined controller."""
+    controller = env.unwrapped.agent.controller
+    if hasattr(controller, "controllers"):
+        return controller.controllers.get("arm", controller)
+    return controller
+
+
+def _sync_target_delta_pose_controller(env) -> None:
+    """Re-anchor the target-delta controller's ``_target_pose`` to the actual EE pose.
+
+    With ``use_target=True`` (``pd_ee_target_delta_pose``), the controller open-loop
+    integrates each action delta onto ``_target_pose`` (the previous *commanded* target)
+    rather than the actual end-effector pose. Over a long eval episode this lets IK/PD
+    tracking error and model error compound on the target and drift away from the real
+    EE, which the policy never observes. Re-anchoring the target to the actual EE once
+    per action chunk closes that loop while preserving within-chunk target chaining.
+
+    No-op for controllers without ``use_target`` / ``_target_pose``.
+    """
+    arm_controller = _arm_controller(env)
+    config = getattr(arm_controller, "config", None)
+    if not bool(getattr(config, "use_target", False)) or not hasattr(
+        arm_controller, "_target_pose"
+    ):
+        return
+    prev_target = arm_controller._target_pose
+    actual = arm_controller.ee_pose_at_base
+    if prev_target is not None:
+        drift = (prev_target.p - actual.p).norm(dim=-1).max().item()
+        if drift > 1e-3:
+            _logger.debug(
+                "pd_ee_target_delta_pose: re-anchoring _target_pose to actual EE "
+                "(max pos drift = %.5f m)",
+                drift,
+            )
+    arm_controller._target_pose = actual
 
 
 def extract_termination_from_info(info, num_envs, device):
@@ -61,6 +103,13 @@ class ManiskillEnv(gym.Env):
         self.use_rel_reward = cfg.use_rel_reward
         self.ignore_terminations = cfg.ignore_terminations
         self.use_full_state = bool(getattr(cfg, "use_full_state", False))
+        # Re-anchor the pd_ee_target_delta_pose controller's _target_pose to the actual
+        # EE pose once per action chunk (see _sync_target_delta_pose_controller). This
+        # prevents the open-loop target from drifting away from the real EE over a long
+        # eval episode. Toggle off to reproduce the legacy drifting behavior.
+        self.sync_target_pose_per_chunk = bool(
+            getattr(cfg, "sync_target_pose_per_chunk", True)
+        )
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
@@ -364,6 +413,11 @@ class ManiskillEnv(gym.Env):
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
+        if self.sync_target_pose_per_chunk:
+            # Re-anchor the target-delta controller to the actual EE before executing a
+            # fresh model-predicted chunk, so deltas integrate from the state the policy
+            # was conditioned on instead of a stale commanded target.
+            _sync_target_delta_pose_controller(self.env)
         obs_list = []
         infos_list = []
         chunk_rewards = []

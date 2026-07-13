@@ -176,6 +176,69 @@ add_value_head: False
 It also sets `env.train.use_wrist_image: true` and `env.eval.use_wrist_image: true`
 so ManiSkill's `hand_camera` is routed into `wrist_images`.
 
+### 3.1 Finetune from the generic `pi05_base` (dataset-computed norm_stats)
+
+`sft_finetune.sh` starts from `/opt/kairan/models/RLinf-Pi05-ManiSkill-25Main-SFT`,
+a checkpoint that **already bundles** an openpi `norm_stats.json` at
+`<model_path>/physical-intelligence/maniskill/norm_stats.json`. The SFT chain loads
+those stats in `get_model` (`load_norm_stats(checkpoint_dir, asset_id)`) and copies
+them verbatim into each saved checkpoint — they are never recomputed from the SFT
+dataset.
+
+To finetune from the **generic** base `/opt/zhangchenyu/weights/pi05_base` instead,
+and to compute **fresh norm_stats from the training data**, use the independent
+wrapper `sft_finetune_pi05base.sh`:
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200 \
+GPU_IDS=0,1,2,3 \
+bash sft_finetune_pi05base.sh
+```
+
+What it does (no core-library changes; the shared `pi05_base` dir is left untouched):
+
+1. Builds a **prepared base** directory (default
+   `run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg`) that *symlinks*
+   `pi05_base/model.safetensors` (the 16.5 GB weights are not copied) and
+   `config.json`.
+2. Computes `norm_stats` from `DATA_DIR` by streaming the dataset through the same
+   repack + data transforms the model sees (`observation.state_tcp -> state`,
+   `actions -> actions`), accumulating openpi `RunningStats` (mean/std/q01/q99),
+   and writing
+   `base/pi05_base_peg/physical-intelligence/maniskill/norm_stats.json` in the
+   standard openpi format (`toolkits/lerobot/calculate_norm_stats.py --output-dir`).
+   The result is cached and reused on subsequent runs; set `FORCE_NORM_STATS=1` to
+   recompute.
+3. Launches the same Hydra SFT entrypoint as `sft_finetune.sh`, overriding
+   `actor.model.model_path` to the prepared base and
+   `runner.logger.experiment_name=peg_insertion_sft_pi05base`.
+
+Because `actor.model.model_path` points at the prepared base, `get_model` loads the
+pi05_base weights from the symlinked `model.safetensors` and loads the
+freshly-computed `norm_stats.json`; on save, `FSDPVlaSftWorker.save_checkpoint`
+copies that `norm_stats.json` into the new checkpoint. The saved checkpoint layout
+is therefore identical to `sft_finetune.sh`
+(`actor/{dcp_checkpoint/, model_state_dict/full_weights.pt, physical-intelligence/maniskill/norm_stats.json, data.pt, rng.pt}`)
+and is drop-in compatible with section 4 (eval) and section 5 (PPO).
+
+Environment variables:
+
+```text
+DATA_DIR            training data (default: .../peg_insertion_vertical_controller_3200)
+PI05_BASE           generic base weights dir (default: /opt/zhangchenyu/weights/pi05_base)
+PREPARED_BASE       where the symlinks + computed norm_stats live (default: .../base/pi05_base_peg)
+GPU_IDS             physical GPU ids (default: 0,1,2,3)
+FORCE_NORM_STATS=1  recompute norm_stats even if a cached file exists
+CONFIG_NAME         hydra config (default: peg_insertion_sft_openpi_pi05)
+OPENPI_CONFIG_NAME  openpi config used for norm_stats (default: pi05_maniskill_peg_insertion)
+RESUME_DIR          optional checkpoint dir to resume from (same as sft_finetune.sh)
+```
+
+For the wrist variant, set both `CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist` and
+`OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist`.
+
 ## 4. Evaluate SFT Checkpoint
 
 Use the actor checkpoint produced by SFT:
@@ -238,7 +301,7 @@ MPLCONFIGDIR=/tmp/matplotlib \
   --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_eval_sweep \
   --num-eval-episodes 10 \
   --num-envs 1 \
-  --gpu-ids 0,1,2,3 \
+  --gpu-ids 4,5,6,7 \
   --action-scale 1.0
 ```
 
