@@ -109,6 +109,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ray-dashboard-port",
+        type=int,
+        default=8266,
+        help=(
+            "Dashboard server port for the sweep head. Must differ from any "
+            "concurrent cluster's dashboard (the SFT head uses 8265). Enabling the "
+            "dashboard (instead of --include-dashboard=false) lets ray state API "
+            "calls like list_actors succeed instead of raising "
+            "ConnectionError: Could not read 'dashboard' from GCS."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Reuse existing per-step trajectory_metrics.json files.",
@@ -431,7 +443,7 @@ def start_shared_ray(args: argparse.Namespace) -> None:
             f"--port={ray_port}",
             f"--temp-dir={ray_tmp_dir}",
             f"--num-cpus={ray_num_cpus}",
-            "--include-dashboard=false",
+            f"--dashboard-port={int(args.ray_dashboard_port)}",
             f"--object-store-memory={int(args.ray_object_store_memory)}",
         ],
         check=True,

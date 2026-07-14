@@ -492,16 +492,14 @@ To sweep every `global_step_*/actor` checkpoint under a wrist SFT run in
 insert-only mode, pass `--run-script`:
 
 ```bash
-tmux new-session -d -s eval_sweep "cd /opt/yingxi/RLinf_RoboFAPE && \
+cd /opt/yingxi/RLinf_RoboFAPE && \
   MPLCONFIGDIR=/tmp/matplotlib \
   /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
     --ray-port 6380 \
     --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
-    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
-    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260713-01:53:11-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep \
-    --num-eval-episodes 10 --num-envs 1 --gpu-ids 0,1,2,3 --action-scale 1.0 \
-    2>&1 | tee /opt/yingxi/RLinf_RoboFAPE/logs/eval_sweep_insert_only_tmux.log"
-tmux attach -t eval_sweep   # detach: Ctrl-b d
+    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260714-15:33:16-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_pi05base/checkpoints \
+    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260714-15:33:16-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_pi05base/wrist_insert_only_eval_sweep \
+    --num-eval-episodes 10 --num-envs 1 --gpu-ids 0,1,2,3 --action-scale 1.0 
 ```
 
 Per-episode planning adds a CPU solve (~seconds) per episode, so insert-only

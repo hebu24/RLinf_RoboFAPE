@@ -116,17 +116,23 @@ def _validate_peg_insertion_eval_cfg(cfg: DictConfig, task_id: str) -> None:
     if config_name not in {
         "pi05_maniskill_peg_insertion",
         "pi05_maniskill_peg_insertion_wrist",
+        "pi05_maniskill_peg_insertion_actual_ee",
     }:
         raise ValueError(
             "PegInsertionVertical-v1 evaluation must use the peg-insertion "
             "OpenPI config used by SFT. Expected rollout.model.openpi.config_name "
-            "to be pi05_maniskill_peg_insertion or "
-            f"pi05_maniskill_peg_insertion_wrist, got {config_name!r}. "
+            "to be pi05_maniskill_peg_insertion, "
+            "pi05_maniskill_peg_insertion_wrist, or "
+            "pi05_maniskill_peg_insertion_actual_ee, got "
+            f"{config_name!r}. "
             "Do not evaluate a peg-insertion SFT checkpoint with generic "
             "pi05_maniskill transforms/norm stats."
         )
     num_images = int(openpi_cfg.get("num_images_in_input", -1))
-    is_wrist = config_name == "pi05_maniskill_peg_insertion_wrist"
+    is_wrist = config_name in {
+        "pi05_maniskill_peg_insertion_wrist",
+        "pi05_maniskill_peg_insertion_actual_ee",
+    }
     expected_images = 2 if is_wrist else 1
     if num_images != expected_images:
         raise ValueError(

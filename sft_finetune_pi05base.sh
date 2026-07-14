@@ -25,9 +25,19 @@ cd /opt/yingxi/RLinf_RoboFAPE
 # /opt/kairan/RLinf shadows it otherwise and lacks the peg_insertion configs).
 export PYTHONPATH=/opt/yingxi/RLinf_RoboFAPE:${PYTHONPATH:-}
 export PATH=/opt/kairan/envs/rlinf/bin:$PATH
-export RAY_TMPDIR=/tmp/ray_sft_pi05base
 export SFT_RAY_PORT="${SFT_RAY_PORT:-6379}"
+export RAY_TMPDIR="${SFT_RAY_TMPDIR:-/tmp/ray_sft_${SFT_RAY_PORT}}"
+# Dashboard-agent listen port MUST be unique per Ray cluster on the same host: Ray's
+# default 52365 is a FIXED (non-random) port. If a concurrent cluster (e.g. an eval
+# sweep) already binds 52365, this head's raylet crashes in its HTTP loop on bind.
+# Default 52366 (eval sweep uses 52365). Override per concurrent SFT run.
+export SFT_DASHBOARD_AGENT_PORT="${SFT_DASHBOARD_AGENT_PORT:-52366}"
 export CUDA_LAUNCH_BLOCKING=1
+
+# Raise fd limit so the raylet + torch.distributed.checkpoint shard saves do not hit
+# the default 1024 ("Too many open files" -> raylet grpc errors / save failure). Two
+# concurrent SFT clusters on this box need this badly.
+ulimit -n 1048576 2>/dev/null || true
 
 # --- inputs ---
 DATA_DIR="${DATA_DIR:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200}"
@@ -121,7 +131,8 @@ fi
 trap '_sft_scoped_ray_kill' EXIT
 
 # Start the SFT detached head. The driver + workers attach to it via RAY_ADDRESS.
-ray start --head --port="${SFT_RAY_PORT}" --temp-dir="${RAY_TMPDIR}"
+# --dashboard-agent-listen-port must differ from any concurrent cluster (see above).
+ray start --head --port="${SFT_RAY_PORT}" --temp-dir="${RAY_TMPDIR}" --dashboard-agent-listen-port="${SFT_DASHBOARD_AGENT_PORT}"
 
 # --- (d) launch the existing Hydra SFT entrypoint, overriding model_path + experiment_name ---
 bash examples/sft/run_vla_sft.sh \
