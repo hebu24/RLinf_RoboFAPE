@@ -146,7 +146,7 @@ Wrist SFT:
 ```bash
 cd /opt/yingxi/RLinf_RoboFAPE
 
-DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200 \
+DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200 \
 bash sft_finetune_wrist.sh
 ```
 
@@ -330,6 +330,75 @@ required eval controller: pd_ee_delta_pose (use_target=False, closed-loop)
 required eval action scale: 1.0
 ```
 
+### 3.3 Insert-only SFT training
+
+Train on insert-only trajectories (move-and-insert segment only, starting from
+the lift-end state where the peg is grasped and lifted — aligned with the
+insert-only eval start state produced by `PegInsertionLiftPlanner`). This
+isolates the insert skill from the pick-up phase's BC compound errors.
+
+**Convert the existing dataset to insert-only** (source is read-only; output is
+a new directory):
+
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+/opt/kairan/envs/rlinf/bin/python run_train/peginsertion_maniskill_pi0.5/convert_to_insert_only.py \
+  --src-dir run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200 \
+  --dst-dir run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200 \
+  --num-prompts 500 --seed 0
+```
+
+Each source episode is cropped at the lift-end frame (gripper closed + TCP z
+plateaued after lift, before lateral transport), the reach+grasp+close+lift
+prefix is dropped, videos are re-cut to match, and `task` is rewritten to
+single-stage insert-only prompts (index 0 = `insert the peg into the hole`).
+Validate on a small batch first with `--max-episodes 10`.
+
+**Train (wrist + base-only, isolated Ray per `RAY_ISOLATION.md`)** — each in a
+detached tmux session, distinct GCS port + dashboard-agent port + temp-dir +
+disjoint GPUs:
+
+```bash
+# wrist insert-only SFT — GPUs 4-7, port 6379
+tmux new-session -d -s sft_insert_wrist "cd /opt/yingxi/RLinf_RoboFAPE && \
+  PYTHONUNBUFFERED=1 \
+  DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200 \
+  GPU_IDS=4,5,6,7 \
+  SFT_RAY_PORT=6379 SFT_DASHBOARD_AGENT_PORT=52366 \
+  CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist \
+  OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist \
+  PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist_insert \
+  EXPERIMENT_NAME=peg_insertion_sft_insert_only_wrist \
+  bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_insert_wrist_tmux.log"
+
+# base-only insert-only SFT — GPUs 0-3, port 6382 (distinct port + dashboard + temp-dir)
+tmux new-session -d -s sft_insert_base "cd /opt/yingxi/RLinf_RoboFAPE && \
+  PYTHONUNBUFFERED=1 \
+  DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200 \
+  GPU_IDS=0,1,2,3 \
+  SFT_RAY_PORT=6382 SFT_DASHBOARD_AGENT_PORT=52368 \
+  CONFIG_NAME=peg_insertion_sft_openpi_pi05 \
+  OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion \
+  PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_insert \
+  EXPERIMENT_NAME=peg_insertion_sft_insert_only \
+  bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_insert_base_tmux.log"
+```
+
+`sft_finetune_pi05base.sh` auto-recomputes norm_stats for the converted dataset
+(set `FORCE_NORM_STATS=1` to force). If you change `runner.max_steps`, also set
+`actor.optim.total_training_steps` to match (cosine LR). Check `df -h /opt`
+before launch (each pi0.5 run needs ~250GB for checkpoints).
+
+**Evaluate** the insert-only checkpoints with the insert-only eval launchers
+(`run_peginsertion_wrist_insert_only.sh` / `run_peginsertion_insert_only.sh`,
+see §4); the train and eval start states are aligned (peg grasped + lifted).
+
+**Ray isolation**: never bare `ray stop` (kills all clusters on the host); use
+the scoped teardown by GCS port in `RAY_ISOLATION.md`. The two SFT runs above
+use disjoint ports (6379/6382), dashboard-agent ports (52366/52368), temp-dirs,
+and GPUs, so they run concurrently without interference. An insert-only eval
+sweep (`--ray-port 6380`) can run concurrently on free GPUs.
+
 ## 4. Evaluate SFT Checkpoint
 
 Use the actor checkpoint produced by SFT:
@@ -470,10 +539,11 @@ cd /opt/yingxi/RLinf_RoboFAPE
 
 # Concurrent with SFT: own Ray head on port 6380, disjoint GPUs.
 VENV_DIR=/opt/kairan/envs/rlinf \
-CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260711-00:18:32-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints/global_step_20000/actor \
-GPU_IDS=0-3 \
+CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260716-00:51:44-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_v2/checkpoints/global_step_30000/actor \
+GPU_IDS=4,5 \
+MAX_EPISODE_STEPS=600 \
 NUM_EVAL_EPISODES=8 \
-NUM_ENVS=4 \
+NUM_ENVS=2 \
 EVAL_ACTION_SCALE=1.0 \
 SAVE_VIDEO=true \
 MANAGE_RAY=true \
@@ -497,9 +567,9 @@ cd /opt/yingxi/RLinf_RoboFAPE && \
   /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
     --ray-port 6380 \
     --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
-    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260714-15:33:16-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_pi05base/checkpoints \
-    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260714-15:33:16-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_pi05base/wrist_insert_only_eval_sweep \
-    --num-eval-episodes 10 --num-envs 1 --gpu-ids 0,1,2,3 --action-scale 1.0 
+    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260716-11:31:24-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
+    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260716-11:31:24-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep \
+    --num-eval-episodes 10 --num-envs 1 --gpu-ids 3,4,5,6,7 --action-scale 1.0 
 ```
 
 Per-episode planning adds a CPU solve (~seconds) per episode, so insert-only
@@ -574,6 +644,100 @@ Run RL with an SFT checkpoint as `MODEL_PATH`:
 MODEL_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/<run>/peg_insertion_sft/checkpoints/global_step_<N>/actor \
 bash run_train/peginsertion_maniskill_pi0.5/run.sh
 ```
+
+## 6. Dual-Wrist (Front+Back) + Insert-Only Workflow
+
+Adds a **back-facing wrist camera** (`hand_camera_back`, eye-in-hand on the same
+`camera_link` as the front `hand_camera`, flipped 180°) alongside the existing
+front wrist camera. The back image maps onto pi0.5's already-present
+`right_wrist_0_rgb` slot (previously zero-padded + masked), so **no model
+architecture change** is needed — only data + a `num_images_in_input=3` config.
+
+The collector gains a `--collect-mode {full,insert_only}` flag (**default
+`insert_only`**): insert-only crops each episode to the move-and-insert segment
+at the lift-end frame via the shared `find_lift_end` criterion (identical to
+`convert_to_insert_only.py`), and uses single-stage "insert the peg" prompts.
+`full` keeps the whole pick-up-and-insert episode with two-stage prompts.
+
+> Schema note: dual-wrist datasets contain `observation.images.wrist_back`. Old
+> single-wrist datasets are **not** compatible with dual-wrist training —
+> (re)collect with the command below. Single-wrist configs/checkpoints are
+> unaffected (back image absent → `right_wrist_0_rgb` stays zero + masked).
+
+Ray isolation (see `RAY_ISOLATION.md`): every Ray cluster needs a distinct
+GCS port + dashboard-agent port + temp-dir + pinned `RAY_ADDRESS` + disjoint
+GPUs; never a bare `ray stop`. The dual-wrist SFT uses port **6383** / dash
+**52369** (distinct from wrist 6379, actual-ee 6381, eval 6380). The data
+collector is multiprocessing (not Ray) but still needs disjoint `--gpu-ids` and
+must **not** be launched via the legacy `run_train/peginsertion_maniskill_pi0.5/run.sh`
+(that script does a bare `ray stop`).
+
+```bash
+export PATH=/opt/kairan/envs/rlinf/bin:$PATH
+cd /opt/yingxi/RLinf_RoboFAPE
+
+# --- 1. Collect dual-wrist data (multiprocessing; default --collect-mode insert_only) ---
+tmux new-session -d -s collect_dualwrist "cd /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5 && \
+  PYTHONUNBUFFERED=1 /opt/kairan/envs/rlinf/bin/python collect_peg_insertion_controller_data.py \
+    --num-traj 3200 --gpu-ids 0,1,2,3 --num-workers 4 --collect-mode insert_only \
+    --output-dir data/peg_insertion_vertical_dualwrist_insert_only_3200 \
+    2>&1 | tee ../../logs/collect_dualwrist_insert_only_tmux.log"
+# Full pick-up-and-insert mode (keeps reach/grasp/lift prefix, two-stage prompts):
+#   --collect-mode full --output-dir data/peg_insertion_vertical_dualwrist_full_3200
+# Optional post-hoc conversion of a full dataset (same find_lift_end criterion):
+#   python convert_to_insert_only.py \
+#     --src-dir data/peg_insertion_vertical_dualwrist_full_3200 \
+#     --dst-dir data/peg_insertion_vertical_dualwrist_insert_only_3200
+
+# --- 2. Replay smoke (no Ray) ---
+python run_train/peginsertion_maniskill_pi0.5/replay_controller_dataset.py \
+  --dataset run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_3200
+
+# --- 3. Dual-wrist insert-only SFT (Ray head: port 6383 / dash 52369 / GPUs 4-7) ---
+tmux new-session -d -s sft_dualwrist "cd /opt/yingxi/RLinf_RoboFAPE && \
+  PYTHONUNBUFFERED=1 \
+  DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_3200 \
+  GPU_IDS=4,5,6,7 \
+  SFT_RAY_PORT=6383 SFT_DASHBOARD_AGENT_PORT=52369 \
+  bash sft_finetune_dualwrist.sh 2>&1 | tee logs/sft_dualwrist_tmux.log"
+# sft_finetune_dualwrist.sh wraps sft_finetune_pi05base.sh (scoped pkill by
+# SFT_RAY_PORT, RAY_ADDRESS pin, ulimit -n 1048576, EXIT trap, no bare ray stop)
+# and sets CONFIG_NAME=peg_insertion_sft_openpi_pi05_dualwrist,
+# OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_dualwrist (num_images_in_input=3).
+
+# --- 4. Dual-wrist eval (Ray head: port 6380; GPUs disjoint from SFT, here 0-3) ---
+# Single checkpoint (full episodes):
+tmux new-session -d -s eval_dualwrist "cd /opt/yingxi/RLinf_RoboFAPE && \
+  CHECKPOINT_PATH=<.../global_step_N/actor> EVAL_RAY_PORT=6380 GPU_IDS=0,1,2,3 MANAGE_RAY=true \
+  bash run_train/eval_checkpoint/run_peginsertion_dualwrist.sh 2>&1 | tee logs/eval_dualwrist_tmux.log"
+# Insert-only eval (pre_grasped reset, 200 steps):
+#   replace run_peginsertion_dualwrist.sh with run_peginsertion_dualwrist_insert_only.sh
+# Sweep all checkpoints (same port 6380; mutually exclusive with the single-ckpt eval):
+tmux new-session -d -s eval_sweep_dualwrist "cd /opt/yingxi/RLinf_RoboFAPE && \
+  MPLCONFIGDIR=/tmp/matplotlib /opt/kairan/envs/rlinf/bin/python \
+    run_train/eval_checkpoint/sweep_peginsertion_dualwrist.py \
+    --ray-port 6380 --run-script run_train/eval_checkpoint/run_peginsertion_dualwrist_insert_only.sh \
+    --checkpoint-dir <.../checkpoints> --output-dir <...> \
+    --num-eval-episodes 10 --num-envs 5 --gpu-ids 0,1,2,3 --action-scale 1.0 \
+    --resume --continue-on-error 2>&1 | tee logs/eval_sweep_dualwrist_tmux.log"
+
+# --- Monitor / scoped teardown (never bare `ray stop`) ---
+tmux ls
+pgrep -fa gcs_server | grep -oE 'gcs_server_port=[0-9]+' | sort -u   # one line per cluster
+ss -tlnp | grep -E '6383|6380|52369|52365'
+# Scoped teardown of ONE cluster (replace P with its GCS port):
+P=6383
+pkill -9 -f "gcs_server.*--gcs_server_port=${P}"  || true
+pkill -9 -f "raylet.*--gcs-address=[^ ]*:${P}"     || true
+pkill -9 -f "dashboard.*--gcs-address=[^ ]*:${P}" || true
+sleep 2
+```
+
+Concurrency rules: SFT (6383, GPUs 4-7) and eval (6380, GPUs 0-3) can run at the
+same time — disjoint ports + disjoint GPUs. Two eval sweeps must not run
+concurrently (both want 6380/52365); give the second `--ray-port 6390` and a
+distinct dashboard port. Before launching SFT, check `df -h /opt` (each pi0.5
+checkpoint is ~16-32GB).
 
 ## Troubleshooting
 

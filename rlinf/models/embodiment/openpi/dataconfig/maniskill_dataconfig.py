@@ -159,6 +159,44 @@ class LeRobotManiSkillPegInsertionWristDataConfig(LeRobotManiSkillDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotManiSkillPegInsertionDualWristDataConfig(
+    LeRobotManiSkillPegInsertionWristDataConfig
+):
+    """DataConfig for PegInsertionVertical finetuning with front+back wrist cameras.
+
+    Differences from LeRobotManiSkillPegInsertionWristDataConfig:
+    - image: base + front wrist + back wrist. The back wrist image
+      (observation.images.wrist_back) is repacked to ``observation/wrist_image_back``
+      so that ``ManiSkillInputs`` maps it to ``right_wrist_0_rgb`` and enables the
+      corresponding image mask. Pair with num_images_in_input=3 so all three image
+      slots are un-masked for the value/VLM prefix.
+    - state/action: inherited from the wrist config (observation.state_tcp, delta).
+    """
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        config = super().create(assets_dirs, model_config)
+        # Same repack as the wrist config plus the back-wrist image -> right slot.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.top",
+                        "observation/wrist_image": "observation.images.wrist",
+                        "observation/wrist_image_back": "observation.images.wrist_back",
+                        "observation/state": "observation.state_tcp",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        return dataclasses.replace(config, repack_transforms=repack_transform)
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotManiSkillPegInsertionDataConfig(LeRobotManiSkillDataConfig):
     """DataConfig for PegInsertionVertical finetuning.
 

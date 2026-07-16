@@ -98,6 +98,12 @@ def _with_wrist_camera_sensor_config(sensor_configs):
     hand_camera.setdefault("width", 224)
     hand_camera.setdefault("height", 224)
     merged["hand_camera"] = hand_camera
+    # Back-facing wrist camera shares the front wrist resolution so the model's
+    # left/right_wrist_0_rgb image slots have matching shapes.
+    hand_camera_back = dict(merged.get("hand_camera_back", {}))
+    hand_camera_back.setdefault("width", 224)
+    hand_camera_back.setdefault("height", 224)
+    merged["hand_camera_back"] = hand_camera_back
     return merged
 
 
@@ -186,11 +192,30 @@ class PegInsertionVerticalEnv(BaseEnv):
 
     @property
     def _default_sensor_configs(self):
-        return [
+        configs = [
             CameraConfig(
                 "base_camera", _external_camera_pose(), 224, 224, 1.0, 0.01, 100
             )
         ]
+        # Back-facing wrist camera (eye-in-hand): mounted on the same camera_link
+        # as the front hand_camera but flipped 180 deg about x for a rear view,
+        # complementary to the front wrist camera. Only panda_wristcam has a
+        # camera_link; skipped for the base panda robot.
+        links_map = getattr(getattr(self.agent, "robot", None), "links_map", {})
+        if "camera_link" in links_map:
+            configs.append(
+                CameraConfig(
+                    "hand_camera_back",
+                    sapien.Pose(p=[0, 0, 0], q=[0, 1, 0, 0]),
+                    224,
+                    224,
+                    1.0,
+                    0.01,
+                    100,
+                    mount=links_map["camera_link"],
+                )
+            )
+        return configs
 
     @property
     def _default_human_render_camera_configs(self):

@@ -139,6 +139,10 @@ from peg_insertion_prompts import (
     DEFAULT_PROMPT_SEED,
     generate_prompts,
 )
+from insert_only_crop import (
+    find_lift_end,
+    generate_insert_only_prompts,
+)
 FPS = 20
 IMAGE_SIZE = 224
 RENDER_W = 640
@@ -188,11 +192,13 @@ def _capture_obs(env) -> dict[str, Any]:
     sensor_data = obs["sensor_data"]
     base = _as_numpy(sensor_data["base_camera"]["rgb"])[0].astype(np.uint8).copy()
     hand = _as_numpy(sensor_data["hand_camera"]["rgb"])[0].astype(np.uint8).copy()
+    hand_back = _as_numpy(sensor_data["hand_camera_back"]["rgb"])[0].astype(np.uint8).copy()
     render = _capture_render_image(unwrapped, base)
     state_capture = _capture_state(env)
     return {
         "base_camera_rgb": base,
         "hand_camera_rgb": hand,
+        "hand_camera_back_rgb": hand_back,
         "render_rgb": render,
         **state_capture,
     }
@@ -221,10 +227,12 @@ def _images_from_obs(env, obs: dict[str, Any]) -> dict[str, np.ndarray]:
     sensor_data = obs["sensor_data"]
     base = _as_numpy(sensor_data["base_camera"]["rgb"])[0].astype(np.uint8).copy()
     hand = _as_numpy(sensor_data["hand_camera"]["rgb"])[0].astype(np.uint8).copy()
+    hand_back = _as_numpy(sensor_data["hand_camera_back"]["rgb"])[0].astype(np.uint8).copy()
     render = _capture_render_image(env.unwrapped, base)
     return {
         "base_camera_rgb": base,
         "hand_camera_rgb": hand,
+        "hand_camera_back_rgb": hand_back,
         "render_rgb": render,
     }
 
@@ -552,6 +560,7 @@ def _track_reference_with_controller(
     rows = []
     base_frames = []
     wrist_frames = []
+    wrist_back_frames = []
     render_frames = []
     for plan_item in action_plan:
         pre = _capture_state(env)
@@ -584,6 +593,7 @@ def _track_reference_with_controller(
             assert images is not None
             base_frames.append(images["base_camera_rgb"])
             wrist_frames.append(images["hand_camera_rgb"])
+            wrist_back_frames.append(images["hand_camera_back_rgb"])
             render_frames.append(images["render_rgb"])
 
     eval_info = env.unwrapped.evaluate()
@@ -593,6 +603,7 @@ def _track_reference_with_controller(
             success,
             reset_state,
             rows,
+            None,
             None,
             None,
             None,
@@ -606,6 +617,7 @@ def _track_reference_with_controller(
         rows,
         np.stack(base_frames),
         np.stack(wrist_frames),
+        np.stack(wrist_back_frames),
         np.stack(render_frames),
         action_plan,
         norm_diagnostics,
@@ -631,6 +643,9 @@ class LeRobotControllerWriter:
         self.global_index = 0
         self.task_to_idx: dict[str, int] = {}
         self.tasks: list[str] = []
+        # Recorded into meta/info.json for traceability. Set by the collector
+        # via the --collect-mode flag ("full" or "insert_only").
+        self.collect_mode = "insert_only"
         os.makedirs(self.outdir, exist_ok=True)
 
     def _task_index(self, task: str) -> int:
@@ -651,6 +666,7 @@ class LeRobotControllerWriter:
         episode_rows: list[dict[str, Any]],
         base_frames: np.ndarray,
         wrist_frames: np.ndarray,
+        wrist_back_frames: np.ndarray,
         render_frames: np.ndarray,
         task: str,
     ) -> int:
@@ -682,6 +698,7 @@ class LeRobotControllerWriter:
         for key, frames in [
             ("observation.images.top", base_frames),
             ("observation.images.wrist", wrist_frames),
+            ("observation.images.wrist_back", wrist_back_frames),
             ("observation.images.render", render_frames),
         ]:
             video_path = osp.join(
@@ -707,6 +724,7 @@ class LeRobotControllerWriter:
             self.episodes,
             self.tasks,
             write_stats=write_stats,
+            collect_mode=self.collect_mode,
         )
 
     def finalize(self) -> None:
@@ -773,6 +791,7 @@ def _features(num_reset_state_dims: int) -> dict[str, Any]:
     for key, height, width in [
         ("observation.images.top", IMAGE_SIZE, IMAGE_SIZE),
         ("observation.images.wrist", IMAGE_SIZE, IMAGE_SIZE),
+        ("observation.images.wrist_back", IMAGE_SIZE, IMAGE_SIZE),
         ("observation.images.render", RENDER_H, RENDER_W),
     ]:
         features[key] = {
@@ -828,6 +847,7 @@ def _write_dataset_tables(
     df: pd.DataFrame,
     episodes: list[dict[str, Any]],
     tasks: list[str],
+    collect_mode: str = "insert_only",
 ) -> None:
     df = _prepare_dataset_df(df)
     for episode_index in sorted(df["episode_index"].unique()):
@@ -835,7 +855,7 @@ def _write_dataset_tables(
         episode_df = df[df["episode_index"] == episode_index].reset_index(drop=True)
         _write_episode_table(outdir, episode_df, episode_index)
 
-    _write_dataset_metadata(outdir, df, episodes, tasks, write_stats=True)
+    _write_dataset_metadata(outdir, df, episodes, tasks, write_stats=True, collect_mode=collect_mode)
 
 
 def _write_dataset_metadata(
@@ -845,6 +865,7 @@ def _write_dataset_metadata(
     tasks: list[str],
     *,
     write_stats: bool,
+    collect_mode: str = "insert_only",
 ) -> None:
     meta_dir = osp.join(outdir, "meta")
     os.makedirs(meta_dir, exist_ok=True)
@@ -894,6 +915,7 @@ def _write_dataset_metadata(
     info = {
         "codebase_version": "v2.0",
         "dataset_variant": "peg-insertion-controller-domain-v1",
+        "collect_mode": collect_mode,
         "robot_type": "panda_wristcam",
         "total_episodes": total_episodes,
         "total_frames": int(len(df)),
@@ -945,6 +967,7 @@ def _collect_episodes(
     max_attempts: int,
     render_backend_prefix: str,
     progress_prefix: str = "",
+    collect_mode: str = "insert_only",
 ):
     reset_options = {"randomize_initial_poses": True}
     seed = base_seed
@@ -953,6 +976,13 @@ def _collect_episodes(
     ref_fail = 0
     ctrl_dry_fail = 0
     ctrl_capture_fail = 0
+    # Prompt pool: insert_only uses single-stage "insert the peg" wording (matches
+    # convert_to_insert_only.py); full keeps the two-stage pick-up-and-insert set.
+    if collect_mode == "insert_only":
+        task_pool = generate_insert_only_prompts(DEFAULT_NUM_PROMPTS, DEFAULT_PROMPT_SEED)
+    else:
+        task_pool = TASK_DESCRIPTIONS
+    writer.collect_mode = collect_mode
     render_backend = _render_backend_from_gpu_id(gpu_id, render_backend_prefix)
     gpu_label = _gpu_label(gpu_id, render_backend_prefix)
     pbar = tqdm(total=num_traj, desc=progress_prefix or "Collect controller data")
@@ -1047,6 +1077,7 @@ def _collect_episodes(
                         _,
                         _,
                         _,
+                        _,
                         action_plan,
                         dry_plan_diagnostics,
                     ) = _track_reference_with_controller(
@@ -1091,6 +1122,7 @@ def _collect_episodes(
                     rows,
                     base,
                     wrist,
+                    wrist_back,
                     render,
                     _,
                     norm_diagnostics,
@@ -1125,9 +1157,37 @@ def _collect_episodes(
                     writer.log_attempt(attempt_record)
                     seed += 1
                     continue
-                assert base is not None and wrist is not None and render is not None
-                task = random.Random(seed).choice(TASK_DESCRIPTIONS)
-                episode_index = writer.add_episode(rows, base, wrist, render, task)
+                assert base is not None and wrist is not None and wrist_back is not None and render is not None
+                # insert_only mode: crop to the move-and-insert segment starting at
+                # the lift-end frame (drops reach/grasp/close/lift prefix), matching
+                # convert_to_insert_only.py via the shared find_lift_end criterion.
+                if collect_mode == "insert_only":
+                    actions_arr = np.stack([r["actions"] for r in rows])
+                    state_tcp_arr = np.stack([r["observation.state_tcp"] for r in rows])
+                    t_lift = find_lift_end(actions_arr, state_tcp_arr)
+                    if t_lift is None or len(rows) - t_lift < 10:
+                        attempt_record.update(
+                            {
+                                "status": "insert_crop_skip",
+                                "t_lift": t_lift,
+                                "episode_len": len(rows),
+                                "passed_after": passed,
+                                "ref_fail": ref_fail,
+                                "ctrl_dry_fail": ctrl_dry_fail,
+                                "ctrl_capture_fail": ctrl_capture_fail,
+                                "total_time_sec": time.time() - attempt_started_at,
+                            }
+                        )
+                        writer.log_attempt(attempt_record)
+                        seed += 1
+                        continue
+                    rows = rows[t_lift:]
+                    base = base[t_lift:]
+                    wrist = wrist[t_lift:]
+                    wrist_back = wrist_back[t_lift:]
+                    render = render[t_lift:]
+                task = random.Random(seed).choice(task_pool)
+                episode_index = writer.add_episode(rows, base, wrist, wrist_back, render, task)
                 passed += 1
                 attempt_record.update(
                     {
@@ -1207,6 +1267,7 @@ def _collect_worker(
     startup_delay: float,
     max_attempts: int,
     render_backend_prefix: str,
+    collect_mode: str = "insert_only",
 ):
     if startup_delay > 0:
         time.sleep(startup_delay)
@@ -1220,6 +1281,7 @@ def _collect_worker(
         max_attempts=max_attempts,
         render_backend_prefix=render_backend_prefix,
         progress_prefix=f"[w{worker_id}/gpu{gpu_label}] ",
+        collect_mode=collect_mode,
     )
     writer.finalize()
     print(
@@ -1230,7 +1292,7 @@ def _collect_worker(
     return (worker_id, shard_dir, *result)
 
 
-def _merge_shards(final_dir: str, shard_dirs: list[str]) -> None:
+def _merge_shards(final_dir: str, shard_dirs: list[str], collect_mode: str = "insert_only") -> None:
     final_dir = osp.abspath(final_dir)
     for subdir in ["data", "meta", "videos"]:
         path = osp.join(final_dir, subdir)
@@ -1280,6 +1342,7 @@ def _merge_shards(final_dir: str, shard_dirs: list[str]) -> None:
             for key in [
                 "observation.images.top",
                 "observation.images.wrist",
+                "observation.images.wrist_back",
                 "observation.images.render",
             ]:
                 src = osp.join(
@@ -1306,7 +1369,7 @@ def _merge_shards(final_dir: str, shard_dirs: list[str]) -> None:
         raise RuntimeError("No successful shard data to merge.")
     merged_df = pd.concat(all_frames, ignore_index=True)
     merged_df["task"] = merged_df["task"].astype("string")
-    _write_dataset_tables(final_dir, merged_df, episodes, tasks)
+    _write_dataset_tables(final_dir, merged_df, episodes, tasks, collect_mode=collect_mode)
     print(
         f"Merged controller-domain dataset: {global_episode} episodes, "
         f"{len(merged_df)} frames -> {final_dir}"
@@ -1340,6 +1403,17 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         default="/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller",
+    )
+    parser.add_argument(
+        "--collect-mode",
+        choices=("full", "insert_only"),
+        default="insert_only",
+        help=(
+            "full = record the whole pick-up-and-insert episode. "
+            "insert_only (default) = crop to the move-and-insert segment starting "
+            "at the lift-end frame (drops reach/grasp/close/lift prefix), matching "
+            "convert_to_insert_only.py via the shared find_lift_end criterion."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=1)
@@ -1392,6 +1466,7 @@ def main() -> None:
             gpu_ids[0],
             max_attempts=max(args.num_traj * args.max_attempts_multiplier, args.num_traj),
             render_backend_prefix=args.render_backend_prefix,
+            collect_mode=args.collect_mode,
         )
         writer.finalize()
         print(f"Done: passed={result[0]} attempts={result[1]} out={output_dir}")
@@ -1421,6 +1496,7 @@ def main() -> None:
                 delay,
                 max(count * args.max_attempts_multiplier, count),
                 args.render_backend_prefix,
+                args.collect_mode,
             )
         )
 
@@ -1433,7 +1509,7 @@ def main() -> None:
     with ctx.Pool(args.num_workers) as pool:
         results = pool.starmap(_collect_worker, worker_args)
     print(f"Worker results: {results}")
-    _merge_shards(output_dir, [item[3] for item in worker_args])
+    _merge_shards(output_dir, [item[3] for item in worker_args], collect_mode=args.collect_mode)
 
 
 if __name__ == "__main__":

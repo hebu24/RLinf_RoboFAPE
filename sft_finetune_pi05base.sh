@@ -141,4 +141,5 @@ bash examples/sft/run_vla_sft.sh \
   actor.model.model_path="${PREPARED_BASE}" \
   runner.logger.experiment_name="${EXPERIMENT_NAME}" \
   cluster.component_placement="{actor\\,env\\,rollout:${SFT_COMPONENT_PLACEMENT}}" \
-  "${RESUME_DIR:+runner.resume_dir=${RESUME_DIR}}"
+  "${RESUME_DIR:+runner.resume_dir=${RESUME_DIR}}" \
+  ${EXTRA_HYDRA:-}

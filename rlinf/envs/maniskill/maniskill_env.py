@@ -240,6 +240,17 @@ class ManiskillEnv(gym.Env):
                     wrist_images = sorted_images.pop("hand_camera")["rgb"]
                 else:
                     sorted_images.pop("hand_camera", None)
+                # Back-facing wrist camera (eye-in-hand). Routed to its own named
+                # channel (not the catch-all extra_view_images) so it maps cleanly
+                # onto the model's right_wrist_0_rgb slot. Enabled by
+                # cfg.use_wrist_back_image; absent sensors / disabled flag -> None.
+                wrist_back_images = None
+                if bool(getattr(self.cfg, "use_wrist_back_image", False)) and (
+                    "hand_camera_back" in sorted_images
+                ):
+                    wrist_back_images = sorted_images.pop("hand_camera_back")["rgb"]
+                else:
+                    sorted_images.pop("hand_camera_back", None)
                 extra_view_images = (
                     torch.stack([v["rgb"] for v in sorted_images.values()], dim=1)
                     if sorted_images
@@ -249,6 +260,7 @@ class ManiskillEnv(gym.Env):
                     "main_images": main_images,
                     "extra_view_images": extra_view_images,
                     "wrist_images": wrist_images,
+                    "wrist_back_images": wrist_back_images,
                     "states": state,
                     "task_descriptions": self.instruction,
                 }
