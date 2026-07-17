@@ -367,12 +367,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         loss = super().forward(observation, actions)
         if use_action_chunk_loss:
             loss = loss[:, : self.config.action_chunk, : self.config.action_env_dim]
-        # OpenPI pads actions to the model action_dim (typically 32). Restrict the
-        # masked loss to the six continuous environment action dimensions so the
-        # gripper and padded channels do not contribute.
+        # OpenPI pads actions to the model action_dim (typically 32), while the
+        # environment gripper is at action_env_dim - 1. Mask exactly that channel
+        # and retain the padded-action objective and loss scale used by OpenPI.
         if getattr(self.config, "mask_gripper_loss", False):
-            env_loss = loss[..., : self.config.action_env_dim - 1]
-            return env_loss.mean()
+            gripper_index = self.config.action_env_dim - 1
+            loss = loss.clone()
+            loss[..., gripper_index] = 0.0
+            return loss.sum() / (loss.numel() - loss.shape[0] * loss.shape[1])
         return loss.mean()
 
     def prepare_dagger_sft_batch(self, batch):
