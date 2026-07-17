@@ -52,6 +52,7 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_sft_pi05base}"
 # used to compute norm_stats. Override both together for the wrist variant.
 CONFIG_NAME="${CONFIG_NAME:-peg_insertion_sft_openpi_pi05}"
 OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_peg_insertion}"
+FORCE_NORM_STATS="${FORCE_NORM_STATS:-0}"
 NORM_STATS_ASSET="physical-intelligence/maniskill"
 
 # --- (a) prepare base dir: symlink pi05_base weights (do not copy 16.5GB / do not touch shared dir) ---
@@ -60,9 +61,18 @@ ln -sfn "$PI05_BASE/model.safetensors" "$PREPARED_BASE/model.safetensors"
 [[ -f "$PI05_BASE/config.json" ]] && ln -sfn "$PI05_BASE/config.json" "$PREPARED_BASE/config.json"
 echo "[pi05base] prepared base dir: $PREPARED_BASE (symlinks -> $PI05_BASE)"
 
-# --- (b) compute norm_stats from the training data into the prepared base (cached unless FORCE_NORM_STATS=1) ---
+# --- (b) restore or compute OpenPI norm_stats ---
+# Keep a dataset-local cache, namespaced by OpenPI config because different camera/
+# state transforms can produce different statistics from the same LeRobot dataset.
 NS_FILE="$PREPARED_BASE/$NORM_STATS_ASSET/norm_stats.json"
-if [[ ! -f "$NS_FILE" || "${FORCE_NORM_STATS:-0}" == "1" ]]; then
+DATA_NS_FILE="$DATA_DIR/meta/openpi/$OPENPI_CONFIG_NAME/norm_stats.json"
+if [[ "$FORCE_NORM_STATS" != "1" && -f "$DATA_NS_FILE" ]]; then
+  mkdir -p "$(dirname "$NS_FILE")"
+  cp -f "$DATA_NS_FILE" "$NS_FILE"
+  echo "[pi05base] restored dataset-cached norm_stats: $DATA_NS_FILE -> $NS_FILE"
+elif [[ "$FORCE_NORM_STATS" != "1" && -f "$NS_FILE" ]]; then
+  echo "[pi05base] reusing cached norm_stats at $NS_FILE (set FORCE_NORM_STATS=1 to recompute)"
+else
   echo "[pi05base] computing norm_stats from $DATA_DIR -> $NS_FILE"
   # Norm_stats is a pure-statistics (CPU) pass: hide all GPUs so the data loader does
   # not allocate VRAM and compete with training on other cards. GPU visibility is
@@ -72,9 +82,12 @@ if [[ ! -f "$NS_FILE" || "${FORCE_NORM_STATS:-0}" == "1" ]]; then
     --config-name "$OPENPI_CONFIG_NAME" \
     --repo-id "$DATA_DIR" \
     --output-dir "$PREPARED_BASE"
-else
-  echo "[pi05base] reusing cached norm_stats at $NS_FILE (set FORCE_NORM_STATS=1 to recompute)"
 fi
+
+# Persist the exact OpenPI stats next to the dataset for future prepared-base dirs.
+mkdir -p "$(dirname "$DATA_NS_FILE")"
+cp -f "$NS_FILE" "$DATA_NS_FILE"
+echo "[pi05base] dataset norm_stats cache: $DATA_NS_FILE"
 
 # --- (c) GPU placement (same logic as sft_finetune.sh) ---
 IFS="," read -r -a GPU_ID_ARRAY <<< "${GPU_IDS}"

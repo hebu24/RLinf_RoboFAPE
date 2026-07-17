@@ -360,16 +360,16 @@ disjoint GPUs:
 
 ```bash
 # wrist insert-only SFT — GPUs 4-7, port 6379
-tmux new-session -d -s sft_insert_wrist "cd /opt/yingxi/RLinf_RoboFAPE && \
+cd /opt/yingxi/RLinf_RoboFAPE && \
   PYTHONUNBUFFERED=1 \
   DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200 \
-  GPU_IDS=4,5,6,7 \
+  GPU_IDS=0,1,2,3 \
   SFT_RAY_PORT=6379 SFT_DASHBOARD_AGENT_PORT=52366 \
   CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist \
   OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist \
   PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist_insert \
   EXPERIMENT_NAME=peg_insertion_sft_insert_only_wrist \
-  bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_insert_wrist_tmux.log"
+  bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_insert_wrist_tmux.log
 
 # base-only insert-only SFT — GPUs 0-3, port 6382 (distinct port + dashboard + temp-dir)
 tmux new-session -d -s sft_insert_base "cd /opt/yingxi/RLinf_RoboFAPE && \
@@ -569,7 +569,7 @@ cd /opt/yingxi/RLinf_RoboFAPE && \
     --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
     --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260716-11:31:24-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
     --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260716-11:31:24-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep \
-    --num-eval-episodes 10 --num-envs 1 --gpu-ids 3,4,5,6,7 --action-scale 1.0 
+    --num-eval-episodes 10 --num-envs 1 --gpu-ids 3,4,5,6,7 --action-scale 1.0
 ```
 
 Per-episode planning adds a CPU solve (~seconds) per episode, so insert-only
@@ -694,32 +694,45 @@ python run_train/peginsertion_maniskill_pi0.5/replay_controller_dataset.py \
   --dataset run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_3200
 
 # --- 3. Dual-wrist insert-only SFT (Ray head: port 6383 / dash 52369 / GPUs 4-7) ---
-tmux new-session -d -s sft_dualwrist "cd /opt/yingxi/RLinf_RoboFAPE && \
+cd /opt/yingxi/RLinf_RoboFAPE && \
   PYTHONUNBUFFERED=1 \
   DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_3200 \
   GPU_IDS=4,5,6,7 \
   SFT_RAY_PORT=6383 SFT_DASHBOARD_AGENT_PORT=52369 \
-  bash sft_finetune_dualwrist.sh 2>&1 | tee logs/sft_dualwrist_tmux.log"
+  bash sft_finetune_dualwrist.sh 2>&1 | tee logs/sft_dualwrist_tmux.log
 # sft_finetune_dualwrist.sh wraps sft_finetune_pi05base.sh (scoped pkill by
 # SFT_RAY_PORT, RAY_ADDRESS pin, ulimit -n 1048576, EXIT trap, no bare ray stop)
 # and sets CONFIG_NAME=peg_insertion_sft_openpi_pi05_dualwrist,
 # OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_dualwrist (num_images_in_input=3).
 
-# --- 4. Dual-wrist eval (Ray head: port 6380; GPUs disjoint from SFT, here 0-3) ---
-# Single checkpoint (full episodes):
-tmux new-session -d -s eval_dualwrist "cd /opt/yingxi/RLinf_RoboFAPE && \
-  CHECKPOINT_PATH=<.../global_step_N/actor> EVAL_RAY_PORT=6380 GPU_IDS=0,1,2,3 MANAGE_RAY=true \
-  bash run_train/eval_checkpoint/run_peginsertion_dualwrist.sh 2>&1 | tee logs/eval_dualwrist_tmux.log"
-# Insert-only eval (pre_grasped reset, 200 steps):
-#   replace run_peginsertion_dualwrist.sh with run_peginsertion_dualwrist_insert_only.sh
-# Sweep all checkpoints (same port 6380; mutually exclusive with the single-ckpt eval):
-tmux new-session -d -s eval_sweep_dualwrist "cd /opt/yingxi/RLinf_RoboFAPE && \
-  MPLCONFIGDIR=/tmp/matplotlib /opt/kairan/envs/rlinf/bin/python \
-    run_train/eval_checkpoint/sweep_peginsertion_dualwrist.py \
-    --ray-port 6380 --run-script run_train/eval_checkpoint/run_peginsertion_dualwrist_insert_only.sh \
-    --checkpoint-dir <.../checkpoints> --output-dir <...> \
-    --num-eval-episodes 10 --num-envs 5 --gpu-ids 0,1,2,3 --action-scale 1.0 \
-    --resume --continue-on-error 2>&1 | tee logs/eval_sweep_dualwrist_tmux.log"
+# --- 4a. Test one dual-wrist insertion-only checkpoint ---
+# Own Ray head on port 6380; GPU 0 is disjoint from the dual-wrist SFT on GPUs 4-7.
+VENV_DIR=/opt/kairan/envs/rlinf \
+CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260717-03:20:44-peg_insertion_sft_openpi_pi05_dualwrist-3200/peg_insertion_sft_dualwrist/checkpoints/global_step_10000/actor \
+GPU_IDS=0 \
+MAX_EPISODE_STEPS=600 \
+NUM_EVAL_EPISODES=10 \
+NUM_ENVS=1 \
+EVAL_ACTION_SCALE=1.0 \
+SAVE_VIDEO=true \
+MANAGE_RAY=true \
+EVAL_RAY_PORT=6380 \
+bash run_train/eval_checkpoint/run_peginsertion_dualwrist_insert_only.sh
+
+# --- 4b. Sweep all dual-wrist insertion-only checkpoints ---
+# The sweep owns the same port 6380, so do not run it with the single-checkpoint
+# command above or another eval sweep. It schedules one checkpoint per listed GPU.
+MPLCONFIGDIR=/tmp/matplotlib \
+/opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_dualwrist.py \
+  --ray-port 6380 \
+  --run-script run_train/eval_checkpoint/run_peginsertion_dualwrist_insert_only.sh \
+  --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260717-03:20:44-peg_insertion_sft_openpi_pi05_dualwrist-3200/peg_insertion_sft_dualwrist/checkpoints \
+  --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260717-03:20:44-peg_insertion_sft_openpi_pi05_dualwrist-3200/peg_insertion_sft_dualwrist/dualwrist_insert_only_eval_sweep \
+  --num-eval-episodes 10 \
+  --num-envs 1 \
+  --max-episode-steps 600 \
+  --gpu-ids 0,1,2,3 \
+  --action-scale 1.0 
 
 # --- Monitor / scoped teardown (never bare `ray stop`) ---
 tmux ls

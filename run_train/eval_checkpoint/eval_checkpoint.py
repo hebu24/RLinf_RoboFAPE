@@ -113,27 +113,23 @@ def _validate_peg_insertion_eval_cfg(cfg: DictConfig, task_id: str) -> None:
     model_cfg = cfg.rollout.model
     openpi_cfg = model_cfg.get("openpi", {})
     config_name = openpi_cfg.get("config_name", None)
-    if config_name not in {
-        "pi05_maniskill_peg_insertion",
-        "pi05_maniskill_peg_insertion_wrist",
-        "pi05_maniskill_peg_insertion_actual_ee",
-    }:
+    config_profiles = {
+        "pi05_maniskill_peg_insertion": (1, False, False),
+        "pi05_maniskill_peg_insertion_wrist": (2, True, False),
+        "pi05_maniskill_peg_insertion_actual_ee": (2, True, False),
+        "pi05_maniskill_peg_insertion_dualwrist": (3, True, True),
+    }
+    if config_name not in config_profiles:
+        expected_config_names = ", ".join(sorted(config_profiles))
         raise ValueError(
             "PegInsertionVertical-v1 evaluation must use the peg-insertion "
             "OpenPI config used by SFT. Expected rollout.model.openpi.config_name "
-            "to be pi05_maniskill_peg_insertion, "
-            "pi05_maniskill_peg_insertion_wrist, or "
-            "pi05_maniskill_peg_insertion_actual_ee, got "
-            f"{config_name!r}. "
+            f"to be one of {expected_config_names}, got {config_name!r}. "
             "Do not evaluate a peg-insertion SFT checkpoint with generic "
             "pi05_maniskill transforms/norm stats."
         )
+    expected_images, expected_wrist, expected_wrist_back = config_profiles[config_name]
     num_images = int(openpi_cfg.get("num_images_in_input", -1))
-    is_wrist = config_name in {
-        "pi05_maniskill_peg_insertion_wrist",
-        "pi05_maniskill_peg_insertion_actual_ee",
-    }
-    expected_images = 2 if is_wrist else 1
     if num_images != expected_images:
         raise ValueError(
             "PegInsertionVertical-v1 evaluation image count does not match "
@@ -141,11 +137,19 @@ def _validate_peg_insertion_eval_cfg(cfg: DictConfig, task_id: str) -> None:
             f"got {num_images}."
         )
     use_wrist_image = bool(cfg.env.eval.get("use_wrist_image", False))
-    if use_wrist_image != is_wrist:
+    if use_wrist_image != expected_wrist:
         raise ValueError(
             "PegInsertionVertical-v1 evaluation wrist image routing does not "
-            f"match {config_name}: expected env.eval.use_wrist_image={is_wrist}, "
+            f"match {config_name}: expected env.eval.use_wrist_image={expected_wrist}, "
             f"got {use_wrist_image}."
+        )
+    use_wrist_back_image = bool(cfg.env.eval.get("use_wrist_back_image", False))
+    if use_wrist_back_image != expected_wrist_back:
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation back-wrist image routing does not "
+            f"match {config_name}: expected "
+            f"env.eval.use_wrist_back_image={expected_wrist_back}, got "
+            f"{use_wrist_back_image}."
         )
     num_action_chunks = int(model_cfg.get("num_action_chunks", -1))
     action_horizon = int(openpi_cfg.get("action_horizon", num_action_chunks))

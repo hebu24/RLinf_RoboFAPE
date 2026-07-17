@@ -18,7 +18,7 @@ cd /opt/yingxi/RLinf_RoboFAPE
 
 export PYTHONUNBUFFERED=1
 export DATA_DIR="${DATA_DIR:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_3200}"
-export GPU_IDS="${GPU_IDS:-4,5,6,7}"
+export GPU_IDS="${GPU_IDS:-0,1,2,3}"
 # Distinct Ray isolation from wrist(6379)/actual-ee(6381)/eval(6380).
 export SFT_RAY_PORT="${SFT_RAY_PORT:-6383}"
 export SFT_DASHBOARD_AGENT_PORT="${SFT_DASHBOARD_AGENT_PORT:-52369}"
@@ -31,7 +31,7 @@ export EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_sft_dualwrist}"
 # insert-only wrist v2 run. Cap the run at 10000 steps (max_steps ==
 # total_training_steps so the cosine LR schedule decays to min_lr over the run;
 # save a checkpoint every 1000 steps).
-export EXTRA_HYDRA="${EXTRA_HYDRA:-+actor.model.openapi.mask_gripper_loss=True actor.optim.lr=1.5e-6 actor.optim.lr_warmup_steps=1000 runner.max_steps=10000 actor.optim.total_training_steps=10000 runner.save_interval=1000 actor.optim.num_cycles=0.5 actor.optim.min_lr=2.5e-7}"
+export EXTRA_HYDRA="${EXTRA_HYDRA:-+actor.model.openapi.mask_gripper_loss=True actor.optim.lr=1e-5 actor.optim.lr_warmup_steps=1000 runner.max_steps=40000 actor.optim.total_training_steps=40000 runner.save_interval=5000 actor.optim.num_cycles=0.5 actor.optim.min_lr=2.5e-7}"
 
 bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_dualwrist_tmux.log
 

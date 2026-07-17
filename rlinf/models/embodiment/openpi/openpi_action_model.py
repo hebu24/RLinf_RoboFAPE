@@ -367,15 +367,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         loss = super().forward(observation, actions)
         if use_action_chunk_loss:
             loss = loss[:, : self.config.action_chunk, : self.config.action_env_dim]
-        # Optionally mask the gripper dim (last action dim). For insert-only data
-        # the gripper is constant (-1 -> normalized 0), so its flow-matching target
-        # u_t = noise - actions becomes pure noise; the model cannot predict it and
-        # it injects a non-zero, randomly-varying loss that destabilizes training.
-        # Masking it restricts the loss to the 6 real target-delta action dims.
+        # OpenPI pads actions to the model action_dim (typically 32). Restrict the
+        # masked loss to the six continuous environment action dimensions so the
+        # gripper and padded channels do not contribute.
         if getattr(self.config, "mask_gripper_loss", False):
-            loss = loss.clone()
-            loss[..., -1] = 0.0
-            return loss.sum() / (loss.numel() - loss.shape[0] * loss.shape[1])
+            env_loss = loss[..., : self.config.action_env_dim - 1]
+            return env_loss.mean()
         return loss.mean()
 
     def prepare_dagger_sft_batch(self, batch):
