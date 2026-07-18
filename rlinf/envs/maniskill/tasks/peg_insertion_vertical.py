@@ -87,8 +87,8 @@ def _build_table_plane(
 
 def _external_camera_pose():
     return sapien.Pose(
-        p=[0.705400, -0.086655, 0.686691],
-        q=[0.025112, -0.237384, -0.033640, 0.970508],
+        p=[0.60, -0.05, 0.55],
+        q=[0.03978504, -0.28877059, 0.01201129, 0.95649594],
     )
 
 
@@ -150,16 +150,16 @@ class PegInsertionVerticalEnv(BaseEnv):
     )
     hole_xy_randomization_bounds = np.array(
         [
-            [-0.12, 0.12],
-            [-0.12, 0.12],
+            [-0.02, 0.02],
+            [-0.02, 0.02],
         ],
         dtype=np.float32,
     )
-    peg_relative_hole_radius_bounds = np.array([0.17, 0.30], dtype=np.float32)
+    peg_relative_hole_radius_bounds = np.array([0.17, 0.20], dtype=np.float32)
     peg_xy_randomization_bounds = np.array(
         [
-            [-0.30, 0.15],
-            [-0.30, 0.30],
+            [-0.20, 0.20],
+            [-0.20, 0.20],
         ],
         dtype=np.float32,
     )
@@ -194,7 +194,7 @@ class PegInsertionVerticalEnv(BaseEnv):
     def _default_sensor_configs(self):
         configs = [
             CameraConfig(
-                "base_camera", _external_camera_pose(), 224, 224, 1.0, 0.01, 100
+                "base_camera", _external_camera_pose(), 224, 224, 0.6, 0.01, 100
             )
         ]
         # Back-facing wrist camera (eye-in-hand): mounted on the same camera_link
@@ -487,8 +487,8 @@ class PegInsertionVerticalEnv(BaseEnv):
             b = len(env_idx)
             episode_rngs = self._batched_episode_rng[env_idx]
             peg_pos = torch.zeros((b, 3))
-            peg_pos[:, 0] = -0.22
-            peg_pos[:, 1] = -0.12
+            peg_pos[:, 0] = -0.18
+            peg_pos[:, 1] = 0.0
             peg_pos[:, 2] = self.table_top_z + self.peg_half_length
             peg_quat = torch.tensor(
                 euler2quat(0, np.pi / 2, 0), device=self.device
@@ -496,8 +496,8 @@ class PegInsertionVerticalEnv(BaseEnv):
             peg_pose = Pose.create_from_pq(peg_pos, peg_quat)
 
             hole_pos = torch.zeros((b, 3))
-            hole_pos[:, 0] = -0.04
-            hole_pos[:, 1] = 0.02
+            hole_pos[:, 0] = 0.0
+            hole_pos[:, 1] = 0.0
             hole_pos[:, 2] = self.table_top_z + self.hole_half_depth
             hole_quat = torch.tensor(
                 euler2quat(0, np.pi / 2, 0), device=self.device

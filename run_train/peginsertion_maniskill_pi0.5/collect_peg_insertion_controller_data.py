@@ -50,7 +50,9 @@ def _early_configure_cuda_visible_devices() -> None:
     The CLI accepts physical nvidia-smi ids.  Once CUDA_VISIBLE_DEVICES is set,
     worker render backends are remapped to local ids later in main().
     """
-    render_prefix = (_early_arg_value("--render-backend-prefix", "cuda") or "cuda").lower()
+    render_prefix = (
+        _early_arg_value("--render-backend-prefix", "cuda") or "cuda"
+    ).lower()
     if render_prefix not in {"", "default", "cuda", "sapien_cuda"}:
         return
     if os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -143,6 +145,7 @@ from insert_only_crop import (
     find_lift_end,
     generate_insert_only_prompts,
 )
+
 FPS = 20
 IMAGE_SIZE = 224
 RENDER_W = 640
@@ -192,7 +195,9 @@ def _capture_obs(env) -> dict[str, Any]:
     sensor_data = obs["sensor_data"]
     base = _as_numpy(sensor_data["base_camera"]["rgb"])[0].astype(np.uint8).copy()
     hand = _as_numpy(sensor_data["hand_camera"]["rgb"])[0].astype(np.uint8).copy()
-    hand_back = _as_numpy(sensor_data["hand_camera_back"]["rgb"])[0].astype(np.uint8).copy()
+    hand_back = (
+        _as_numpy(sensor_data["hand_camera_back"]["rgb"])[0].astype(np.uint8).copy()
+    )
     render = _capture_render_image(unwrapped, base)
     state_capture = _capture_state(env)
     return {
@@ -227,7 +232,9 @@ def _images_from_obs(env, obs: dict[str, Any]) -> dict[str, np.ndarray]:
     sensor_data = obs["sensor_data"]
     base = _as_numpy(sensor_data["base_camera"]["rgb"])[0].astype(np.uint8).copy()
     hand = _as_numpy(sensor_data["hand_camera"]["rgb"])[0].astype(np.uint8).copy()
-    hand_back = _as_numpy(sensor_data["hand_camera_back"]["rgb"])[0].astype(np.uint8).copy()
+    hand_back = (
+        _as_numpy(sensor_data["hand_camera_back"]["rgb"])[0].astype(np.uint8).copy()
+    )
     render = _capture_render_image(env.unwrapped, base)
     return {
         "base_camera_rgb": base,
@@ -251,7 +258,9 @@ class ReferenceRecorder:
 
         def _step(action, **kwargs):
             pre = _capture_state(recorder.env)
-            obs, reward, terminated, truncated, info = recorder._orig_step(action, **kwargs)
+            obs, reward, terminated, truncated, info = recorder._orig_step(
+                action, **kwargs
+            )
             post = _capture_state(recorder.env)
             recorder.records.append(
                 {
@@ -275,14 +284,22 @@ def _render_backend_from_gpu_id(gpu_id: int, render_backend_prefix: str) -> str 
     if prefix in {"none", "off"}:
         return "none"
     if prefix in {"", "default", "gpu", "cuda", "sapien_cuda"}:
-        return f"gpu:{gpu_id}" if prefix in {"", "default", "gpu"} else f"{prefix}:{gpu_id}"
+        return (
+            f"gpu:{gpu_id}"
+            if prefix in {"", "default", "gpu"}
+            else f"{prefix}:{gpu_id}"
+        )
     return f"{render_backend_prefix}:{gpu_id}"
 
 
 def _gpu_label(gpu_id: int, render_backend_prefix: str) -> str:
     prefix = render_backend_prefix.lower()
     if prefix in {"", "default", "cuda", "sapien_cuda"}:
-        visible = [value.strip() for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if value.strip()]
+        visible = [
+            value.strip()
+            for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+            if value.strip()
+        ]
         if 0 <= gpu_id < len(visible):
             return f"{gpu_id}/physical{visible[gpu_id]}"
     return str(gpu_id)
@@ -453,7 +470,9 @@ def _build_tracking_plan(
 def _solver_result_summary(result: Any) -> dict[str, Any]:
     if isinstance(result, tuple):
         status = result[0]
-        stage_records = result[1] if len(result) > 1 and isinstance(result[1], list) else []
+        stage_records = (
+            result[1] if len(result) > 1 and isinstance(result[1], list) else []
+        )
     else:
         status = result
         stage_records = []
@@ -583,8 +602,12 @@ def _track_reference_with_controller(
                     "actions": raw_action,
                     "debug.env_action": env_action,
                     "debug.ref_next_tcp": target_tcp.reshape(-1).astype(np.float32),
-                    "debug.tcp_before": pre["tcp_matrix_root"].reshape(-1).astype(np.float32),
-                    "debug.tcp_after": post["tcp_matrix_root"].reshape(-1).astype(np.float32),
+                    "debug.tcp_before": pre["tcp_matrix_root"]
+                    .reshape(-1)
+                    .astype(np.float32),
+                    "debug.tcp_after": post["tcp_matrix_root"]
+                    .reshape(-1)
+                    .astype(np.float32),
                     "observation.state": pre["state"],
                     "observation.state_tcp": pre["state_tcp"],
                     "episode_reset_state": reset_state,
@@ -627,12 +650,105 @@ def _track_reference_with_controller(
 def _write_video(path: str, frames: np.ndarray) -> None:
     os.makedirs(osp.dirname(path), exist_ok=True)
     height, width = frames.shape[1], frames.shape[2]
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (width, height))
+    writer = cv2.VideoWriter(
+        path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (width, height)
+    )
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open video writer: {path}")
     for frame in frames:
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     writer.release()
+
+
+_VIS_KEYS = (
+    ("observation.images.top", "base"),
+    ("observation.images.wrist", "wrist_front"),
+    ("observation.images.wrist_back", "wrist_back"),
+)
+
+
+def _create_visualization_samples(root, total, count=10, seed=0):
+    count = min(max(count, 0), total)
+    if not count:
+        return
+    ids = sorted(
+        map(int, np.random.default_rng(seed).choice(total, count, replace=False))
+    )
+    out = osp.join(root, "visualization_samples")
+    if osp.exists(out):
+        shutil.rmtree(out)
+    os.makedirs(out)
+    manifest = []
+    for eid in ids:
+        chunk = eid // CHUNK_SIZE
+        captures = []
+        sources = []
+        for key, label in _VIS_KEYS:
+            src = osp.join(
+                root, "videos", f"chunk-{chunk:03d}", key, f"episode_{eid:06d}.mp4"
+            )
+            cap = cv2.VideoCapture(src)
+            if not cap.isOpened():
+                raise RuntimeError(f"Failed to open {src}")
+            captures.append((cap, label))
+            sources.append(osp.relpath(src, root))
+        dst = osp.join(out, f"episode_{eid:06d}_three_view.mp4")
+        writer = cv2.VideoWriter(
+            dst, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (IMAGE_SIZE * 3, IMAGE_SIZE)
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open {dst}")
+        frames = 0
+        try:
+            while True:
+                panels = []
+                for cap, label in captures:
+                    ok, frame = cap.read()
+                    if not ok:
+                        panels = []
+                        break
+                    frame = cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE))
+                    cv2.putText(
+                        frame,
+                        label,
+                        (6, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    panels.append(frame)
+                if not panels:
+                    break
+                joined = np.concatenate(panels, axis=1)
+                cv2.putText(
+                    joined,
+                    f"episode {eid}",
+                    (6, IMAGE_SIZE - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                writer.write(joined)
+                frames += 1
+        finally:
+            writer.release()
+            for cap, _ in captures:
+                cap.release()
+        manifest.append(
+            {
+                "episode_index": eid,
+                "frames": frames,
+                "video": osp.relpath(dst, root),
+                "sources": sources,
+            }
+        )
+    with open(osp.join(out, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"seed": seed, "samples": manifest}, f, indent=2)
+    print(f"Created {len(manifest)} visualization samples -> {out}")
 
 
 class LeRobotControllerWriter:
@@ -678,7 +794,9 @@ class LeRobotControllerWriter:
         df["timestamp"] = frame_index.astype(np.float32) / FPS
         df["frame_index"] = frame_index
         df["episode_index"] = np.full(length, episode_index, dtype=np.int64)
-        df["index"] = np.arange(self.global_index, self.global_index + length, dtype=np.int64)
+        df["index"] = np.arange(
+            self.global_index, self.global_index + length, dtype=np.int64
+        )
         df["task_index"] = np.full(length, task_index, dtype=np.int64)
         df["task"] = [task] * length
         self.rows.append(df)
@@ -773,19 +891,79 @@ def _array_summary(values: np.ndarray) -> dict[str, Any]:
 
 def _features(num_reset_state_dims: int) -> dict[str, Any]:
     features = {
-        "actions": {"dtype": "float32", "shape": [PI05_ACTION_DIM], "names": ACTION_NAMES, "fps": float(FPS)},
-        "debug.env_action": {"dtype": "float32", "shape": [PI05_ACTION_DIM], "names": ACTION_NAMES, "fps": float(FPS)},
-        "debug.ref_next_tcp": {"dtype": "float32", "shape": [16], "names": None, "fps": float(FPS)},
-        "debug.tcp_before": {"dtype": "float32", "shape": [16], "names": None, "fps": float(FPS)},
-        "debug.tcp_after": {"dtype": "float32", "shape": [16], "names": None, "fps": float(FPS)},
-        "observation.state": {"dtype": "float32", "shape": [8], "names": [f"qpos_{i}" for i in range(8)], "fps": float(FPS)},
-        "observation.state_tcp": {"dtype": "float32", "shape": [PI05_STATE_DIM], "names": STATE_NAMES, "fps": float(FPS)},
-        "episode_reset_state": {"dtype": "float32", "shape": [num_reset_state_dims], "names": None, "fps": float(FPS)},
-        "timestamp": {"dtype": "float32", "shape": [1], "names": None, "fps": float(FPS)},
-        "frame_index": {"dtype": "int64", "shape": [1], "names": None, "fps": float(FPS)},
-        "episode_index": {"dtype": "int64", "shape": [1], "names": None, "fps": float(FPS)},
+        "actions": {
+            "dtype": "float32",
+            "shape": [PI05_ACTION_DIM],
+            "names": ACTION_NAMES,
+            "fps": float(FPS),
+        },
+        "debug.env_action": {
+            "dtype": "float32",
+            "shape": [PI05_ACTION_DIM],
+            "names": ACTION_NAMES,
+            "fps": float(FPS),
+        },
+        "debug.ref_next_tcp": {
+            "dtype": "float32",
+            "shape": [16],
+            "names": None,
+            "fps": float(FPS),
+        },
+        "debug.tcp_before": {
+            "dtype": "float32",
+            "shape": [16],
+            "names": None,
+            "fps": float(FPS),
+        },
+        "debug.tcp_after": {
+            "dtype": "float32",
+            "shape": [16],
+            "names": None,
+            "fps": float(FPS),
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [8],
+            "names": [f"qpos_{i}" for i in range(8)],
+            "fps": float(FPS),
+        },
+        "observation.state_tcp": {
+            "dtype": "float32",
+            "shape": [PI05_STATE_DIM],
+            "names": STATE_NAMES,
+            "fps": float(FPS),
+        },
+        "episode_reset_state": {
+            "dtype": "float32",
+            "shape": [num_reset_state_dims],
+            "names": None,
+            "fps": float(FPS),
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [1],
+            "names": None,
+            "fps": float(FPS),
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [1],
+            "names": None,
+            "fps": float(FPS),
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [1],
+            "names": None,
+            "fps": float(FPS),
+        },
         "index": {"dtype": "int64", "shape": [1], "names": None, "fps": float(FPS)},
-        "task_index": {"dtype": "int64", "shape": [1], "names": None, "fps": float(FPS)},
+        "task_index": {
+            "dtype": "int64",
+            "shape": [1],
+            "names": None,
+            "fps": float(FPS),
+        },
         "task": {"dtype": "string", "shape": [1], "names": None, "fps": float(FPS)},
     }
     for key, height, width in [
@@ -827,17 +1005,23 @@ LIST_FIELDS = [
 def _prepare_dataset_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for field in LIST_FIELDS:
-        df[field] = df[field].map(lambda value: np.asarray(value, dtype=np.float32).tolist())
+        df[field] = df[field].map(
+            lambda value: np.asarray(value, dtype=np.float32).tolist()
+        )
     return df
 
 
-def _write_episode_table(outdir: str, episode_df: pd.DataFrame, episode_index: int) -> None:
+def _write_episode_table(
+    outdir: str, episode_df: pd.DataFrame, episode_index: int
+) -> None:
     episode_df = _prepare_dataset_df(episode_df.reset_index(drop=True))
     chunk = episode_index // CHUNK_SIZE
     chunk_dir = osp.join(outdir, "data", f"chunk-{chunk:03d}")
     os.makedirs(chunk_dir, exist_ok=True)
     pq.write_table(
-        pa.Table.from_pandas(episode_df, schema=_dataset_schema(), preserve_index=False),
+        pa.Table.from_pandas(
+            episode_df, schema=_dataset_schema(), preserve_index=False
+        ),
         osp.join(chunk_dir, f"episode_{episode_index:06d}.parquet"),
     )
 
@@ -855,7 +1039,9 @@ def _write_dataset_tables(
         episode_df = df[df["episode_index"] == episode_index].reset_index(drop=True)
         _write_episode_table(outdir, episode_df, episode_index)
 
-    _write_dataset_metadata(outdir, df, episodes, tasks, write_stats=True, collect_mode=collect_mode)
+    _write_dataset_metadata(
+        outdir, df, episodes, tasks, write_stats=True, collect_mode=collect_mode
+    )
 
 
 def _write_dataset_metadata(
@@ -888,7 +1074,9 @@ def _write_dataset_metadata(
             "observation.state_tcp",
             "episode_reset_state",
         ]:
-            stats[field] = _array_summary(np.stack(df[field].to_numpy()).astype(np.float32))
+            stats[field] = _array_summary(
+                np.stack(df[field].to_numpy()).astype(np.float32)
+            )
         actions = np.stack(df["actions"].to_numpy()).astype(np.float32)
         states_tcp = np.stack(df["observation.state_tcp"].to_numpy()).astype(np.float32)
         stats["base_norm.actions.abs"] = normalized_abs_summary(
@@ -897,7 +1085,13 @@ def _write_dataset_metadata(
         stats["base_norm.observation.state_tcp.abs"] = normalized_abs_summary(
             quantile_normalize_with_base_stats(states_tcp, "state")
         )
-        for field in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+        for field in [
+            "timestamp",
+            "frame_index",
+            "episode_index",
+            "index",
+            "task_index",
+        ]:
             values = df[field].to_numpy()
             stats[field] = {
                 "mean": [float(values.mean())],
@@ -910,7 +1104,9 @@ def _write_dataset_metadata(
             json.dump(stats, f, indent=2)
 
     num_reset_state_dims = len(df["episode_reset_state"].iloc[0])
-    data_size = sum(path.stat().st_size for path in Path(outdir).rglob("data/**/*.parquet"))
+    data_size = sum(
+        path.stat().st_size for path in Path(outdir).rglob("data/**/*.parquet")
+    )
     total_episodes = int(df["episode_index"].nunique())
     info = {
         "codebase_version": "v2.0",
@@ -946,13 +1142,17 @@ def _write_dataset_metadata(
     }
     with open(osp.join(meta_dir, "info.json"), "w", encoding="utf-8") as f:
         json.dump(info, f, indent=2)
-    with open(osp.join(meta_dir, "collection_progress.json"), "w", encoding="utf-8") as f:
+    with open(
+        osp.join(meta_dir, "collection_progress.json"), "w", encoding="utf-8"
+    ) as f:
         json.dump(
             {
                 "total_episodes": total_episodes,
                 "total_frames": int(len(df)),
                 "stats_finalized": bool(write_stats),
-                "last_episode_index": int(max(episode["episode_index"] for episode in episodes)),
+                "last_episode_index": int(
+                    max(episode["episode_index"] for episode in episodes)
+                ),
             },
             f,
             indent=2,
@@ -979,7 +1179,9 @@ def _collect_episodes(
     # Prompt pool: insert_only uses single-stage "insert the peg" wording (matches
     # convert_to_insert_only.py); full keeps the two-stage pick-up-and-insert set.
     if collect_mode == "insert_only":
-        task_pool = generate_insert_only_prompts(DEFAULT_NUM_PROMPTS, DEFAULT_PROMPT_SEED)
+        task_pool = generate_insert_only_prompts(
+            DEFAULT_NUM_PROMPTS, DEFAULT_PROMPT_SEED
+        )
     else:
         task_pool = TASK_DESCRIPTIONS
     writer.collect_mode = collect_mode
@@ -1157,7 +1359,12 @@ def _collect_episodes(
                     writer.log_attempt(attempt_record)
                     seed += 1
                     continue
-                assert base is not None and wrist is not None and wrist_back is not None and render is not None
+                assert (
+                    base is not None
+                    and wrist is not None
+                    and wrist_back is not None
+                    and render is not None
+                )
                 # insert_only mode: crop to the move-and-insert segment starting at
                 # the lift-end frame (drops reach/grasp/close/lift prefix), matching
                 # convert_to_insert_only.py via the shared find_lift_end criterion.
@@ -1187,7 +1394,9 @@ def _collect_episodes(
                     wrist_back = wrist_back[t_lift:]
                     render = render[t_lift:]
                 task = random.Random(seed).choice(task_pool)
-                episode_index = writer.add_episode(rows, base, wrist, wrist_back, render, task)
+                episode_index = writer.add_episode(
+                    rows, base, wrist, wrist_back, render, task
+                )
                 passed += 1
                 attempt_record.update(
                     {
@@ -1258,6 +1467,7 @@ def _collect_episodes(
                     print(f"{progress_prefix}Warning: env.close() failed: {exc}")
     return passed, attempts, ref_fail, ctrl_dry_fail, ctrl_capture_fail
 
+
 def _collect_worker(
     worker_id: int,
     num_traj: int,
@@ -1292,7 +1502,9 @@ def _collect_worker(
     return (worker_id, shard_dir, *result)
 
 
-def _merge_shards(final_dir: str, shard_dirs: list[str], collect_mode: str = "insert_only") -> None:
+def _merge_shards(
+    final_dir: str, shard_dirs: list[str], collect_mode: str = "insert_only"
+) -> None:
     final_dir = osp.abspath(final_dir)
     for subdir in ["data", "meta", "videos"]:
         path = osp.join(final_dir, subdir)
@@ -1307,12 +1519,12 @@ def _merge_shards(final_dir: str, shard_dirs: list[str], collect_mode: str = "in
     global_episode = 0
     global_index = 0
     for shard_dir in shard_dirs:
-        paths = sorted(
-            Path(shard_dir).glob("data/chunk-*/episode_*.parquet")
-        )
+        paths = sorted(Path(shard_dir).glob("data/chunk-*/episode_*.parquet"))
         if not paths:
             continue
-        shard_df = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
+        shard_df = pd.concat(
+            [pd.read_parquet(path) for path in paths], ignore_index=True
+        )
         for local_episode in sorted(shard_df["episode_index"].unique()):
             local_episode = int(local_episode)
             episode_df = shard_df[shard_df["episode_index"] == local_episode].copy()
@@ -1323,7 +1535,9 @@ def _merge_shards(final_dir: str, shard_dirs: list[str], collect_mode: str = "in
             new_task_idx = task_to_idx[old_task]
             length = len(episode_df)
             episode_df["episode_index"] = global_episode
-            episode_df["index"] = np.arange(global_index, global_index + length, dtype=np.int64)
+            episode_df["index"] = np.arange(
+                global_index, global_index + length, dtype=np.int64
+            )
             episode_df["task_index"] = new_task_idx
             all_frames.append(episode_df)
             episodes.append(
@@ -1369,7 +1583,9 @@ def _merge_shards(final_dir: str, shard_dirs: list[str], collect_mode: str = "in
         raise RuntimeError("No successful shard data to merge.")
     merged_df = pd.concat(all_frames, ignore_index=True)
     merged_df["task"] = merged_df["task"].astype("string")
-    _write_dataset_tables(final_dir, merged_df, episodes, tasks, collect_mode=collect_mode)
+    _write_dataset_tables(
+        final_dir, merged_df, episodes, tasks, collect_mode=collect_mode
+    )
     print(
         f"Merged controller-domain dataset: {global_episode} episodes, "
         f"{len(merged_df)} frames -> {final_dir}"
@@ -1383,7 +1599,9 @@ def _parse_gpu_ids(gpu_ids: str) -> list[int]:
     return ids
 
 
-def _runtime_gpu_ids(requested_gpu_ids: list[int], render_backend_prefix: str) -> list[int]:
+def _runtime_gpu_ids(
+    requested_gpu_ids: list[int], render_backend_prefix: str
+) -> list[int]:
     prefix = render_backend_prefix.lower()
     if prefix not in {"", "default", "cuda", "sapien_cuda"}:
         return requested_gpu_ids
@@ -1391,7 +1609,9 @@ def _runtime_gpu_ids(requested_gpu_ids: list[int], render_backend_prefix: str) -
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     visible_ids = _parse_gpu_ids(visible) if visible else []
     requested_visible = visible_ids == requested_gpu_ids
-    collector_set_visible = os.environ.get("RLINF_COLLECTOR_SET_CUDA_VISIBLE_DEVICES") == "1"
+    collector_set_visible = (
+        os.environ.get("RLINF_COLLECTOR_SET_CUDA_VISIBLE_DEVICES") == "1"
+    )
     if collector_set_visible or requested_visible:
         return list(range(len(requested_gpu_ids)))
     return requested_gpu_ids
@@ -1419,6 +1639,8 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--gpu-ids", default="0")
     parser.add_argument("--worker-stagger", type=float, default=5.0)
+    parser.add_argument("--visualization-samples", type=int, default=10)
+    parser.add_argument("--visualization-seed", type=int, default=0)
     parser.add_argument(
         "--render-backend-prefix",
         default="cuda",
@@ -1464,11 +1686,16 @@ def main() -> None:
             args.seed,
             writer,
             gpu_ids[0],
-            max_attempts=max(args.num_traj * args.max_attempts_multiplier, args.num_traj),
+            max_attempts=max(
+                args.num_traj * args.max_attempts_multiplier, args.num_traj
+            ),
             render_backend_prefix=args.render_backend_prefix,
             collect_mode=args.collect_mode,
         )
         writer.finalize()
+        _create_visualization_samples(
+            output_dir, result[0], args.visualization_samples, args.visualization_seed
+        )
         print(f"Done: passed={result[0]} attempts={result[1]} out={output_dir}")
         return
 
@@ -1509,7 +1736,12 @@ def main() -> None:
     with ctx.Pool(args.num_workers) as pool:
         results = pool.starmap(_collect_worker, worker_args)
     print(f"Worker results: {results}")
-    _merge_shards(output_dir, [item[3] for item in worker_args], collect_mode=args.collect_mode)
+    _merge_shards(
+        output_dir, [item[3] for item in worker_args], collect_mode=args.collect_mode
+    )
+    _create_visualization_samples(
+        output_dir, args.num_traj, args.visualization_samples, args.visualization_seed
+    )
 
 
 if __name__ == "__main__":

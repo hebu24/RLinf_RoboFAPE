@@ -96,6 +96,39 @@ Expected dataset fields include:
 | `episode_reset_state` | ManiSkill flat state for strict replay. |
 | `debug.tcp_before` / `debug.tcp_after` | TCP matrices for replay diagnostics. |
 
+
+Collect compact data (less randomization & cropped base camera):
+```bash
+cd /opt/yingxi/RLinf_RoboFAPE
+
+OUT=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_compact_3200
+LOG=/opt/yingxi/RLinf_RoboFAPE/logs/collect_dualwrist_insert_only_compact_3200.log
+
+test ! -e "${OUT}" || {
+    echo "Refusing to overwrite existing path: ${OUT}"
+    exit 1
+}
+
+tmux new-session -d -s collect_compact \
+"cd /opt/yingxi/RLinf_RoboFAPE && \
+MPLCONFIGDIR=/tmp/matplotlib \
+PYTHONUNBUFFERED=1 \
+/opt/kairan/envs/rlinf/bin/python \
+run_train/peginsertion_maniskill_pi0.5/collect_peg_insertion_controller_data.py \
+--num-traj 3200 \
+--output-dir '${OUT}' \
+--collect-mode insert_only \
+--seed 0 \
+--num-workers 4 \
+--gpu-ids 0,1,2,3 \
+--worker-stagger 5.0 \
+--render-backend-prefix cuda \
+--mp-start-method spawn \
+--visualization-samples 10 \
+--visualization-seed 0 \
+2>&1 | tee '${LOG}'"
+```
+
 ## 2. Replay Smoke
 
 Run strict replay before training.  This restores each saved episode state and
@@ -539,11 +572,11 @@ cd /opt/yingxi/RLinf_RoboFAPE
 
 # Concurrent with SFT: own Ray head on port 6380, disjoint GPUs.
 VENV_DIR=/opt/kairan/envs/rlinf \
-CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260716-00:51:44-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_v2/checkpoints/global_step_30000/actor \
-GPU_IDS=4,5 \
+CHECKPOINT_PATH=/opt/yingxi/RLinf_RoboFAPE/logs/20260718-01:38:08-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_clean/checkpoints/global_step_20000/actor \
+GPU_IDS=0,1,2,3 \
 MAX_EPISODE_STEPS=600 \
 NUM_EVAL_EPISODES=8 \
-NUM_ENVS=2 \
+NUM_ENVS=4 \
 EVAL_ACTION_SCALE=1.0 \
 SAVE_VIDEO=true \
 MANAGE_RAY=true \
@@ -567,8 +600,8 @@ cd /opt/yingxi/RLinf_RoboFAPE && \
   /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
     --ray-port 6380 \
     --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
-    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260716-11:31:24-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/checkpoints \
-    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260716-11:31:24-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_wrist/wrist_insert_only_eval_sweep \
+    --checkpoint-dir logs/20260718-01:38:08-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_clean/checkpoints \
+    --output-dir logs/20260718-01:38:08-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_clean/wrist_insert_only_eval_sweep \
     --num-eval-episodes 10 --num-envs 1 --gpu-ids 3,4,5,6,7 --action-scale 1.0
 ```
 
