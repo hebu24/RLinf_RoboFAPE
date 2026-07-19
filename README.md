@@ -99,34 +99,23 @@ Expected dataset fields include:
 
 Collect compact data (less randomization & cropped base camera):
 ```bash
-cd /opt/yingxi/RLinf_RoboFAPE
-
-OUT=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_compact_3200
-LOG=/opt/yingxi/RLinf_RoboFAPE/logs/collect_dualwrist_insert_only_compact_3200.log
-
-test ! -e "${OUT}" || {
-    echo "Refusing to overwrite existing path: ${OUT}"
-    exit 1
-}
-
-tmux new-session -d -s collect_compact \
-"cd /opt/yingxi/RLinf_RoboFAPE && \
+cd /opt/yingxi/RLinf_RoboFAPE && \
 MPLCONFIGDIR=/tmp/matplotlib \
 PYTHONUNBUFFERED=1 \
 /opt/kairan/envs/rlinf/bin/python \
 run_train/peginsertion_maniskill_pi0.5/collect_peg_insertion_controller_data.py \
 --num-traj 3200 \
---output-dir '${OUT}' \
+--output-dir /opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_compact_3200_v2 \
 --collect-mode insert_only \
 --seed 0 \
 --num-workers 4 \
---gpu-ids 0,1,2,3 \
+--gpu-ids 4,5,6,7 \
 --worker-stagger 5.0 \
 --render-backend-prefix cuda \
 --mp-start-method spawn \
 --visualization-samples 10 \
 --visualization-seed 0 \
-2>&1 | tee '${LOG}'"
+2>&1 | tee /opt/yingxi/RLinf_RoboFAPE/logs/collect_dualwrist_insert_only_compact_3200_v2.log
 ```
 
 ## 2. Replay Smoke
@@ -394,27 +383,28 @@ disjoint GPUs:
 ```bash
 # wrist insert-only SFT — GPUs 4-7, port 6379
 cd /opt/yingxi/RLinf_RoboFAPE && \
-  PYTHONUNBUFFERED=1 \
-  DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200 \
-  GPU_IDS=0,1,2,3 \
-  SFT_RAY_PORT=6379 SFT_DASHBOARD_AGENT_PORT=52366 \
-  CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist \
-  OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist \
-  PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist_insert \
-  EXPERIMENT_NAME=peg_insertion_sft_insert_only_wrist \
-  bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_insert_wrist_tmux.log
+PYTHONUNBUFFERED=1 \
+DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_compact_3200 \
+GPU_IDS=0,1,2,3 \
+SFT_RAY_PORT=6379 \
+SFT_DASHBOARD_AGENT_PORT=52366 \
+CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist \
+OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist \
+PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist_insert \
+EXPERIMENT_NAME=peg_insertion_sft_insert_only_wrist_filtered \
+bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_insert_wrist_filtered_tmux.log
 
 # base-only insert-only SFT — GPUs 0-3, port 6382 (distinct port + dashboard + temp-dir)
-tmux new-session -d -s sft_insert_base "cd /opt/yingxi/RLinf_RoboFAPE && \
+cd /opt/yingxi/RLinf_RoboFAPE && \
   PYTHONUNBUFFERED=1 \
-  DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200 \
+  DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_compact_3200 \
   GPU_IDS=0,1,2,3 \
   SFT_RAY_PORT=6382 SFT_DASHBOARD_AGENT_PORT=52368 \
   CONFIG_NAME=peg_insertion_sft_openpi_pi05 \
   OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion \
   PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_insert \
   EXPERIMENT_NAME=peg_insertion_sft_insert_only \
-  bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_insert_base_tmux.log"
+  bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_insert_base_tmux.log
 ```
 
 `sft_finetune_pi05base.sh` auto-recomputes norm_stats for the converted dataset
@@ -600,9 +590,9 @@ cd /opt/yingxi/RLinf_RoboFAPE && \
   /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
     --ray-port 6380 \
     --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
-    --checkpoint-dir logs/20260718-01:38:08-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_clean/checkpoints \
-    --output-dir logs/20260718-01:38:08-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_clean/wrist_insert_only_eval_sweep \
-    --num-eval-episodes 10 --num-envs 1 --gpu-ids 3,4,5,6,7 --action-scale 1.0
+    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260718-23:26:39-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_filtered/checkpoints \
+    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260718-23:26:39-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_filtered/wrist_insert_only_eval_sweep \
+    --num-eval-episodes 10 --num-envs 1 --gpu-ids 7 --action-scale 1.0 --resume
 ```
 
 Per-episode planning adds a CPU solve (~seconds) per episode, so insert-only

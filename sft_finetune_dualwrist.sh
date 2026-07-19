@@ -31,7 +31,7 @@ export EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_sft_dualwrist}"
 # insert-only wrist v2 run. Cap the run at 10000 steps (max_steps ==
 # total_training_steps so the cosine LR schedule decays to min_lr over the run;
 # save a checkpoint every 1000 steps).
-export EXTRA_HYDRA="${EXTRA_HYDRA:-+actor.model.openapi.mask_gripper_loss=True actor.optim.lr=1e-5 actor.optim.lr_warmup_steps=1000 runner.max_steps=40000 actor.optim.total_training_steps=40000 runner.save_interval=5000 actor.optim.num_cycles=0.5 actor.optim.min_lr=2.5e-7}"
+export EXTRA_HYDRA="${EXTRA_HYDRA:-+actor.model.openpi.mask_gripper_loss=True actor.optim.lr=1e-5 actor.optim.lr_warmup_steps=1000 runner.max_steps=40000 actor.optim.total_training_steps=40000 runner.save_interval=5000 actor.optim.num_cycles=0.5 actor.optim.min_lr=2.5e-7}"
 
 bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_dualwrist_tmux.log
 

@@ -752,7 +752,7 @@ def _create_visualization_samples(root, total, count=10, seed=0):
 
 
 class LeRobotControllerWriter:
-    def __init__(self, outdir: str):
+    def __init__(self, outdir: str, *, resume: bool = False):
         self.outdir = osp.abspath(outdir)
         self.rows: list[pd.DataFrame] = []
         self.episodes: list[dict[str, Any]] = []
@@ -763,7 +763,67 @@ class LeRobotControllerWriter:
         # via the --collect-mode flag ("full" or "insert_only").
         self.collect_mode = "insert_only"
         os.makedirs(self.outdir, exist_ok=True)
+        if resume:
+            self._load_existing()
 
+    def _load_existing(self) -> None:
+        """Restore writer state from completed episode parquet files."""
+        paths = sorted(Path(self.outdir).glob("data/chunk-*/episode_*.parquet"))
+        for expected_episode, path in enumerate(paths):
+            try:
+                episode_index = int(path.stem.removeprefix("episode_"))
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid episode parquet name: {path}") from exc
+            if episode_index != expected_episode:
+                raise RuntimeError(
+                    f"Cannot resume non-contiguous shard {self.outdir}: expected "
+                    f"episode_{expected_episode:06d}.parquet, found {path.name}"
+                )
+            df = pd.read_parquet(path)
+            if df.empty:
+                raise RuntimeError(f"Cannot resume empty episode parquet: {path}")
+            task = str(df["task"].iloc[0])
+            if df["task"].astype(str).nunique() != 1:
+                raise RuntimeError(f"Episode has multiple tasks: {path}")
+            task_index = self._task_index(task)
+            length = len(df)
+            df["episode_index"] = np.full(length, episode_index, dtype=np.int64)
+            df["index"] = np.arange(
+                self.global_index, self.global_index + length, dtype=np.int64
+            )
+            df["task_index"] = np.full(length, task_index, dtype=np.int64)
+            df["task"] = [task] * length
+            self.rows.append(df)
+            self.episodes.append(
+                {
+                    "episode_index": episode_index,
+                    "dataset_from_index": self.global_index,
+                    "dataset_to_index": self.global_index + length,
+                    "tasks": [task],
+                    "length": length,
+                    "success": True,
+                }
+            )
+            self.global_index += length
+        if paths:
+            print(
+                f"Resumed shard {self.outdir}: {len(self.episodes)} completed "
+                f"episodes, {self.global_index} frames"
+            )
+
+    def resume_seed(self, base_seed: int) -> int:
+        """Return the first seed not recorded in the append-only attempt journal."""
+        path = osp.join(self.outdir, "meta", "collection_attempts.jsonl")
+        if not osp.exists(path):
+            return base_seed
+        max_seed = base_seed - 1
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    max_seed = max(max_seed, int(json.loads(line)["seed"]))
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+        return max_seed + 1
     def _task_index(self, task: str) -> int:
         if task not in self.task_to_idx:
             self.task_to_idx[task] = len(self.tasks)
@@ -1475,20 +1535,37 @@ def _collect_worker(
     shard_dir: str,
     gpu_id: int,
     startup_delay: float,
-    max_attempts: int,
+    max_attempts_multiplier: int,
     render_backend_prefix: str,
     collect_mode: str = "insert_only",
+    resume: bool = False,
 ):
     if startup_delay > 0:
         time.sleep(startup_delay)
     gpu_label = _gpu_label(gpu_id, render_backend_prefix)
-    writer = LeRobotControllerWriter(shard_dir)
+    writer = LeRobotControllerWriter(shard_dir, resume=resume)
+    existing = len(writer.episodes)
+    if existing > num_traj:
+        raise RuntimeError(
+            f"Shard {shard_dir} already has {existing} episodes, exceeding its "
+            f"configured target {num_traj}."
+        )
+    remaining = num_traj - existing
+    if remaining == 0:
+        writer.finalize()
+        print(f"[w{worker_id}/gpu{gpu_label}] Shard already complete: {existing}/{num_traj}")
+        return (worker_id, shard_dir, 0, 0, 0, 0, 0)
+    start_seed = writer.resume_seed(base_seed) if resume else base_seed
+    print(
+        f"[w{worker_id}/gpu{gpu_label}] Starting with existing={existing}, "
+        f"remaining={remaining}, seed={start_seed}"
+    )
     result = _collect_episodes(
-        num_traj,
-        base_seed,
+        remaining,
+        start_seed,
         writer,
         gpu_id,
-        max_attempts=max_attempts,
+        max_attempts=max(remaining * max_attempts_multiplier, remaining),
         render_backend_prefix=render_backend_prefix,
         progress_prefix=f"[w{worker_id}/gpu{gpu_label}] ",
         collect_mode=collect_mode,
@@ -1642,6 +1719,14 @@ def main() -> None:
     parser.add_argument("--visualization-samples", type=int, default=10)
     parser.add_argument("--visualization-seed", type=int, default=0)
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from completed per-episode parquet files in the output shard(s). "
+            "Without this flag, an existing multi-worker _shards directory is replaced."
+        ),
+    )
+    parser.add_argument(
         "--render-backend-prefix",
         default="cuda",
         help=(
@@ -1680,23 +1765,43 @@ def main() -> None:
 
     output_dir = osp.abspath(args.output_dir)
     if args.num_workers <= 1:
-        writer = LeRobotControllerWriter(output_dir)
+        writer = LeRobotControllerWriter(output_dir, resume=args.resume)
+        existing = len(writer.episodes)
+        if existing > args.num_traj:
+            raise RuntimeError(
+                f"Output already has {existing} episodes, exceeding target {args.num_traj}."
+            )
+        remaining = args.num_traj - existing
+        if remaining == 0:
+            writer.finalize()
+            _create_visualization_samples(
+                output_dir,
+                args.num_traj,
+                args.visualization_samples,
+                args.visualization_seed,
+            )
+            print(f"Already complete: {existing}/{args.num_traj} episodes in {output_dir}")
+            return
+        start_seed = writer.resume_seed(args.seed) if args.resume else args.seed
         result = _collect_episodes(
-            args.num_traj,
-            args.seed,
+            remaining,
+            start_seed,
             writer,
             gpu_ids[0],
             max_attempts=max(
-                args.num_traj * args.max_attempts_multiplier, args.num_traj
+                remaining * args.max_attempts_multiplier, remaining
             ),
             render_backend_prefix=args.render_backend_prefix,
             collect_mode=args.collect_mode,
         )
         writer.finalize()
         _create_visualization_samples(
-            output_dir, result[0], args.visualization_samples, args.visualization_seed
+            output_dir, args.num_traj, args.visualization_samples, args.visualization_seed
         )
-        print(f"Done: passed={result[0]} attempts={result[1]} out={output_dir}")
+        print(
+            f"Done: existing={existing} newly_passed={result[0]} "
+            f"attempts={result[1]} total={len(writer.episodes)} out={output_dir}"
+        )
         return
 
     counts = [args.num_traj // args.num_workers] * args.num_workers
@@ -1704,7 +1809,7 @@ def main() -> None:
         counts[i] += 1
 
     shard_root = osp.join(output_dir, "_shards")
-    if osp.exists(shard_root):
+    if osp.exists(shard_root) and not args.resume:
         shutil.rmtree(shard_root)
     os.makedirs(shard_root, exist_ok=True)
     worker_args = []
@@ -1721,9 +1826,10 @@ def main() -> None:
                 osp.join(shard_root, f"shard_{worker_id:03d}"),
                 gpu_id,
                 delay,
-                max(count * args.max_attempts_multiplier, count),
+                args.max_attempts_multiplier,
                 args.render_backend_prefix,
                 args.collect_mode,
+                args.resume,
             )
         )
 
