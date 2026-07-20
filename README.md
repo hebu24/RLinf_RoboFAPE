@@ -590,8 +590,8 @@ cd /opt/yingxi/RLinf_RoboFAPE && \
   /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
     --ray-port 6380 \
     --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
-    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260718-23:26:39-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_filtered/checkpoints \
-    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260718-23:26:39-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_filtered/wrist_insert_only_eval_sweep \
+    --checkpoint-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_filtered/checkpoints \
+    --output-dir /opt/yingxi/RLinf_RoboFAPE/logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/peg_insertion_sft_insert_only_wrist_filtered/wrist_insert_only_eval_sweep \
     --num-eval-episodes 10 --num-envs 1 --gpu-ids 7 --action-scale 1.0 --resume
 ```
 
