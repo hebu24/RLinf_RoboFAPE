@@ -21,6 +21,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
+from rlinf.data.utils import forward_set_epoch
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
@@ -236,6 +237,19 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 torch.save(all_rng_states, os.path.join(save_path, "rng.pt"))
 
             torch.distributed.barrier()
+        elif SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.OPENPI:
+            # OpenPI wraps a regular torch DataLoader rather than a
+            # StatefulDataLoader. Persist its logical cursor so resumed runs do
+            # not restart sampling at the beginning of the epoch.
+            if self._rank == 0:
+                torch.save(
+                    {
+                        "data_epoch": self._data_epoch,
+                        "data_iter_offset": self._data_iter_offset,
+                    },
+                    os.path.join(save_path, "data_progress.pt"),
+                )
+            torch.distributed.barrier()
 
     def load_checkpoint(self, load_path: str) -> None:
         super().load_checkpoint(load_path)
@@ -253,6 +267,45 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 all_rng_states = torch.load(rng_path, weights_only=False)
                 set_rng_state(all_rng_states[self._rank])
 
+            torch.distributed.barrier()
+        elif SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.OPENPI:
+            progress_path = os.path.join(load_path, "data_progress.pt")
+            batches_per_epoch = len(self._openpi_pytorch_dataloader(self.data_loader))
+            if os.path.exists(progress_path):
+                progress = torch.load(progress_path, weights_only=False)
+                self._data_epoch = int(progress["data_epoch"])
+                self._data_iter_offset = int(progress["data_iter_offset"])
+            else:
+                # Backward compatibility for checkpoints created before the
+                # OpenPI cursor was persisted. One runner step consumes one
+                # batch per gradient-accumulation iteration.
+                step_dir = os.path.basename(os.path.dirname(load_path.rstrip(os.sep)))
+                if not step_dir.startswith("global_step_"):
+                    raise ValueError(
+                        f"Cannot infer OpenPI data progress from checkpoint path: {load_path}"
+                    )
+                checkpoint_step = int(step_dir.removeprefix("global_step_"))
+                consumed_batches = checkpoint_step * self.gradient_accumulation
+                self._data_epoch, self._data_iter_offset = divmod(
+                    consumed_batches, batches_per_epoch
+                )
+                logging.warning(
+                    "Checkpoint has no data_progress.pt; inferred OpenPI data "
+                    "cursor from global step: epoch=%d, offset=%d",
+                    self._data_epoch,
+                    self._data_iter_offset,
+                )
+
+            forward_set_epoch(self.data_loader, self._data_epoch)
+            self.data_iter = iter(self.data_loader)
+            for _ in range(self._data_iter_offset):
+                next(self.data_iter)
+            logging.info(
+                "Restored OpenPI data cursor: epoch=%d, offset=%d/%d",
+                self._data_epoch,
+                self._data_iter_offset,
+                batches_per_epoch,
+            )
             torch.distributed.barrier()
 
     def get_max_steps_per_epoch(self):

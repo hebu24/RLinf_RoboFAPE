@@ -13,12 +13,14 @@
 # Required env (override on the command line): DATA_DIR must point at a
 # dual-wrist dataset collected with collect_peg_insertion_controller_data.py
 # --collect-mode insert_only (contains observation.images.wrist_back).
+# Resume with either `RESUME_DIR=/.../global_step_N bash sft_finetune_dualwrist.sh`
+# or `bash sft_finetune_dualwrist.sh /.../global_step_N`.
 set -euo pipefail
 cd /opt/yingxi/RLinf_RoboFAPE
 
 export PYTHONUNBUFFERED=1
 export DATA_DIR="${DATA_DIR:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_dualwrist_insert_only_3200}"
-export GPU_IDS="${GPU_IDS:-0,1,2,3}"
+export GPU_IDS="${GPU_IDS:-4,5,6,7}"
 # Distinct Ray isolation from wrist(6379)/actual-ee(6381)/eval(6380).
 export SFT_RAY_PORT="${SFT_RAY_PORT:-6383}"
 export SFT_DASHBOARD_AGENT_PORT="${SFT_DASHBOARD_AGENT_PORT:-52369}"
@@ -26,12 +28,18 @@ export CONFIG_NAME="${CONFIG_NAME:-peg_insertion_sft_openpi_pi05_dualwrist}"
 export OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_peg_insertion_dualwrist}"
 export PREPARED_BASE="${PREPARED_BASE:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_dualwrist}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_sft_dualwrist}"
-# Insert-only OOD start distribution: mask the gripper dim in the flow-matching
-# loss (std=0 -> pure-noise target), lower lr + longer warmup. Same recipe as the
-# insert-only wrist v2 run. Cap the run at 10000 steps (max_steps ==
-# total_training_steps so the cosine LR schedule decays to min_lr over the run;
-# save a checkpoint every 1000 steps).
-export EXTRA_HYDRA="${EXTRA_HYDRA:-+actor.model.openpi.mask_gripper_loss=True actor.optim.lr=1e-5 actor.optim.lr_warmup_steps=1000 runner.max_steps=40000 actor.optim.total_training_steps=40000 runner.save_interval=5000 actor.optim.num_cycles=0.5 actor.optim.min_lr=2.5e-7}"
+export RESUME_DIR="${RESUME_DIR:-${1:-}}"
+
+# The global_step_10000 checkpoint was created with batch 16/64 and a 40000-step
+# cosine schedule. A strict resume must rebuild that same optimizer/scheduler
+# configuration; only runner.max_steps changes to stop the continued run at 20000.
+# DCP then restores model weights, Adam moments, scheduler position, and RNG state.
+if [[ -n "$RESUME_DIR" ]]; then
+  export EXTRA_HYDRA="${EXTRA_HYDRA:-+actor.model.openpi.mask_gripper_loss=True actor.micro_batch_size=16 actor.global_batch_size=64 actor.optim.lr=3e-6 actor.optim.lr_warmup_steps=1000 runner.max_steps=20000 actor.optim.total_training_steps=40000 runner.save_interval=5000 actor.optim.num_cycles=0.5 actor.optim.min_lr=2.5e-7}"
+else
+  # Fresh run: use a self-contained 20000-step cosine schedule.
+  export EXTRA_HYDRA="${EXTRA_HYDRA:-+actor.model.openpi.mask_gripper_loss=True actor.optim.lr=3e-6 actor.optim.lr_warmup_steps=1000 runner.max_steps=20000 actor.optim.total_training_steps=20000 runner.save_interval=5000 actor.optim.num_cycles=0.5 actor.optim.min_lr=2.5e-7}"
+fi
 
 bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_dualwrist_tmux.log
 

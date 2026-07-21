@@ -6,7 +6,6 @@ cd /opt/yingxi/RLinf_RoboFAPE
 export PATH=/opt/kairan/envs/rlinf/bin:$PATH
 export RAY_TMPDIR=/tmp/ray_sft
 export SFT_RAY_PORT="${SFT_RAY_PORT:-6379}"
-export CUDA_LAUNCH_BLOCKING=1
 
 DATA_DIR="${DATA_DIR:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"

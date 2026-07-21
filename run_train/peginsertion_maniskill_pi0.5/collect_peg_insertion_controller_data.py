@@ -154,6 +154,7 @@ CHUNK_SIZE = 1000
 
 STATE_NAMES = ["tcp_x", "tcp_y", "tcp_z", "roll", "pitch", "yaw", "finger0", "finger1"]
 ACTION_NAMES = ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"]
+POSE7_NAMES = ["x", "y", "z", "qw", "qx", "qy", "qz"]
 
 
 class TrackingPlanError(RuntimeError):
@@ -189,6 +190,12 @@ def _qpos8(unwrapped) -> np.ndarray:
     return state
 
 
+def _raw_pose7(raw_pose_value: Any) -> np.ndarray:
+    pose = _as_numpy(raw_pose_value).astype(np.float32).reshape(-1, 7)
+    return pose[0].copy()
+
+
+
 def _capture_obs(env) -> dict[str, Any]:
     unwrapped = env.unwrapped
     obs = unwrapped.get_obs()
@@ -214,9 +221,15 @@ def _capture_state(env) -> dict[str, np.ndarray]:
     state = _qpos8(unwrapped)
     tcp_matrix = _tcp_matrix_in_robot_root(unwrapped)
     state_tcp = aligned_pi05_state_from_tcp_matrix(tcp_matrix, [state[7], state[7]])
+    peg_pose = _raw_pose7(unwrapped.peg.pose.raw_pose)
+    peg_head_pose = _raw_pose7(unwrapped.peg_head_pose.raw_pose)
+    hole_pose = _raw_pose7(unwrapped.box_hole_pose.raw_pose)
     return {
         "state": state,
         "state_tcp": state_tcp,
+        "peg_pose": peg_pose,
+        "peg_head_pose": peg_head_pose,
+        "hole_pose": hole_pose,
         "tcp_matrix_root": tcp_matrix,
     }
 
@@ -610,6 +623,9 @@ def _track_reference_with_controller(
                     .astype(np.float32),
                     "observation.state": pre["state"],
                     "observation.state_tcp": pre["state_tcp"],
+                    "observation.peg_pose": pre["peg_pose"],
+                    "observation.peg_head_pose": pre["peg_head_pose"],
+                    "observation.hole_pose": pre["hole_pose"],
                     "episode_reset_state": reset_state,
                 }
             )
@@ -782,6 +798,15 @@ class LeRobotControllerWriter:
             df = pd.read_parquet(path)
             if df.empty:
                 raise RuntimeError(f"Cannot resume empty episode parquet: {path}")
+            for pose_field in (
+                "observation.peg_pose",
+                "observation.peg_head_pose",
+                "observation.hole_pose",
+            ):
+                if pose_field not in df.columns:
+                    df[pose_field] = [
+                        np.full(7, np.nan, dtype=np.float32) for _ in range(len(df))
+                    ]
             task = str(df["task"].iloc[0])
             if df["task"].astype(str).nunique() != 1:
                 raise RuntimeError(f"Episode has multiple tasks: {path}")
@@ -926,6 +951,9 @@ def _dataset_schema() -> pa.Schema:
             pa.field("debug.tcp_after", _list_type()),
             pa.field("observation.state", _list_type()),
             pa.field("observation.state_tcp", _list_type()),
+            pa.field("observation.peg_pose", _list_type()),
+            pa.field("observation.peg_head_pose", _list_type()),
+            pa.field("observation.hole_pose", _list_type()),
             pa.field("episode_reset_state", _list_type()),
             pa.field("timestamp", pa.float32()),
             pa.field("frame_index", pa.int64()),
@@ -993,6 +1021,24 @@ def _features(num_reset_state_dims: int) -> dict[str, Any]:
             "names": STATE_NAMES,
             "fps": float(FPS),
         },
+        "observation.peg_pose": {
+            "dtype": "float32",
+            "shape": [7],
+            "names": POSE7_NAMES,
+            "fps": float(FPS),
+        },
+        "observation.peg_head_pose": {
+            "dtype": "float32",
+            "shape": [7],
+            "names": POSE7_NAMES,
+            "fps": float(FPS),
+        },
+        "observation.hole_pose": {
+            "dtype": "float32",
+            "shape": [7],
+            "names": POSE7_NAMES,
+            "fps": float(FPS),
+        },
         "episode_reset_state": {
             "dtype": "float32",
             "shape": [num_reset_state_dims],
@@ -1058,6 +1104,9 @@ LIST_FIELDS = [
     "debug.tcp_after",
     "observation.state",
     "observation.state_tcp",
+    "observation.peg_pose",
+    "observation.peg_head_pose",
+    "observation.hole_pose",
     "episode_reset_state",
 ]
 
@@ -1132,6 +1181,9 @@ def _write_dataset_metadata(
             "debug.env_action",
             "observation.state",
             "observation.state_tcp",
+            "observation.peg_pose",
+            "observation.peg_head_pose",
+            "observation.hole_pose",
             "episode_reset_state",
         ]:
             stats[field] = _array_summary(

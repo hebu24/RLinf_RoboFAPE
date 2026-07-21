@@ -32,7 +32,6 @@ export RAY_TMPDIR="${SFT_RAY_TMPDIR:-/tmp/ray_sft_${SFT_RAY_PORT}}"
 # sweep) already binds 52365, this head's raylet crashes in its HTTP loop on bind.
 # Default 52366 (eval sweep uses 52365). Override per concurrent SFT run.
 export SFT_DASHBOARD_AGENT_PORT="${SFT_DASHBOARD_AGENT_PORT:-52366}"
-export CUDA_LAUNCH_BLOCKING=1
 
 # Raise fd limit so the raylet + torch.distributed.checkpoint shard saves do not hit
 # the default 1024 ("Too many open files" -> raylet grpc errors / save failure). Two

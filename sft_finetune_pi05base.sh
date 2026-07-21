@@ -32,7 +32,7 @@ export RAY_TMPDIR="${SFT_RAY_TMPDIR:-/tmp/ray_sft_${SFT_RAY_PORT}}"
 # sweep) already binds 52365, this head's raylet crashes in its HTTP loop on bind.
 # Default 52366 (eval sweep uses 52365). Override per concurrent SFT run.
 export SFT_DASHBOARD_AGENT_PORT="${SFT_DASHBOARD_AGENT_PORT:-52366}"
-export CUDA_LAUNCH_BLOCKING=1
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 
 # Raise fd limit so the raylet + torch.distributed.checkpoint shard saves do not hit
 # the default 1024 ("Too many open files" -> raylet grpc errors / save failure). Two
@@ -54,6 +54,22 @@ CONFIG_NAME="${CONFIG_NAME:-peg_insertion_sft_openpi_pi05}"
 OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_peg_insertion}"
 FORCE_NORM_STATS="${FORCE_NORM_STATS:-0}"
 NORM_STATS_ASSET="physical-intelligence/maniskill"
+
+# Fail early instead of silently starting from the base model when a resume path is
+# misspelled or points at the actor subdirectory rather than global_step_<N>.
+if [[ -n "${RESUME_DIR:-}" ]]; then
+  if [[ ! "$RESUME_DIR" =~ /global_step_[0-9]+/?$ ]]; then
+    echo "RESUME_DIR must point to a global_step_<N> directory, got: $RESUME_DIR" >&2
+    exit 1
+  fi
+  if [[ ! -d "$RESUME_DIR/actor/dcp_checkpoint" ]] || ! compgen -G "$RESUME_DIR/actor/dcp_checkpoint/*.distcp" >/dev/null; then
+    echo "RESUME_DIR has no complete actor DCP checkpoint: $RESUME_DIR" >&2
+    exit 1
+  fi
+  echo "[pi05base] strict resume checkpoint: $RESUME_DIR"
+else
+  echo "[pi05base] RESUME_DIR is empty; starting a fresh run from PREPARED_BASE."
+fi
 
 # --- (a) prepare base dir: symlink pi05_base weights (do not copy 16.5GB / do not touch shared dir) ---
 mkdir -p "$PREPARED_BASE"
