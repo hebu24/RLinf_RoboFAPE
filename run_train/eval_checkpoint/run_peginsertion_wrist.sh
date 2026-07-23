@@ -5,18 +5,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Edit these values directly, or override them with environment variables.
-VENV_DIR="${VENV_DIR:-/opt/kairan/envs/rlinf}"
+VENV_DIR="${VENV_DIR:-/data/yingxi/kairan/envs/rlinf}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
 CONFIG_DIR="${CONFIG_DIR:-${REPO_PATH}/run_train/peginsertion_maniskill_pi0.5/config}"
-CONFIG_NAME="${CONFIG_NAME:-maniskill_peg_insertion_vertical_wrist_sft_eval_openpi_pi05}"
+CONFIG_NAME="${CONFIG_NAME:-maniskill_peg_insertion_vertical_wrist_sft_eval_openpi_pi05_insert_only}"
 TASK_ID="${TASK_ID:-PegInsertionVertical-v1}"
 OBJ_SET="${OBJ_SET:-}"
-TASK_DESCRIPTION="${TASK_DESCRIPTION:-insert the blue peg vertically into the orange hole}"
+TASK_DESCRIPTION="${TASK_DESCRIPTION:-transport and insert the grasped peg into the hole}"
 
 # NUM_EVAL_EPISODES is the exact trajectory count and must be divisible by NUM_ENVS.
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-25}"
 NUM_ENVS="${NUM_ENVS:-5}"
-MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-600}"
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 SEED="${SEED:-0}"
 GPU_IDS="${GPU_IDS:-0}"
 

@@ -22,7 +22,7 @@ action space.
 
 The proprio state is an aligned TCP pose used only as model input.  The fixed
 alignment maps the peg-insertion TCP distribution into the same rough coordinate
-range as the 25Main pi0.5 ManiSkill SFT checkpoint norm stats, avoiding the
+range as the reference pi0.5 ManiSkill SFT checkpoint norm stats, avoiding the
 extreme normalized Euler values produced by the raw TCP frame.
 """
 
@@ -41,7 +41,7 @@ PANDA_EE_DELTA_ROT_BOUND = 0.1
 PANDA_GRIPPER_OPEN = 1.0
 PANDA_GRIPPER_CLOSE = -1.0
 
-# State/action quantile stats from the base RLinf-Pi05-ManiSkill-25Main-SFT
+# State/action quantile stats from the reference pi0.5 ManiSkill SFT
 # checkpoint.  Keep them local so data collection can reject obviously OOD
 # samples before SFT.
 _BASE_MANISKILL_STATE_Q01 = np.array(

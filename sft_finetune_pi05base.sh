@@ -1,30 +1,28 @@
 #!/usr/bin/env bash
 # Independent SFT finetune script that starts from the generic pi05_base checkpoint
-# (/opt/zhangchenyu/weights/pi05_base) and computes fresh norm_stats from the
-# training data (instead of reusing the maniskill norm_stats bundled with
-# RLinf-Pi05-ManiSkill-25Main-SFT).
+# (/data/yingxi/weights/pi05_base) and computes fresh norm_stats from the
+# training data when the dataset does not already ship them.
 #
 # It does NOT modify the shared pi05_base dir. Instead it builds a "prepared base"
 # directory that symlinks pi05_base/model.safetensors and holds a freshly-computed
 # <asset_id>/norm_stats.json, then points actor.model.model_path at it. The rest of
 # the SFT chain (get_model weight+norm_stats loading, FSDPVlaSftWorker.save_checkpoint
-# norm_stats copy) is reused unchanged, so the saved checkpoint layout is identical to
-# sft_finetune.sh.
+# norm_stats copy) is reused unchanged, so the saved checkpoint layout is the standard
+# pi0.5 SFT layout.
 #
 # Usage:
 #   GPU_IDS=0,1,2,3 bash sft_finetune_pi05base.sh
 #   DATA_DIR=... GPU_IDS=0 bash sft_finetune_pi05base.sh
-#   FORCE_NORM_STATS=1 bash sft_finetune_pi05base.sh          # recompute norm_stats
 #   CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist \
 #     OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist bash sft_finetune_pi05base.sh
 set -euo pipefail
 
-cd /opt/yingxi/RLinf_RoboFAPE
+cd /data/yingxi/RLinf_RoboFAPE
 
 # Resolve the repo-local rlinf package (an older installed copy at
 # /opt/kairan/RLinf shadows it otherwise and lacks the peg_insertion configs).
-export PYTHONPATH=/opt/yingxi/RLinf_RoboFAPE:${PYTHONPATH:-}
-export PATH=/opt/kairan/envs/rlinf/bin:$PATH
+export PYTHONPATH=/data/yingxi/RLinf_RoboFAPE:${PYTHONPATH:-}
+export PATH=/data/yingxi/kairan/envs/rlinf/bin:$PATH
 export SFT_RAY_PORT="${SFT_RAY_PORT:-6379}"
 export RAY_TMPDIR="${SFT_RAY_TMPDIR:-/tmp/ray_sft_${SFT_RAY_PORT}}"
 # Dashboard-agent listen port MUST be unique per Ray cluster on the same host: Ray's
@@ -40,19 +38,17 @@ export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 ulimit -n 1048576 2>/dev/null || true
 
 # --- inputs ---
-DATA_DIR="${DATA_DIR:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_controller_3200}"
-PI05_BASE="${PI05_BASE:-/opt/zhangchenyu/weights/pi05_base}"
-PREPARED_BASE="${PREPARED_BASE:-/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg}"
+DATA_DIR="${DATA_DIR:-/data/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200}"
+PI05_BASE="${PI05_BASE:-/data/yingxi/weights/pi05_base}"
+PREPARED_BASE="${PREPARED_BASE:-/data/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist_insert}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
-# logger experiment name (default keeps the original behavior; override for the
-# actual-EE-delta variant so its logs/checkpoints are distinguishable).
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_sft_pi05base}"
+# logger experiment name (override to distinguish logs/checkpoints across runs).
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_sft_insert_only_wrist}"
 
 # Hydra config (examples/sft/config/<NAME>.yaml) and the matching openpi config_name
-# used to compute norm_stats. Override both together for the wrist variant.
-CONFIG_NAME="${CONFIG_NAME:-peg_insertion_sft_openpi_pi05}"
-OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_peg_insertion}"
-FORCE_NORM_STATS="${FORCE_NORM_STATS:-0}"
+# used to compute norm_stats. Both default to the wrist insert-only variant.
+CONFIG_NAME="${CONFIG_NAME:-peg_insertion_sft_openpi_pi05_wrist}"
+OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_peg_insertion_wrist}"
 NORM_STATS_ASSET="physical-intelligence/maniskill"
 
 # Fail early instead of silently starting from the base model when a resume path is
@@ -82,12 +78,10 @@ echo "[pi05base] prepared base dir: $PREPARED_BASE (symlinks -> $PI05_BASE)"
 # state transforms can produce different statistics from the same LeRobot dataset.
 NS_FILE="$PREPARED_BASE/$NORM_STATS_ASSET/norm_stats.json"
 DATA_NS_FILE="$DATA_DIR/meta/openpi/$OPENPI_CONFIG_NAME/norm_stats.json"
-if [[ "$FORCE_NORM_STATS" != "1" && -f "$DATA_NS_FILE" ]]; then
+if [[ -f "$DATA_NS_FILE" ]]; then
   mkdir -p "$(dirname "$NS_FILE")"
   cp -f "$DATA_NS_FILE" "$NS_FILE"
-  echo "[pi05base] restored dataset-cached norm_stats: $DATA_NS_FILE -> $NS_FILE"
-elif [[ "$FORCE_NORM_STATS" != "1" && -f "$NS_FILE" ]]; then
-  echo "[pi05base] reusing cached norm_stats at $NS_FILE (set FORCE_NORM_STATS=1 to recompute)"
+  echo "[pi05base] using dataset norm_stats: $DATA_NS_FILE -> $NS_FILE"
 else
   echo "[pi05base] computing norm_stats from $DATA_DIR -> $NS_FILE"
   # Norm_stats is a pure-statistics (CPU) pass: hide all GPUs so the data loader does
@@ -105,7 +99,7 @@ mkdir -p "$(dirname "$DATA_NS_FILE")"
 cp -f "$NS_FILE" "$DATA_NS_FILE"
 echo "[pi05base] dataset norm_stats cache: $DATA_NS_FILE"
 
-# --- (c) GPU placement (same logic as sft_finetune.sh) ---
+# --- (c) GPU placement ---
 IFS="," read -r -a GPU_ID_ARRAY <<< "${GPU_IDS}"
 if ((${#GPU_ID_ARRAY[@]} == 0)); then
   echo "GPU_IDS must contain at least one GPU id." >&2; exit 1

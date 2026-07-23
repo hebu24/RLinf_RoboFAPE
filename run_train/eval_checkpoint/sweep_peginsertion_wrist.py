@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory for per-checkpoint eval logs, CSV, JSON, and plots.",
     )
-    parser.add_argument("--venv-dir", default="/opt/kairan/envs/rlinf")
+    parser.add_argument("--venv-dir", default="/data/yingxi/kairan/envs/rlinf")
     parser.add_argument("--gpu-ids", default="0-3")
     parser.add_argument(
         "--ray-num-cpus",
@@ -151,10 +151,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--run-script",
-        default=str(REPO_PATH / "run_train/eval_checkpoint/run_peginsertion_wrist.sh"),
+        default=str(REPO_PATH / "run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh"),
         help=(
-            "Launcher script to invoke per checkpoint. Point this at "
-            "run_peginsertion_wrist_insert_only.sh for insert-only sweeps."
+            "Launcher script to invoke per checkpoint (insert-only wrist eval)."
         ),
     )
     return parser.parse_args()

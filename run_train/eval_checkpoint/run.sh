@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Edit these values directly, or override them with environment variables.
-VENV_DIR="${VENV_DIR:-/opt/kairan/envs/rlinf}"
+VENV_DIR="${VENV_DIR:-/data/yingxi/kairan/envs/rlinf}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/opt/yingxi/rlinf/RLinf-Pi05-ManiSkill-25Main-RL-FlowNoise/checkpoints/global_step_150/actor}"
 CONFIG_DIR="${CONFIG_DIR:-${REPO_PATH}/run_train/test_maniskill_pi0.5/config}"
 CONFIG_NAME="${CONFIG_NAME:-maniskill_ppo_openpi_pi05}"

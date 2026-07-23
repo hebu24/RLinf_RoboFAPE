@@ -107,17 +107,14 @@ def _validate_peg_insertion_eval_cfg(cfg: DictConfig, task_id: str) -> None:
             "env.eval.wrap_obs_mode=simple so the policy receives base_camera "
             "images and aligned pi0.5 proprio. Use the peg-insertion config "
             "run_train/peginsertion_maniskill_pi0.5/config/"
-            "maniskill_peg_insertion_vertical_ppo_openpi_pi05.yaml instead of "
-            "a generic ManiSkill config."
+            "maniskill_peg_insertion_vertical_wrist_sft_eval_openpi_pi05_insert_only.yaml "
+            "instead of a generic ManiSkill config."
         )
     model_cfg = cfg.rollout.model
     openpi_cfg = model_cfg.get("openpi", {})
     config_name = openpi_cfg.get("config_name", None)
     config_profiles = {
-        "pi05_maniskill_peg_insertion": (1, False, False),
         "pi05_maniskill_peg_insertion_wrist": (2, True, False),
-        "pi05_maniskill_peg_insertion_actual_ee": (2, True, False),
-        "pi05_maniskill_peg_insertion_dualwrist": (3, True, True),
     }
     if config_name not in config_profiles:
         expected_config_names = ", ".join(sorted(config_profiles))
@@ -161,21 +158,19 @@ def _validate_peg_insertion_eval_cfg(cfg: DictConfig, task_id: str) -> None:
             f"and {action_horizon}."
         )
     policy_setup = str(model_cfg.get("policy_setup", ""))
-    if policy_setup not in ("panda-ee-target-dpose", "panda-ee-dpose"):
+    if policy_setup != "panda-ee-target-dpose":
         raise ValueError(
             "PegInsertionVertical-v1 evaluation must use "
             "rollout.model.policy_setup=panda-ee-target-dpose (use_target=True, "
-            "target-delta labels) or panda-ee-dpose (use_target=False, "
-            "actual-EE-delta labels) so physical TCP actions are converted for "
-            "the matching ManiSkill pd_ee_(target_)delta_pose controller. "
+            "target-delta labels) so physical TCP actions are converted for "
+            "the ManiSkill pd_ee_target_delta_pose controller. "
             f"Got {policy_setup!r}."
         )
     control_mode = str(cfg.env.eval.init_params.get("control_mode", ""))
-    if control_mode not in ("pd_ee_target_delta_pose", "pd_ee_delta_pose"):
+    if control_mode != "pd_ee_target_delta_pose":
         raise ValueError(
             "PegInsertionVertical-v1 evaluation must use "
-            "env.eval.init_params.control_mode=pd_ee_target_delta_pose or "
-            "pd_ee_delta_pose. "
+            "env.eval.init_params.control_mode=pd_ee_target_delta_pose. "
             f"Got {control_mode!r}."
         )
 

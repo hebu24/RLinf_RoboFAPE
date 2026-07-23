@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG_NAME="maniskill_ppo_openpi_pi05"
-VENV_DIR="/opt/kairan/envs/rlinf"
+VENV_DIR="/data/yingxi/kairan/envs/rlinf"
 PYTHON_BIN="${VENV_DIR}/bin/python"
 RAY_BIN="${VENV_DIR}/bin/ray"
 

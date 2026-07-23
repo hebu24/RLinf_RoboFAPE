@@ -21,7 +21,6 @@ from typing_extensions import override
 
 from rlinf.models.embodiment.openpi.policies import maniskill_policy
 
-
 @dataclasses.dataclass(frozen=True)
 class LeRobotManiSkillDataConfig(DataConfigFactory):
     """
@@ -102,12 +101,11 @@ class LeRobotManiSkillDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
-
 @dataclasses.dataclass(frozen=True)
 class LeRobotManiSkillPegInsertionWristDataConfig(LeRobotManiSkillDataConfig):
     """DataConfig for PegInsertionVertical finetuning with wrist camera.
 
-    Differences from LeRobotManiSkillPegInsertionDataConfig:
+    Configuration (relative to LeRobotManiSkillDataConfig):
     - image: base (observation.images.top) + wrist (observation.images.wrist).
       The wrist image is repacked to ``observation/wrist_image`` so that
       ``ManiSkillInputs`` maps it to ``left_wrist_0_rgb`` and enables the
@@ -126,101 +124,6 @@ class LeRobotManiSkillPegInsertionWristDataConfig(LeRobotManiSkillDataConfig):
                     {
                         "observation/image": "observation.images.top",
                         "observation/wrist_image": "observation.images.wrist",
-                        "observation/state": "observation.state_tcp",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
-
-        data_transforms = _transforms.Group(
-            inputs=[
-                maniskill_policy.ManiSkillInputs(model_type=model_config.model_type)
-            ],
-            outputs=[maniskill_policy.ManiSkillOutputs()],
-        )
-
-        if self.extra_delta_transform:
-            delta_action_mask = _transforms.make_bool_mask(6, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
-
-        model_transforms = ModelTransformFactory()(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class LeRobotManiSkillPegInsertionDualWristDataConfig(
-    LeRobotManiSkillPegInsertionWristDataConfig
-):
-    """DataConfig for PegInsertionVertical finetuning with front+back wrist cameras.
-
-    Differences from LeRobotManiSkillPegInsertionWristDataConfig:
-    - image: base + front wrist + back wrist. The back wrist image
-      (observation.images.wrist_back) is repacked to ``observation/wrist_image_back``
-      so that ``ManiSkillInputs`` maps it to ``right_wrist_0_rgb`` and enables the
-      corresponding image mask. Pair with num_images_in_input=3 so all three image
-      slots are un-masked for the value/VLM prefix.
-    - state/action: inherited from the wrist config (observation.state_tcp, delta).
-    """
-
-    @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
-        config = super().create(assets_dirs, model_config)
-        # Same repack as the wrist config plus the back-wrist image -> right slot.
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "observation.images.top",
-                        "observation/wrist_image": "observation.images.wrist",
-                        "observation/wrist_image_back": "observation.images.wrist_back",
-                        "observation/state": "observation.state_tcp",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
-        return dataclasses.replace(config, repack_transforms=repack_transform)
-
-
-@dataclasses.dataclass(frozen=True)
-class LeRobotManiSkillPegInsertionDataConfig(LeRobotManiSkillDataConfig):
-    """DataConfig for PegInsertionVertical finetuning.
-
-    Differences from base LeRobotManiSkillDataConfig:
-    - state: uses observation.state_tcp (8-dim aligned pi0.5 TCP proprio)
-      instead of observation.state (qpos). TCP proprio is pre-computed offline
-      via FK with the same helper used by online inference.
-    - image: base-only (observation.images.top). wrist/render not mapped,
-      so ManiSkillInputs zero-pads and masks them out.
-    - action: already physical target-delta TCP action
-      ([dx, dy, dz, droll, dpitch, dyaw, gripper]) with Euler XYZ rotation for
-      ManiSkill Panda pd_ee_target_delta_pose eval, so extra_delta_transform
-      stays False (inherited).
-    """
-
-    @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "observation.images.top",
                         "observation/state": "observation.state_tcp",
                         "actions": "actions",
                         "prompt": "prompt",

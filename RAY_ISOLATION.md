@@ -1,7 +1,7 @@
 # Ray Isolation — concurrent SFT + eval on one host
 
 **Audience: all agents (and humans) launching SFT training or eval on this box.**
-Host: `H100-SQZ` (`/opt/yingxi/RLinf_RoboFAPE`), 8× H100, shared by multiple jobs.
+Host: `xulab` (`/data/yingxi/RLinf_RoboFAPE`), multi-GPU H100, shared by multiple jobs.
 
 ## TL;DR — the 5 rules
 
@@ -9,18 +9,17 @@ Host: `H100-SQZ` (`/opt/yingxi/RLinf_RoboFAPE`), 8× H100, shared by multiple jo
 2. **Each Ray cluster needs 3 DISTINCT things**: GCS port (`--port`), dashboard-agent port (`--dashboard-agent-listen-port`), and temp-dir (`--temp-dir`). These are the only fixed (non-random) ports Ray uses; collide on any one and a raylet crashes (`boost::beast::http` stack in `raylet.out`). All other Ray ports default to 0 (random) and are safe.
 3. **Pin driver + workers with `RAY_ADDRESS=127.0.0.1:<port>`.** RLinf hardcodes `ray.init(address="auto")`; with `RAY_ADDRESS` unset, Ray's `find_gcs_addresses()` greps `ps` for *any* GCS and connects to whichever — so an SFT worker can attach to the eval cluster. `RAY_ADDRESS` overrides that.
 4. **Disjoint GPUs.** Ray isolation ≠ GPU memory isolation. Two clusters on the same GPU share HBM and OOM each other. SFT on one half, eval/other-SFT on the other half.
-5. **No bare `ray stop` in any script that may run concurrently.** The fixed scripts below are safe; the legacy `run_train/*/run.sh` and `ray_utils/` still do bare `ray stop` — don't run them while training is up.
+5. **No bare `ray stop` in any script that may run concurrently.** The fixed scripts below are safe; the legacy `run_train/test_maniskill_pi0.5/run.sh` (PutOnPlate PPO entry) still does bare `ray stop` — don't run it while training is up.
 
 ## Default port assignments (this box)
 
 | job | script | GCS port | dashboard-agent | temp-dir | GPUs |
 |---|---|---|---|---|---|
 | wrist SFT | `sft_finetune_pi05base.sh` (CONFIG=..._wrist) | `6379` (`SFT_RAY_PORT`) | `52366` (`SFT_DASHBOARD_AGENT_PORT`) | `/tmp/ray_sft_6379` | 4-7 |
-| actual-ee SFT | `sft_finetune_pi05base.sh` (CONFIG=..._actual_ee) | `6381` | `52367` | `/tmp/ray_sft_6381` | 0-3 |
 | eval sweep | `sweep_peginsertion_wrist.py` | `6380` (`--ray-port`) | `52365` (Ray default) | `/tmp/ray_eval_wrist_sweep_<pid>` | 0-3 |
 | single ckpt eval | `run_peginsertion*.sh` (`MANAGE_RAY=true`) | `6380` (`EVAL_RAY_PORT`) | `52365` | `/tmp/ray_eval_wrist` | per `GPU_IDS` |
 
-All four GCS ports (6379/6380/6381) and the two non-default dashboard-agent ports (52366/52367) are distinct → these can all run at once. **Two eval sweeps at once would collide on 6380 + 52365** — don't; give the second `--ray-port 6390` and a distinct dashboard-agent port.
+Both GCS ports (6379/6380) and the non-default dashboard-agent port (52366) are distinct → these can run at once. **Two eval sweeps at once would collide on 6380 + 52365** — don't; give the second `--ray-port 6390` and a distinct dashboard-agent port.
 
 ## The fixed scripts (what makes them safe)
 
@@ -34,22 +33,12 @@ Run each in a detached tmux session so it survives SSH disconnect. Launch order 
 
 ```bash
 # wrist SFT — 4-7, port 6379
-tmux new-session -d -s sft_pi05_wrist "cd /opt/yingxi/RLinf_RoboFAPE && \
-  PYTHONUNBUFFERED=1 DATA_DIR=<...controller_12800> GPU_IDS=4,5,6,7 \
-  CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist \
-  PREPARED_BASE=<.../base/pi05_base_peg_wrist> bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_pi05base_wrist_tmux.log"
+tmux new-session -d -s sft_wrist "cd /data/yingxi/RLinf_RoboFAPE && \
+  PYTHONUNBUFFERED=1 bash run_sft_insert_wrist_v2.sh 2>&1 | tee logs/sft_insert_wrist_v2_tmux.log"
 
-# actual-ee SFT — 0-3, port 6381 (distinct port + dash-agent + temp-dir)
-tmux new-session -d -s sft_actual_ee "cd /opt/yingxi/RLinf_RoboFAPE && \
-  SFT_RAY_PORT=6381 SFT_DASHBOARD_AGENT_PORT=52367 \
-  PYTHONUNBUFFERED=1 DATA_DIR=<...actual_ee_3200> GPU_IDS=0,1,2,3 \
-  CONFIG_NAME=peg_insertion_sft_openpi_pi05_actual_ee OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_actual_ee \
-  PREPARED_BASE=<.../base/pi05_base_peg_actual_ee> EXPERIMENT_NAME=peg_insertion_sft_actual_ee \
-  bash sft_finetune_pi05base.sh 2>&1 | tee logs/sft_actual_ee_tmux.log"
-
-# eval sweep — 0-3, port 6380 (NOT concurrent with the actual-ee SFT on 0-3 — GPU clash; run when 0-3 free)
-tmux new-session -d -s eval_sweep "cd /opt/yingxi/RLinf_RoboFAPE && \
-  MPLCONFIGDIR=/tmp/matplotlib /opt/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
+# eval sweep — 0-3, port 6380 (run when GPUs 0-3 are free)
+tmux new-session -d -s eval_sweep "cd /data/yingxi/RLinf_RoboFAPE && \
+  MPLCONFIGDIR=/tmp/matplotlib /data/yingxi/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
     --ray-port 6380 --run-script run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh \
     --checkpoint-dir <.../checkpoints> --output-dir <...> \
     --num-eval-episodes 10 --num-envs 1 --gpu-ids 0,1,2,3 --action-scale 1.0 \
@@ -59,8 +48,8 @@ tmux new-session -d -s eval_sweep "cd /opt/yingxi/RLinf_RoboFAPE && \
 Attach/monitor:
 ```bash
 tmux ls
-tmux attach -t sft_pi05_wrist      # detach: Ctrl-b d
-tail -f logs/sft_pi05base_wrist_tmux.log
+tmux attach -t sft_wrist      # detach: Ctrl-b d
+tail -f logs/sft_insert_wrist_v2_tmux.log
 ```
 
 ## How to test / debug
@@ -68,7 +57,7 @@ tail -f logs/sft_pi05base_wrist_tmux.log
 **List running clusters + ports:**
 ```bash
 pgrep -fa gcs_server | grep -oE 'gcs_server_port=[0-9]+' | sort -u     # one line per cluster
-ss -tlnp | grep -E '6379|6380|6381|52365|52366|52367'                  # who binds what
+ss -tlnp | grep -E '6379|6380|52365|52366'                  # who binds what
 ```
 
 **Confirm two jobs aren't killing each other** (both gcs stay up across an eval launch):
@@ -99,7 +88,7 @@ dmesg 2>/dev/null | grep -iE 'out of memory|killed process|oom' | tail
 1. **Bare `ray stop`** — kills every cluster on the host. The #1 cause of "eval killed my training". Forbidden while >1 job is up.
 2. **`--dashboard-agent-listen-port` defaults to fixed 52365** — two heads both want 52365 → the second raylet crashes in its HTTP loop. Give each cluster a distinct one (SFT scripts: `SFT_DASHBOARD_AGENT_PORT`; the eval sweep uses 52365 so an SFT must use 52366+).
 3. **Shared `RAY_TMPDIR`** — two heads writing the same temp-dir collide on the session dir. `sft_finetune_pi05base.sh` derives it from `SFT_RAY_PORT` (`/tmp/ray_sft_${SFT_RAY_PORT}`); override `SFT_RAY_TMPDIR` only if needed.
-4. **Legacy scripts still do bare `ray stop`**: `run_train/test_maniskill_pi0.5/run.sh`, `run_train/peginsertion_maniskill_pi0.5/run.sh`, and the data-collection command in `README.md §1`. Don't run these while SFT/eval is up; if you must, port-isolate them first (same `--port` + `--dashboard-agent-listen-port` + scoped pattern).
+4. **Legacy scripts still do bare `ray stop`**: `run_train/test_maniskill_pi0.5/run.sh` (the PutOnPlate PPO entry) still does bare `ray stop`. Don't run it while SFT/eval is up; if you must, port-isolate it first (same `--port` + `--dashboard-agent-listen-port` + scoped pattern).
 5. **`RAY_ADDRESS` unset** → `address="auto"` ps-scans to *any* cluster. Always set it (the fixed scripts do).
 6. **GPU overlap ≠ process-kill.** Ray isolation (distinct port + scoped + no bare `ray stop`) holds **regardless of GPU overlap** — an eval on GPUs the SFT also uses will NOT ray-kill the SFT. But the shared GPUs time-slice compute (both slower) and HBM adds up; if SFT+eval > 80GB/GPU → CUDA OOM (crashes the later-started one). Cleanest: disjoint GPUs; if you must overlap, keep combined HBM < ~70GB/GPU and `watch nvidia-smi`.
 7. **Hard-restart of an SFT** while another SFT is up: the new one's `_sft_scoped_ray_kill` only touches its OWN port, so it's safe — but two SFTs on the same GPUs still OOM. Use disjoint GPUs + distinct `SFT_RAY_PORT`/`SFT_DASHBOARD_AGENT_PORT`.
@@ -119,7 +108,7 @@ actor:
     lr_warmup_steps: 500
     lr_scheduler: "cosine"
 ```
-Files: `examples/sft/config/peg_insertion_sft_openpi_pi05_wrist.yaml`, `..._actual_ee.yaml`.
+Files: `examples/sft/config/peg_insertion_sft_openpi_pi05_wrist.yaml`.
 
 ## Scaling GPUs (does 8 GPUs = 2x speed?)
 
@@ -137,7 +126,7 @@ Rule of thumb: before assuming N GPUs = Nx speed, check `nvidia-smi` util — if
 
 ## Files touched for isolation (reference)
 
-- `sft_finetune.sh`, `sft_finetune_wrist.sh`, `sft_finetune_pi05base.sh`, `sft_finetune_actual_ee.sh` — SFT detached-head + scoped.
+- `sft_finetune_pi05base.sh`, `run_sft_insert_wrist_v2.sh` — SFT detached-head + scoped.
 - `run_train/eval_checkpoint/sweep_peginsertion_wrist.py` — `--ray-port`, `_scoped_ray_kill`.
-- `run_train/eval_checkpoint/run_peginsertion_wrist.sh`, `run_peginsertion.sh`, `run.sh` — `EVAL_RAY_PORT`, scoped trap.
-- Backups: `.edit_bak/` (pre-isolation originals). `README.md §4` has the Ray-isolation note + commands.
+- `run_train/eval_checkpoint/run_peginsertion_wrist.sh`, `run_peginsertion_wrist_insert_only.sh`, `run.sh` — `EVAL_RAY_PORT`, scoped trap.
+- `README.md §2` has the Ray-isolation note + commands.

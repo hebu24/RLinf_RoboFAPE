@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /opt/yingxi/RLinf_RoboFAPE
+cd /data/yingxi/RLinf_RoboFAPE
 export PYTHONUNBUFFERED=1
-export DATA_DIR=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200
+export DATA_DIR=/data/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200
 export GPU_IDS=4,5,6,7
 export SFT_RAY_PORT=6379
 export SFT_DASHBOARD_AGENT_PORT=52366
 export CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist
 export OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist
-export PREPARED_BASE=/opt/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist_insert
+export PREPARED_BASE=/data/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist_insert
 export EXPERIMENT_NAME=peg_insertion_sft_insert_only_wrist_v2
 # Fixes: mask gripper dim in flow-matching loss (std=0 -> pure-noise target),
 # lower lr + longer warmup for the OOD insert-only start distribution.
