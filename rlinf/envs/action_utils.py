@@ -19,6 +19,121 @@ from rlinf.config import SupportedModel
 from rlinf.envs import SupportedEnvType
 
 
+class TemporalEnsembleBuffer:
+    """ACT-style time-weighted temporal ensemble of overlapping action chunks.
+
+    Used for eval real-time chunking: the model predicts a full horizon-H chunk
+    every k env steps (k <= H), and at each executed step we blend the
+    ``age``-th action of every still-overlapping buffered prediction, weighting
+    each by ``exp(-m * age)``. This closes the within-chunk open loop (each
+    executed action is conditioned on a recent observation) and smooths the
+    chunk-boundary discontinuity, while blending before the (linear) panda
+    action conversion so the average is exact.
+
+    Per-env reset masking drops predictions made before an env's last reset, so
+    a freshly-reset env does not blend in stale pre-reset predictions.
+    """
+
+    def __init__(self, horizon: int, m: float, num_envs: int, device):
+        self.horizon = int(horizon)
+        self.m = float(m)
+        self.num_envs = int(num_envs)
+        self.device = device
+        # parallel lists; chunks[i] is [num_envs, horizon, action_dim]
+        self.chunks: list[torch.Tensor] = []
+        self.predict_steps: list[int] = []
+        # per-env global step of the most recent reset (inclusive); preds with
+        # predict_step < reset_step[e] are ignored for env e.
+        self.reset_step = torch.zeros(num_envs, dtype=torch.long, device=device)
+
+    def push(self, chunk, predict_step: int) -> None:
+        """Buffer a freshly predicted chunk [num_envs, horizon, action_dim].
+
+        Accepts torch.Tensor or numpy.ndarray (the rollout worker ships model
+        outputs as numpy); converted to a tensor on the buffer's device.
+        """
+        if not torch.is_tensor(chunk):
+            chunk = torch.as_tensor(chunk, dtype=torch.float32)
+        chunk = chunk.detach().float()
+        if chunk.device != self.device:
+            chunk = chunk.to(self.device)
+        self.chunks.append(chunk)
+        self.predict_steps.append(int(predict_step))
+        # drop predictions that can no longer overlap any future step.
+        # A prediction made at step p overlaps up to step p + horizon - 1.
+        if len(self.predict_steps) > 1:
+            oldest_needed = predict_step - self.horizon + 1
+            while self.predict_steps and self.predict_steps[0] < oldest_needed:
+                self.chunks.pop(0)
+                self.predict_steps.pop(0)
+
+    def mark_reset(self, env_mask: torch.Tensor, step: int) -> None:
+        """Record that envs in ``env_mask`` reset at ``step`` (inclusive).
+
+        Predictions made before ``step`` are ignored for those envs afterward.
+        """
+        if env_mask is None or not bool(env_mask.any()):
+            return
+        mask = env_mask.to(self.device).bool()
+        self.reset_step[mask] = int(step)
+
+    def current_action(self, current_step: int) -> torch.Tensor:
+        """Return the blended action [num_envs, action_dim] for ``current_step``.
+
+        Blends the ``age``-th action of each overlapping, non-reset prediction,
+        weighted by ``exp(-m * age)``. With m == 0 returns the newest valid
+        prediction's action (pure slicing).
+        """
+        if not self.chunks:
+            raise RuntimeError("TemporalEnsembleBuffer.current_action with empty buffer")
+        ages = [current_step - ps for ps in self.predict_steps]
+        # keep overlapping predictions (age in [0, horizon))
+        keep = [i for i, a in enumerate(ages) if 0 <= a < self.horizon]
+        if not keep:
+            raise RuntimeError(
+                "TemporalEnsembleBuffer: no overlapping prediction for current_step "
+                f"{current_step}; predict_steps={self.predict_steps}"
+            )
+        ages = torch.tensor(
+            [ages[i] for i in keep], dtype=torch.float32, device=self.device
+        )  # [J]
+        # each prediction's age-th action along the horizon axis: [J, num_envs, action_dim]
+        acts = torch.stack(
+            [self.chunks[keep[j]][:, ages[j].long(), :] for j in range(len(keep))],
+            dim=0,
+        )  # [J, num_envs, action_dim]
+
+        # per-env validity mask: prediction i valid for env e iff
+        # predict_step_i >= reset_step[e]
+        ps = torch.tensor(
+            [self.predict_steps[i] for i in keep],
+            dtype=torch.long,
+            device=self.device,
+        )  # [J]
+        valid = ps[:, None] >= self.reset_step[None, :]  # [J, num_envs]
+
+        if self.m > 0:
+            weights = torch.exp(-self.m * ages)  # [J]
+        else:
+            weights = torch.ones(len(keep), device=self.device)  # uniform; argmax newest below
+        weights = weights[:, None] * valid.float()  # [J, num_envs]
+
+        if self.m == 0:
+            # pure slicing: take the newest valid prediction per env.
+            # keep[] is ordered oldest->newest; pick the last valid per env.
+            order = torch.arange(len(keep), device=self.device)  # [J]
+            valid_order = order[:, None] * valid  # [J, num_envs], 0 for invalid
+            newest_idx = valid_order.argmax(dim=0)  # [num_envs]
+            env_idx = torch.arange(self.num_envs, device=self.device)
+            return acts[newest_idx, env_idx]
+
+        denom = weights.sum(dim=0)  # [num_envs]
+        denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+        blended = (weights.unsqueeze(-1) * acts).sum(dim=0) / denom.unsqueeze(-1)
+        return blended  # [num_envs, action_dim]
+
+
+
 def prepare_actions_for_maniskill(
     raw_chunk_actions,
     num_action_chunks,
@@ -26,10 +141,33 @@ def prepare_actions_for_maniskill(
     action_scale,
     policy,
 ) -> torch.Tensor:
-    if "panda" in policy:
-        return raw_chunk_actions
     # TODO only suitable for action_dim = 7
+    policy = policy or "widowx_bridge"
     reshaped_actions = raw_chunk_actions.reshape(-1, action_dim)
+    if "panda" in policy:
+        chunk_actions = reshaped_actions.copy()
+        if policy in [
+            "panda-ee-dpose",
+            "panda-ee-target-dpos",
+            "panda-ee-target-dpose",
+        ]:
+            from rlinf.envs.maniskill.peg_insertion_pi05 import (
+                model_action_to_panda_env_action,
+            )
+
+            # The policy predicts raw controller-space deltas:
+            # [meters, meters, meters, radians, radians, radians, gripper].
+            # ManiSkill's Panda EE pose controllers have normalize_action=True.
+            # Position uses delta / 0.1; rotation uses -delta / 0.1 because
+            # PDEEPoseController multiplies normalized rotation by rot_lower.
+            chunk_actions = model_action_to_panda_env_action(
+                chunk_actions, action_scale=action_scale
+            )
+        else:
+            chunk_actions[:, :6] *= action_scale
+        return torch.tensor(chunk_actions, dtype=torch.float32).cuda().reshape(
+            -1, num_action_chunks, action_dim
+        )
     batch_size = reshaped_actions.shape[0]
     raw_actions = {
         "world_vector": np.array(reshaped_actions[:, :3]),

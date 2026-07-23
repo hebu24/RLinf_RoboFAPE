@@ -103,6 +103,7 @@ class _ManiskillEnvCore(ManiskillEnv, EnvOffloadMixin):
                     "success_once": self.success_once.cpu(),
                     "fail_once": self.fail_once.cpu(),
                     "returns": self.returns.cpu(),
+                    "max_rewards": self.max_rewards.cpu(),
                 }
             )
         buffer = io.BytesIO()
@@ -169,6 +170,7 @@ class _ManiskillEnvCore(ManiskillEnv, EnvOffloadMixin):
             self.success_once = state["success_once"].to(self.device)
             self.fail_once = state["fail_once"].to(self.device)
             self.returns = state["returns"].to(self.device)
+            self.max_rewards = state.get("max_rewards", self.returns).to(self.device)
 
 
 def _maniskill_worker_main(

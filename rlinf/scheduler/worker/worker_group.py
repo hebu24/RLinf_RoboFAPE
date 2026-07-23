@@ -208,6 +208,10 @@ class WorkerGroup(Generic[WorkerClsType]):
         self._execution_ranks = list(ranks)
         return self
 
+    def close(self) -> None:
+        """Close the worker group and release its Ray actors."""
+        self._close()
+
     def _close(self):
         """Close the worker group and release resources. This method is called when the worker group is no longer needed."""
         for worker_info in self._workers:

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import os
 from typing import Any
 
@@ -20,6 +21,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
+from rlinf.data.utils import forward_set_epoch
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
@@ -28,6 +30,84 @@ from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 class FSDPVlaSftWorker(FSDPSftWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
+        self._sft_diag_interval = int(
+            getattr(self.cfg.actor, "sft_diagnostics_interval", 100)
+        )
+
+    @staticmethod
+    def _to_numpy(value: Any):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().float().cpu().numpy()
+        try:
+            import numpy as np
+
+            return np.asarray(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _add_dim_stats(metrics: dict[str, float], prefix: str, value: Any, names):
+        array = FSDPVlaSftWorker._to_numpy(value)
+        if array is None or array.size == 0:
+            return
+        import numpy as np
+
+        array = array.reshape(-1, array.shape[-1])
+        finite = np.isfinite(array)
+        metrics[f"{prefix}/finite_frac"] = float(finite.mean())
+        for dim, name in enumerate(names[: array.shape[-1]]):
+            dim_values = array[:, dim]
+            metrics[f"{prefix}/{name}_mean"] = float(np.mean(dim_values))
+            metrics[f"{prefix}/{name}_std"] = float(np.std(dim_values))
+            metrics[f"{prefix}/{name}_min"] = float(np.min(dim_values))
+            metrics[f"{prefix}/{name}_max"] = float(np.max(dim_values))
+            metrics[f"{prefix}/{name}_p01"] = float(np.percentile(dim_values, 1))
+            metrics[f"{prefix}/{name}_p99"] = float(np.percentile(dim_values, 99))
+
+    @staticmethod
+    def _collect_openpi_batch_diagnostics(batch: Any) -> dict[str, float]:
+        state_names = [
+            "tcp_x",
+            "tcp_y",
+            "tcp_z",
+            "roll",
+            "pitch",
+            "yaw",
+            "finger0",
+            "finger1",
+        ]
+        action_names = ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"]
+        metrics: dict[str, float] = {}
+        if isinstance(batch, tuple):
+            observation, actions = batch
+        else:
+            observation = batch.get("observation") if isinstance(batch, dict) else None
+            actions = batch.get("actions") if isinstance(batch, dict) else None
+
+        state = getattr(observation, "state", None)
+        FSDPVlaSftWorker._add_dim_stats(metrics, "sft_diag/state", state, state_names)
+        FSDPVlaSftWorker._add_dim_stats(
+            metrics, "sft_diag/actions", actions, action_names
+        )
+
+        action_array = FSDPVlaSftWorker._to_numpy(actions)
+        if action_array is not None and action_array.shape[-1] >= 7:
+            gripper = action_array[..., 6].reshape(-1)
+            metrics["sft_diag/gripper_mean"] = float(gripper.mean())
+            metrics["sft_diag/gripper_min"] = float(gripper.min())
+            metrics["sft_diag/gripper_max"] = float(gripper.max())
+            metrics["sft_diag/gripper_open_frac_gt_0_5"] = float((gripper > 0.5).mean())
+            metrics["sft_diag/gripper_close_frac_lt_0"] = float((gripper < 0.0).mean())
+
+        image_mask = getattr(observation, "image_mask", None)
+        if isinstance(image_mask, dict):
+            for name, value in image_mask.items():
+                mask = FSDPVlaSftWorker._to_numpy(value)
+                if mask is not None:
+                    metrics[f"sft_diag/image_mask/{name}"] = float(mask.mean())
+        return metrics
 
     def build_dataloader(self, data_paths: Any, eval_dataset: bool = False):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
@@ -92,6 +172,11 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             loss = output["loss"]
 
         step_metrics = {"loss": loss.detach().item()}
+        if (
+            self._sft_diag_interval > 0
+            and self.global_step % self._sft_diag_interval == 0
+        ):
+            step_metrics.update(self._collect_openpi_batch_diagnostics(batch))
         if isinstance(output, dict) and output.get("dynamics_loss", None) is not None:
             step_metrics.update(
                 {
@@ -103,6 +188,36 @@ class FSDPVlaSftWorker(FSDPSftWorker):
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         super().save_checkpoint(save_path, step)
+
+        # OpenPI checkpoints need norm_stats.json colocated with model weights so
+        # downstream rollout/eval can load it via load_norm_stats(ckpt_dir, asset_id).
+        # FSDP only shards model/optimizer state, so copy norm_stats.json from the
+        # base model directory into the checkpoint.
+        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.OPENPI:
+            if self._rank == 0:
+                import glob
+                import shutil
+
+                asset_id = getattr(self.data_config, "asset_id", None)
+                model_path = self.cfg.actor.model.model_path
+                src_norm_stats = None
+                if asset_id is not None:
+                    candidate = os.path.join(model_path, asset_id, "norm_stats.json")
+                    if os.path.exists(candidate):
+                        src_norm_stats = candidate
+                if src_norm_stats is None:
+                    matches = sorted(glob.glob(os.path.join(model_path, "**", "norm_stats.json"), recursive=True))
+                    if matches:
+                        src_norm_stats = matches[0]
+                if src_norm_stats is not None and asset_id is not None:
+                    dst_dir = os.path.join(save_path, asset_id)
+                    os.makedirs(dst_dir, exist_ok=True)
+                    dst_norm_stats = os.path.join(dst_dir, "norm_stats.json")
+                    shutil.copy2(src_norm_stats, dst_norm_stats)
+                    logging.info(f"Copied norm_stats.json from {src_norm_stats} to {dst_norm_stats}")
+                else:
+                    logging.warning(f"Could not find norm_stats.json under model_path={model_path} with asset_id={asset_id}; rollout/eval will fail to load norm stats.")
+            torch.distributed.barrier()
 
         if isinstance(self.data_loader, StatefulDataLoader):
             state = self.data_loader.state_dict()
@@ -122,6 +237,19 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 torch.save(all_rng_states, os.path.join(save_path, "rng.pt"))
 
             torch.distributed.barrier()
+        elif SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.OPENPI:
+            # OpenPI wraps a regular torch DataLoader rather than a
+            # StatefulDataLoader. Persist its logical cursor so resumed runs do
+            # not restart sampling at the beginning of the epoch.
+            if self._rank == 0:
+                torch.save(
+                    {
+                        "data_epoch": self._data_epoch,
+                        "data_iter_offset": self._data_iter_offset,
+                    },
+                    os.path.join(save_path, "data_progress.pt"),
+                )
+            torch.distributed.barrier()
 
     def load_checkpoint(self, load_path: str) -> None:
         super().load_checkpoint(load_path)
@@ -139,6 +267,45 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 all_rng_states = torch.load(rng_path, weights_only=False)
                 set_rng_state(all_rng_states[self._rank])
 
+            torch.distributed.barrier()
+        elif SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.OPENPI:
+            progress_path = os.path.join(load_path, "data_progress.pt")
+            batches_per_epoch = len(self._openpi_pytorch_dataloader(self.data_loader))
+            if os.path.exists(progress_path):
+                progress = torch.load(progress_path, weights_only=False)
+                self._data_epoch = int(progress["data_epoch"])
+                self._data_iter_offset = int(progress["data_iter_offset"])
+            else:
+                # Backward compatibility for checkpoints created before the
+                # OpenPI cursor was persisted. One runner step consumes one
+                # batch per gradient-accumulation iteration.
+                step_dir = os.path.basename(os.path.dirname(load_path.rstrip(os.sep)))
+                if not step_dir.startswith("global_step_"):
+                    raise ValueError(
+                        f"Cannot infer OpenPI data progress from checkpoint path: {load_path}"
+                    )
+                checkpoint_step = int(step_dir.removeprefix("global_step_"))
+                consumed_batches = checkpoint_step * self.gradient_accumulation
+                self._data_epoch, self._data_iter_offset = divmod(
+                    consumed_batches, batches_per_epoch
+                )
+                logging.warning(
+                    "Checkpoint has no data_progress.pt; inferred OpenPI data "
+                    "cursor from global step: epoch=%d, offset=%d",
+                    self._data_epoch,
+                    self._data_iter_offset,
+                )
+
+            forward_set_epoch(self.data_loader, self._data_epoch)
+            self.data_iter = iter(self.data_loader)
+            for _ in range(self._data_iter_offset):
+                next(self.data_iter)
+            logging.info(
+                "Restored OpenPI data cursor: epoch=%d, offset=%d/%d",
+                self._data_epoch,
+                self._data_iter_offset,
+                batches_per_epoch,
+            )
             torch.distributed.barrier()
 
     def get_max_steps_per_epoch(self):

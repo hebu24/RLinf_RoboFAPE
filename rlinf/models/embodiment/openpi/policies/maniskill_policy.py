@@ -78,6 +78,20 @@ class ManiSkillInputs(transforms.DataTransformFn):
             wrist_image = np.zeros_like(base_image)
             wrist_image_mask = np.False_
 
+        # Back-facing wrist camera -> the model's right_wrist_0_rgb slot. Absent
+        # (single-wrist data/configs) falls back to zero-pad + mask=False, exactly
+        # the previous behavior, so old single-wrist checkpoints stay compatible.
+        back_wrist_image = data.get("observation/wrist_image_back")
+        if back_wrist_image is not None:
+            back_wrist_image = np.asarray(back_wrist_image)
+            if back_wrist_image.ndim == 4:
+                back_wrist_image = back_wrist_image[0]
+            back_wrist_image = _parse_image(back_wrist_image)
+            back_wrist_image_mask = np.True_
+        else:
+            back_wrist_image = np.zeros_like(base_image)
+            back_wrist_image_mask = np.False_
+
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
             "state": data["observation/state"],
@@ -85,13 +99,13 @@ class ManiSkillInputs(transforms.DataTransformFn):
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
                 # Pad any non-existent images with zero-arrays of the appropriate shape.
-                "right_wrist_0_rgb": np.zeros_like(base_image),
+                "right_wrist_0_rgb": back_wrist_image,
                 # Pad any non-existent images with zero-arrays of the appropriate shape.
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": wrist_image_mask,
-                "right_wrist_0_rgb": np.False_,
+                "right_wrist_0_rgb": back_wrist_image_mask,
             },
         }
 

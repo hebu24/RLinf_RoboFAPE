@@ -25,8 +25,50 @@ from mani_skill.utils.structs.types import Array
 from mani_skill.utils.visualization.misc import put_info_on_image, tile_images
 from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
+from rlinf.utils.logging import get_logger
 
 __all__ = ["ManiskillEnv"]
+
+_logger = get_logger()
+
+
+def _arm_controller(env):
+    """Return the arm sub-controller of a ManiSkill agent's combined controller."""
+    controller = env.unwrapped.agent.controller
+    if hasattr(controller, "controllers"):
+        return controller.controllers.get("arm", controller)
+    return controller
+
+
+def _sync_target_delta_pose_controller(env) -> None:
+    """Re-anchor the target-delta controller's ``_target_pose`` to the actual EE pose.
+
+    With ``use_target=True`` (``pd_ee_target_delta_pose``), the controller open-loop
+    integrates each action delta onto ``_target_pose`` (the previous *commanded* target)
+    rather than the actual end-effector pose. Over a long eval episode this lets IK/PD
+    tracking error and model error compound on the target and drift away from the real
+    EE, which the policy never observes. Re-anchoring the target to the actual EE once
+    per action chunk closes that loop while preserving within-chunk target chaining.
+
+    No-op for controllers without ``use_target`` / ``_target_pose``.
+    """
+    arm_controller = _arm_controller(env)
+    config = getattr(arm_controller, "config", None)
+    if not bool(getattr(config, "use_target", False)) or not hasattr(
+        arm_controller, "_target_pose"
+    ):
+        return
+    prev_target = arm_controller._target_pose
+    actual = arm_controller.ee_pose_at_base
+    if prev_target is not None:
+        drift = (prev_target.p - actual.p).norm(dim=-1).max().item()
+        if drift > 1e-3:
+            _logger.debug(
+                "pd_ee_target_delta_pose: re-anchoring _target_pose to actual EE "
+                "(max pos drift = %.5f m)",
+                drift,
+            )
+    arm_controller._target_pose = actual
 
 
 def extract_termination_from_info(info, num_envs, device):
@@ -61,6 +103,13 @@ class ManiskillEnv(gym.Env):
         self.use_rel_reward = cfg.use_rel_reward
         self.ignore_terminations = cfg.ignore_terminations
         self.use_full_state = bool(getattr(cfg, "use_full_state", False))
+        # Re-anchor the pd_ee_target_delta_pose controller's _target_pose to the actual
+        # EE pose once per action chunk (see _sync_target_delta_pose_controller). This
+        # prevents the open-loop target from drifting away from the real EE over a long
+        # eval episode. Toggle off to reproduce the legacy drifting behavior.
+        self.sync_target_pose_per_chunk = bool(
+            getattr(cfg, "sync_target_pose_per_chunk", True)
+        )
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
@@ -183,7 +232,25 @@ class ManiskillEnv(gym.Env):
 
                 main_images = sensor_data["base_camera"]["rgb"]
                 sorted_images = OrderedDict(sorted(sensor_data.items()))
-                sorted_images.pop("base_camera")
+                sorted_images.pop("base_camera", None)
+                wrist_images = None
+                if bool(getattr(self.cfg, "use_wrist_image", False)) and (
+                    "hand_camera" in sorted_images
+                ):
+                    wrist_images = sorted_images.pop("hand_camera")["rgb"]
+                else:
+                    sorted_images.pop("hand_camera", None)
+                # Back-facing wrist camera (eye-in-hand). Routed to its own named
+                # channel (not the catch-all extra_view_images) so it maps cleanly
+                # onto the model's right_wrist_0_rgb slot. Enabled by
+                # cfg.use_wrist_back_image; absent sensors / disabled flag -> None.
+                wrist_back_images = None
+                if bool(getattr(self.cfg, "use_wrist_back_image", False)) and (
+                    "hand_camera_back" in sorted_images
+                ):
+                    wrist_back_images = sorted_images.pop("hand_camera_back")["rgb"]
+                else:
+                    sorted_images.pop("hand_camera_back", None)
                 extra_view_images = (
                     torch.stack([v["rgb"] for v in sorted_images.values()], dim=1)
                     if sorted_images
@@ -192,7 +259,8 @@ class ManiskillEnv(gym.Env):
                 return {
                     "main_images": main_images,
                     "extra_view_images": extra_view_images,
-                    "wrist_images": None,
+                    "wrist_images": wrist_images,
+                    "wrist_back_images": wrist_back_images,
                     "states": state,
                     "task_descriptions": self.instruction,
                 }
@@ -257,6 +325,9 @@ class ManiskillEnv(gym.Env):
         self.returns = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.float32
         )
+        self.max_rewards = torch.full(
+            (self.num_envs,), -float("inf"), device=self.device, dtype=torch.float32
+        )
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -267,16 +338,19 @@ class ManiskillEnv(gym.Env):
                 self.success_once[mask] = False
                 self.fail_once[mask] = False
                 self.returns[mask] = 0
+                self.max_rewards[mask] = -float("inf")
         else:
             self.prev_step_reward[:] = 0
             if self.record_metrics:
                 self.success_once[:] = False
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
+                self.max_rewards[:] = -float("inf")
 
     def _record_metrics(self, step_reward, infos):
         episode_info = {}
         self.returns += step_reward
+        self.max_rewards = torch.maximum(self.max_rewards, step_reward)
         if "success" in infos:
             self.success_once = self.success_once | infos["success"]
             episode_info["success_once"] = self.success_once.clone()
@@ -286,6 +360,7 @@ class ManiskillEnv(gym.Env):
         episode_info["return"] = self.returns.clone()
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        episode_info["max_reward"] = self.max_rewards.clone()
         infos["episode"] = episode_info
         return infos
 
@@ -350,6 +425,11 @@ class ManiskillEnv(gym.Env):
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
+        if self.sync_target_pose_per_chunk:
+            # Re-anchor the target-delta controller to the actual EE before executing a
+            # fresh model-predicted chunk, so deltas integrate from the state the policy
+            # was conditioned on instead of a stale commanded target.
+            _sync_target_delta_pose_controller(self.env)
         obs_list = []
         infos_list = []
         chunk_rewards = []
@@ -424,23 +504,37 @@ class ManiskillEnv(gym.Env):
 
     # render utils
     def capture_image(self, infos=None):
-        img = self.env.render()
-        img = common.to_numpy(img)
-        if len(img.shape) == 3:
-            img = img[None]
+        raw_obs = self.env.unwrapped.get_obs()
+        sensor_data = raw_obs["sensor_data"]
+        base_img = common.to_numpy(sensor_data["base_camera"]["rgb"])
+        wrist_img = None
+        if bool(getattr(self.cfg, "use_wrist_image", False)) and "hand_camera" in sensor_data:
+            wrist_img = common.to_numpy(sensor_data["hand_camera"]["rgb"])
+
+        if len(base_img.shape) == 3:
+            base_img = base_img[None]
+        if wrist_img is not None and len(wrist_img.shape) == 3:
+            wrist_img = wrist_img[None]
+
+        frames = []
+        for i in range(len(base_img)):
+            frame = base_img[i]
+            if wrist_img is not None:
+                if wrist_img.shape[0] > i:
+                    frame = np.concatenate([frame, wrist_img[i]], axis=1)
+                else:
+                    frame = np.concatenate([frame, wrist_img[0]], axis=1)
+            frames.append(frame)
 
         if infos is not None:
-            for i in range(len(img)):
+            for i in range(len(frames)):
                 info_item = {
                     k: v if np.size(v) == 1 else v[i] for k, v in infos.items()
                 }
-                img[i] = put_info_on_image(img[i], info_item)
-        if len(img.shape) > 3:
-            if len(img) == 1:
-                img = img[0]
-            else:
-                img = tile_images(img, nrows=int(np.sqrt(self.num_envs)))
-        return img
+                frames[i] = put_info_on_image(frames[i], info_item)
+        if len(frames) > 1:
+            return tile_images(frames, nrows=int(np.sqrt(self.num_envs)))
+        return frames[0]
 
     def render(self, info, rew=None):
         if self.video_cfg.info_on_video:

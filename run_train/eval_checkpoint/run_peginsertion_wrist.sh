@@ -6,29 +6,28 @@ REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Edit these values directly, or override them with environment variables.
 VENV_DIR="${VENV_DIR:-/data/yingxi/kairan/envs/rlinf}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/opt/yingxi/rlinf/RLinf-Pi05-ManiSkill-25Main-RL-FlowNoise/checkpoints/global_step_150/actor}"
-CONFIG_DIR="${CONFIG_DIR:-${REPO_PATH}/run_train/test_maniskill_pi0.5/config}"
-CONFIG_NAME="${CONFIG_NAME:-maniskill_ppo_openpi_pi05}"
-TASK_ID="${TASK_ID:-PutOnPlateInScene25Main-v3}"
-# Set OBJ_SET='' for tasks whose constructor does not accept obj_set.
-OBJ_SET="${OBJ_SET-train}"
-TASK_DESCRIPTION="${TASK_DESCRIPTION:-}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
+CONFIG_DIR="${CONFIG_DIR:-${REPO_PATH}/run_train/peginsertion_maniskill_pi0.5/config}"
+CONFIG_NAME="${CONFIG_NAME:-maniskill_peg_insertion_vertical_wrist_sft_eval_openpi_pi05_insert_only}"
+TASK_ID="${TASK_ID:-PegInsertionVertical-v1}"
+OBJ_SET="${OBJ_SET:-}"
+TASK_DESCRIPTION="${TASK_DESCRIPTION:-transport and insert the grasped peg into the hole}"
 
 # NUM_EVAL_EPISODES is the exact trajectory count and must be divisible by NUM_ENVS.
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-25}"
-NUM_ENVS="${NUM_ENVS:-25}"
-MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-80}"
+NUM_ENVS="${NUM_ENVS:-5}"
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-200}"
 SEED="${SEED:-0}"
-GPU_IDS="${GPU_IDS:-1}"
+GPU_IDS="${GPU_IDS:-0}"
 
 SAVE_VIDEO="${SAVE_VIDEO:-true}"
 IGNORE_TERMINATIONS="${IGNORE_TERMINATIONS:-true}"
-FIXED_RESET_STATE_IDS="${FIXED_RESET_STATE_IDS:-true}"
+FIXED_RESET_STATE_IDS="${FIXED_RESET_STATE_IDS:-false}"
 OBS_MODE="${OBS_MODE:-}"
 CONTROL_MODE="${CONTROL_MODE:-}"
 SIM_BACKEND="${SIM_BACKEND:-}"
-# Extra task constructor arguments, for example: {"use_multiple_plates": false}
 INIT_PARAMS_JSON="${INIT_PARAMS_JSON:-{}}"
+EVAL_ACTION_SCALE="${EVAL_ACTION_SCALE:-1.0}"
 
 PYTHON_BIN="${VENV_DIR}/bin/python"
 RAY_BIN="${VENV_DIR}/bin/ray"
@@ -36,8 +35,17 @@ if [[ ! -x "${PYTHON_BIN}" || ! -x "${RAY_BIN}" ]]; then
   echo "Missing Python or Ray in ${VENV_DIR}." >&2
   exit 1
 fi
+if [[ -z "${CHECKPOINT_PATH}" ]]; then
+  echo "Set CHECKPOINT_PATH to the actor checkpoint you want to evaluate." >&2
+  exit 1
+fi
 if [[ ! -e "${CHECKPOINT_PATH}" ]]; then
   echo "Checkpoint does not exist: ${CHECKPOINT_PATH}" >&2
+  exit 1
+fi
+if [[ "$(basename "${CHECKPOINT_PATH}")" == "checkpoints" ]]; then
+  echo "CHECKPOINT_PATH must point to one global_step_<N>/actor directory, not the checkpoints root." >&2
+  echo "Use sweep_peginsertion_wrist.py --checkpoint-dir ${CHECKPOINT_PATH} to evaluate all steps." >&2
   exit 1
 fi
 if ! "${PYTHON_BIN}" -c "import openpi" >/dev/null 2>&1; then
@@ -52,8 +60,9 @@ export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
 export HYDRA_FULL_ERROR=1
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 
-# RLinf placement uses physical GPU IDs, so Ray must discover all GPUs.
-unset CUDA_VISIBLE_DEVICES
+# Raise fd limit so raylet can manage many worker connections on multi-GPU runs.
+ulimit -n 1048576 2>/dev/null || true
+
 # Eval runs on its OWN Ray cluster on EVAL_RAY_PORT (default 6380), isolated from
 # SFT training (which uses 6379). Never a bare `ray stop` (that kills ALL ray on the
 # host, incl. SFT); teardown is scoped to EVAL_RAY_PORT only.
@@ -78,7 +87,7 @@ if [[ "${MANAGE_RAY}" == "true" ]]; then
   if RAY_ADDRESS="127.0.0.1:${EVAL_RAY_PORT}" "${RAY_BIN}" status >/dev/null 2>&1; then
     echo "Reusing the eval Ray cluster on port ${EVAL_RAY_PORT}; will not stop it."
   else
-    RAY_TMP_DIR="${RAY_TMP_DIR:-${REPO_PATH}/logs/ray_tmp}"
+    RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray_eval_wrist}"
     mkdir -p "${RAY_TMP_DIR}"
     unset CUDA_VISIBLE_DEVICES   # so the head's raylet registers all GPUs
     _eval_scoped_ray_kill         # clear stale eval head on this port only
@@ -101,15 +110,16 @@ CMD=(
   --log-dir "${LOG_DIR}"
   --task-id "${TASK_ID}"
   --obj-set "${OBJ_SET}"
+  --task-description "${TASK_DESCRIPTION}"
   --num-eval-episodes "${NUM_EVAL_EPISODES}"
   --num-envs "${NUM_ENVS}"
   --max-episode-steps "${MAX_EPISODE_STEPS}"
   --seed "${SEED}"
   --gpu-ids "${GPU_IDS}"
   --init-params-json "${INIT_PARAMS_JSON}"
+  --action-scale "${EVAL_ACTION_SCALE}"
 )
 
-[[ -n "${TASK_DESCRIPTION}" ]] && CMD+=(--task-description "${TASK_DESCRIPTION}")
 [[ -n "${OBS_MODE}" ]] && CMD+=(--obs-mode "${OBS_MODE}")
 [[ -n "${CONTROL_MODE}" ]] && CMD+=(--control-mode "${CONTROL_MODE}")
 [[ -n "${SIM_BACKEND}" ]] && CMD+=(--sim-backend "${SIM_BACKEND}")

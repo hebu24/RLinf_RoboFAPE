@@ -1,5 +1,4 @@
 # AGENTS.md
-RAY ISOLATION (concurrent SFT+eval on one host): see RAY_ISOLATION.md — never bare "ray stop"; per-cluster distinct GCS port + dashboard-agent-listen-port + temp-dir; disjoint GPUs.
 
 Brief for AI coding agents working on **RLinf embodied RL**. This file is scoped to robot/VLA reinforcement learning, especially ManiSkill + OpenPI pi0.5. For general contribution rules, code style, and PR process see [CONTRIBUTING.md](CONTRIBUTING.md).
 

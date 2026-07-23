@@ -16,9 +16,11 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
+import ray
 import torch.multiprocessing as mp
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -26,6 +28,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from rlinf.config import validate_cfg
 from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
 from rlinf.scheduler import Cluster
+from rlinf.utils.metric_utils import compute_evaluate_metrics
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -54,6 +57,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--control-mode")
     parser.add_argument("--sim-backend")
     parser.add_argument("--init-params-json", default="{}")
+    parser.add_argument("--action-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--save-episode-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--save-video", action=argparse.BooleanOptionalAction, default=True
     )
@@ -86,6 +95,84 @@ def _load_init_params(raw_value: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("--init-params-json must contain a JSON object")
     return value
+
+
+def _validate_peg_insertion_eval_cfg(cfg: DictConfig, task_id: str) -> None:
+    if task_id != "PegInsertionVertical-v1":
+        return
+    wrap_obs_mode = cfg.env.eval.get("wrap_obs_mode", None)
+    if wrap_obs_mode != "simple":
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation must use "
+            "env.eval.wrap_obs_mode=simple so the policy receives base_camera "
+            "images and aligned pi0.5 proprio. Use the peg-insertion config "
+            "run_train/peginsertion_maniskill_pi0.5/config/"
+            "maniskill_peg_insertion_vertical_wrist_sft_eval_openpi_pi05_insert_only.yaml "
+            "instead of a generic ManiSkill config."
+        )
+    model_cfg = cfg.rollout.model
+    openpi_cfg = model_cfg.get("openpi", {})
+    config_name = openpi_cfg.get("config_name", None)
+    config_profiles = {
+        "pi05_maniskill_peg_insertion_wrist": (2, True, False),
+    }
+    if config_name not in config_profiles:
+        expected_config_names = ", ".join(sorted(config_profiles))
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation must use the peg-insertion "
+            "OpenPI config used by SFT. Expected rollout.model.openpi.config_name "
+            f"to be one of {expected_config_names}, got {config_name!r}. "
+            "Do not evaluate a peg-insertion SFT checkpoint with generic "
+            "pi05_maniskill transforms/norm stats."
+        )
+    expected_images, expected_wrist, expected_wrist_back = config_profiles[config_name]
+    num_images = int(openpi_cfg.get("num_images_in_input", -1))
+    if num_images != expected_images:
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation image count does not match "
+            f"{config_name}: expected num_images_in_input={expected_images}, "
+            f"got {num_images}."
+        )
+    use_wrist_image = bool(cfg.env.eval.get("use_wrist_image", False))
+    if use_wrist_image != expected_wrist:
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation wrist image routing does not "
+            f"match {config_name}: expected env.eval.use_wrist_image={expected_wrist}, "
+            f"got {use_wrist_image}."
+        )
+    use_wrist_back_image = bool(cfg.env.eval.get("use_wrist_back_image", False))
+    if use_wrist_back_image != expected_wrist_back:
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation back-wrist image routing does not "
+            f"match {config_name}: expected "
+            f"env.eval.use_wrist_back_image={expected_wrist_back}, got "
+            f"{use_wrist_back_image}."
+        )
+    num_action_chunks = int(model_cfg.get("num_action_chunks", -1))
+    action_horizon = int(openpi_cfg.get("action_horizon", num_action_chunks))
+    if num_action_chunks != 10 or action_horizon != 10:
+        raise ValueError(
+            "PegInsertionVertical-v1 SFT uses 10-step action chunks. Expected "
+            "rollout.model.num_action_chunks=10 and "
+            f"rollout.model.openpi.action_horizon=10, got {num_action_chunks} "
+            f"and {action_horizon}."
+        )
+    policy_setup = str(model_cfg.get("policy_setup", ""))
+    if policy_setup != "panda-ee-target-dpose":
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation must use "
+            "rollout.model.policy_setup=panda-ee-target-dpose (use_target=True, "
+            "target-delta labels) so physical TCP actions are converted for "
+            "the ManiSkill pd_ee_target_delta_pose controller. "
+            f"Got {policy_setup!r}."
+        )
+    control_mode = str(cfg.env.eval.init_params.get("control_mode", ""))
+    if control_mode != "pd_ee_target_delta_pose":
+        raise ValueError(
+            "PegInsertionVertical-v1 evaluation must use "
+            "env.eval.init_params.control_mode=pd_ee_target_delta_pose. "
+            f"Got {control_mode!r}."
+        )
 
 
 def build_config(args: argparse.Namespace, hydra_overrides: list[str]) -> DictConfig:
@@ -141,6 +228,7 @@ def build_config(args: argparse.Namespace, hydra_overrides: list[str]) -> DictCo
         cfg.env.eval.seed = args.seed
         cfg.env.eval.max_episode_steps = args.max_episode_steps
         cfg.env.eval.max_steps_per_rollout_epoch = args.max_episode_steps
+        cfg.env.eval.action_scale = args.action_scale
         cfg.env.eval.video_cfg.save_video = args.save_video
         cfg.env.eval.video_cfg.video_base_dir = str(
             Path(args.log_dir).expanduser().resolve() / "video" / "eval"
@@ -174,6 +262,7 @@ def build_config(args: argparse.Namespace, hydra_overrides: list[str]) -> DictCo
         # validate_cfg derives a mode from policy_setup; an explicit CLI value wins.
         with open_dict(cfg):
             cfg.env.eval.init_params.control_mode = args.control_mode
+    _validate_peg_insertion_eval_cfg(cfg, args.task_id)
     return cfg
 
 
@@ -183,27 +272,108 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _run_eval(cfg: DictConfig) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    rollout_group = None
+    env_group = None
+    runner = None
+    try:
+        cluster = Cluster(cluster_cfg=cfg.cluster)
+        placement = HybridComponentPlacement(cfg, cluster)
+        rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
+            cluster,
+            name=cfg.rollout.group_name,
+            placement_strategy=placement.get_strategy("rollout"),
+        )
+        env_group = EnvWorker.create_group(cfg).launch(
+            cluster,
+            name=cfg.env.group_name,
+            placement_strategy=placement.get_strategy("env"),
+        )
+        runner = EmbodiedEvalRunner(cfg=cfg, rollout=rollout_group, env=env_group)
+        runner.init_workers()
+        env_handle = runner.env.evaluate(
+            input_channel=runner.env_channel,
+            rollout_channel=runner.rollout_channel,
+        )
+        rollout_handle = runner.rollout.evaluate(
+            input_channel=runner.rollout_channel,
+            output_channel=runner.env_channel,
+        )
+        env_results = env_handle.wait()
+        env_decoupled_mode = cfg.runner.get("enable_decoupled_mode", False)
+        if not env_decoupled_mode:
+            rollout_handle.wait()
+        eval_metrics_list = [results for results in env_results if results is not None]
+        metrics = {
+            key: _json_value(value)
+            for key, value in compute_evaluate_metrics(eval_metrics_list).items()
+        }
+        prefixed_metrics = {f"eval/{key}": value for key, value in metrics.items()}
+        runner.logger.info(prefixed_metrics)
+        runner.metric_logger.log(step=0, data=prefixed_metrics)
+        return metrics, eval_metrics_list
+    finally:
+        if runner is not None:
+            runner.metric_logger.finish()
+        if env_group is not None:
+            env_group.close()
+        if rollout_group is not None:
+            rollout_group.close()
+        if runner is not None:
+            runner.env_channel.close()
+            runner.rollout_channel.close()
+        if ray.is_initialized():
+            # Only shut down if this process started the Ray cluster.
+            # If Ray was already running before we connected (address="auto"),
+            # shutting down would kill the shared training cluster.
+            _driver_started_ray = os.environ.get("RLINF_EVAL_STARTED_RAY", "") == "1"
+            if _driver_started_ray:
+                ray.shutdown()
+
+
+def _serialize_episode_metrics(
+    eval_metrics_list: list[dict[str, Any]],
+) -> dict[str, Any]:
+    episode_metrics: dict[str, Any] = {}
+    for key in ("success_once", "return", "reward", "max_reward", "episode_len"):
+        shards = [metrics[key] for metrics in eval_metrics_list if key in metrics]
+        if not shards:
+            continue
+        values = []
+        for shard in shards:
+            if hasattr(shard, "detach"):
+                shard = shard.detach().cpu()
+            if hasattr(shard, "reshape"):
+                shard = shard.reshape(-1)
+            if hasattr(shard, "tolist"):
+                values.extend(shard.tolist())
+            else:
+                values.append(shard)
+        episode_metrics[key] = values
+    episode_metrics["num_trajectories"] = (
+        len(episode_metrics.get("return", []))
+        or len(episode_metrics.get("reward", []))
+        or len(episode_metrics.get("success_once", []))
+    )
+    return episode_metrics
+
+
 def evaluate(cfg: DictConfig) -> dict[str, Any]:
-    cluster = Cluster(cluster_cfg=cfg.cluster)
-    placement = HybridComponentPlacement(cfg, cluster)
-    rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
-        cluster,
-        name=cfg.rollout.group_name,
-        placement_strategy=placement.get_strategy("rollout"),
-    )
-    env_group = EnvWorker.create_group(cfg).launch(
-        cluster,
-        name=cfg.env.group_name,
-        placement_strategy=placement.get_strategy("env"),
-    )
-    runner = EmbodiedEvalRunner(cfg=cfg, rollout=rollout_group, env=env_group)
-    runner.init_workers()
-    metrics = {key: _json_value(value) for key, value in runner.evaluate().items()}
-    prefixed_metrics = {f"eval/{key}": value for key, value in metrics.items()}
-    runner.logger.info(prefixed_metrics)
-    runner.metric_logger.log(step=0, data=prefixed_metrics)
-    runner.metric_logger.finish()
+    metrics, _ = _run_eval(cfg)
     return metrics
+
+
+def save_episode_metrics(
+    eval_metrics_list: list[dict[str, Any]],
+    log_dir: Path,
+) -> Path:
+    episode_metrics = _serialize_episode_metrics(eval_metrics_list)
+    episode_metrics_path = log_dir / "trajectory_metrics.json"
+    episode_metrics_path.write_text(
+        json.dumps(episode_metrics, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return episode_metrics_path
 
 
 def main() -> None:
@@ -212,7 +382,12 @@ def main() -> None:
     resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
     print(json.dumps(resolved_cfg, indent=2))
 
-    metrics = evaluate(cfg)
+    metrics, eval_metrics_list = _run_eval(cfg)
+    if args.save_episode_metrics:
+        episode_metrics_path = save_episode_metrics(
+            eval_metrics_list, Path(cfg.runner.logger.log_path)
+        )
+        print(f"Episode metrics: {episode_metrics_path}")
     summary = {
         "checkpoint_path": str(Path(args.checkpoint_path).expanduser().resolve()),
         "task_id": args.task_id,

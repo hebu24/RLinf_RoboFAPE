@@ -2,10 +2,16 @@ env_type: maniskill
 
 total_num_envs: null
 wrap_obs_mode: simple
+use_wrist_image: False
+use_wrist_back_image: False
 auto_reset: True
 ignore_terminations: False
 use_rel_reward: False
+# Re-anchor the pd_ee_target_delta_pose controller's _target_pose to the actual EE pose
+# once per action chunk during eval, preventing open-loop target drift into OOD.
+sync_target_pose_per_chunk: True
 reward_mode: raw
+action_scale: 1.0
 seed: 0
 group_size: 1
 use_fixed_reset_state_ids: False
@@ -35,5 +41,8 @@ init_params:
   sensor_configs:
     shader_pack: "default"
     hand_camera:
+      width: 224
+      height: 224
+    hand_camera_back:
       width: 224
       height: 224

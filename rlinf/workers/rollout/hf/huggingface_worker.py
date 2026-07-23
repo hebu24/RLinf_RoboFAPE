@@ -101,9 +101,17 @@ class MultiStepRolloutWorker(Worker):
         )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
+            # Match env_worker: real-time chunking executes the first
+            # env.eval.execute_action_chunks (k) actions per query (default =
+            # num_action_chunks). The worker still predicts the full
+            # [B, num_action_chunks, D] chunk; the env worker slices/blends it.
+            eval_execute_chunks = int(
+                cfg.env.eval.get(
+                    "execute_action_chunks", self.model_cfg.num_action_chunks
+                )
+            )
             self.n_eval_chunk_steps = (
-                cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                cfg.env.eval.max_steps_per_rollout_epoch // eval_execute_chunks
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0

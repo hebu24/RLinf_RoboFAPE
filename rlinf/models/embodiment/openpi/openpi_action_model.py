@@ -66,6 +66,9 @@ class OpenPi0Config(Pi0Config):
     joint_logprob: bool = False  # designed for flow-noise
     double_layer: bool = False  # designed for flow-sde without acceleration
     ignore_last: bool = False  # ignore the last action for noise injection
+    # Insert-only eval: gripper is constant (-1) so its flow-matching target is
+    # pure noise; mask it out of the SFT loss so only the 6 real action dims train.
+    mask_gripper_loss: bool = False
     # critic
     detach_critic_input: bool = False  # detach critic input with the action expert
     chunk_critic_input: bool = False  # use only the action chunk for critic estimation
@@ -364,6 +367,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         loss = super().forward(observation, actions)
         if use_action_chunk_loss:
             loss = loss[:, : self.config.action_chunk, : self.config.action_env_dim]
+        # OpenPI pads actions to the model action_dim (typically 32), while the
+        # environment gripper is at action_env_dim - 1. Mask exactly that channel
+        # and retain the padded-action objective and loss scale used by OpenPI.
+        if getattr(self.config, "mask_gripper_loss", False):
+            gripper_index = self.config.action_env_dim - 1
+            loss = loss.clone()
+            loss[..., gripper_index] = 0.0
+            return loss.sum() / (loss.numel() - loss.shape[0] * loss.shape[1])
         return loss.mean()
 
     def prepare_dagger_sft_batch(self, batch):
@@ -514,6 +525,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
         if env_obs["extra_view_images"] is not None:
             processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
+        wrist_back_images = env_obs.get("wrist_back_images")
+        if wrist_back_images is not None:
+            processed_obs["observation/wrist_image_back"] = wrist_back_images
         return processed_obs
 
     def precision_processor(self, processed_obs):

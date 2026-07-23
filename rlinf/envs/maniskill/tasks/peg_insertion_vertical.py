@@ -26,7 +26,11 @@ from mani_skill.utils.geometry import rotation_conversions
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import SimConfig
-from transforms3d.euler import euler2quat, mat2euler
+from transforms3d.euler import euler2quat
+
+from rlinf.envs.maniskill.peg_insertion_pi05 import (
+    aligned_pi05_state_from_tcp_matrices,
+)
 
 
 def _build_vertical_box_with_hole(
@@ -77,13 +81,14 @@ def _build_table_plane(
         half_size=[half_sizes[0], half_sizes[1]],
         mat=mat,
     )
+    builder.initial_pose = sapien.Pose()
     return builder.build_static(name=name)
 
 
 def _external_camera_pose():
     return sapien.Pose(
-        p=[0.705400, -0.086655, 0.686691],
-        q=[0.025112, -0.237384, -0.033640, 0.970508],
+        p=[0.60, -0.05, 0.55],
+        q=[0.03978504, -0.28877059, 0.01201129, 0.95649594],
     )
 
 
@@ -93,6 +98,12 @@ def _with_wrist_camera_sensor_config(sensor_configs):
     hand_camera.setdefault("width", 224)
     hand_camera.setdefault("height", 224)
     merged["hand_camera"] = hand_camera
+    # Back-facing wrist camera shares the front wrist resolution so the model's
+    # left/right_wrist_0_rgb image slots have matching shapes.
+    hand_camera_back = dict(merged.get("hand_camera_back", {}))
+    hand_camera_back.setdefault("width", 224)
+    hand_camera_back.setdefault("height", 224)
+    merged["hand_camera_back"] = hand_camera_back
     return merged
 
 
@@ -139,16 +150,16 @@ class PegInsertionVerticalEnv(BaseEnv):
     )
     hole_xy_randomization_bounds = np.array(
         [
-            [-0.12, 0.12],
-            [-0.12, 0.12],
+            [-0.02, 0.02],
+            [-0.02, 0.02],
         ],
         dtype=np.float32,
     )
-    peg_relative_hole_radius_bounds = np.array([0.17, 0.30], dtype=np.float32)
+    peg_relative_hole_radius_bounds = np.array([0.17, 0.20], dtype=np.float32)
     peg_xy_randomization_bounds = np.array(
         [
-            [-0.30, 0.15],
-            [-0.30, 0.30],
+            [-0.20, 0.20],
+            [-0.20, 0.20],
         ],
         dtype=np.float32,
     )
@@ -165,6 +176,10 @@ class PegInsertionVerticalEnv(BaseEnv):
         self.obj_set = obj_set
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.render_randomization_spec = render_randomization_spec
+        # Insert-only eval: a PegInsertionLiftPlanner registered via
+        # set_lift_planner(). Must be set before super().__init__ since
+        # BaseEnv construction may trigger an early _initialize_episode.
+        self._lift_planner = None
         if robot_uids == "panda_wristcam":
             kwargs["sensor_configs"] = _with_wrist_camera_sensor_config(
                 kwargs.get("sensor_configs")
@@ -177,11 +192,30 @@ class PegInsertionVerticalEnv(BaseEnv):
 
     @property
     def _default_sensor_configs(self):
-        return [
+        configs = [
             CameraConfig(
-                "base_camera", _external_camera_pose(), 224, 224, 1.0, 0.01, 100
+                "base_camera", _external_camera_pose(), 224, 224, 0.6, 0.01, 100
             )
         ]
+        # Back-facing wrist camera (eye-in-hand): mounted on the same camera_link
+        # as the front hand_camera but flipped 180 deg about x for a rear view,
+        # complementary to the front wrist camera. Only panda_wristcam has a
+        # camera_link; skipped for the base panda robot.
+        links_map = getattr(getattr(self.agent, "robot", None), "links_map", {})
+        if "camera_link" in links_map:
+            configs.append(
+                CameraConfig(
+                    "hand_camera_back",
+                    sapien.Pose(p=[0, 0, 0], q=[0, 1, 0, 0]),
+                    224,
+                    224,
+                    1.0,
+                    0.01,
+                    100,
+                    mount=links_map["camera_link"],
+                )
+            )
+        return configs
 
     @property
     def _default_human_render_camera_configs(self):
@@ -199,7 +233,7 @@ class PegInsertionVerticalEnv(BaseEnv):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
 
     def get_language_instruction(self):
-        return ["insert the blue peg vertically into the orange hole"] * self.num_envs
+        return ["insert the peg into the hole"] * self.num_envs
 
     def _load_scene(self, options: dict):
         self.table = _build_table_plane(
@@ -438,12 +472,23 @@ class PegInsertionVerticalEnv(BaseEnv):
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         options = options or {}
+        # Insert-only eval: when pre_grasped is set and a lift planner is
+        # registered, produce a freshly motion-planned grasped+lifted state for
+        # the envs being reset (env_idx is the reset subset, incl. the
+        # auto-reset done subset) and feed it through the existing override
+        # path below. Reached by both the initial reset and every auto-reset.
+        if (
+            options.get("pre_grasped")
+            and self._lift_planner is not None
+            and options.get("peg_pose") is None
+        ):
+            options = self._inject_planned_lift_state(env_idx, options)
         with torch.device(self.device):
             b = len(env_idx)
             episode_rngs = self._batched_episode_rng[env_idx]
             peg_pos = torch.zeros((b, 3))
-            peg_pos[:, 0] = -0.22
-            peg_pos[:, 1] = -0.12
+            peg_pos[:, 0] = -0.18
+            peg_pos[:, 1] = 0.0
             peg_pos[:, 2] = self.table_top_z + self.peg_half_length
             peg_quat = torch.tensor(
                 euler2quat(0, np.pi / 2, 0), device=self.device
@@ -451,8 +496,8 @@ class PegInsertionVerticalEnv(BaseEnv):
             peg_pose = Pose.create_from_pq(peg_pos, peg_quat)
 
             hole_pos = torch.zeros((b, 3))
-            hole_pos[:, 0] = -0.04
-            hole_pos[:, 1] = 0.02
+            hole_pos[:, 0] = 0.0
+            hole_pos[:, 1] = 0.0
             hole_pos[:, 2] = self.table_top_z + self.hole_half_depth
             hole_quat = torch.tensor(
                 euler2quat(0, np.pi / 2, 0), device=self.device
@@ -507,9 +552,43 @@ class PegInsertionVerticalEnv(BaseEnv):
 
             self.peg.set_pose(peg_pose)
             self.box.set_pose(hole_pose)
-            qpos[:, -2:] = 0.04
+            # The normal pick-up setting always starts with an open gripper.
+            # The insert-only eval supplies a pre-grasped robot_qpos (closed
+            # fingers) via reset_options.pre_grasped, so keep those fingers
+            # closed instead of forcing them open.
+            if not options.get("pre_grasped"):
+                qpos[:, -2:] = 0.04
             self.agent.robot.set_qpos(qpos)
             self.agent.robot.set_pose(sapien.Pose([-0.60, 0.06, 0]))
+
+    def set_lift_planner(self, planner):
+        """Register a PegInsertionLiftPlanner for insert-only evaluation.
+
+        When set, ``_initialize_episode`` (gated on ``options["pre_grasped"]``)
+        initializes each reset env with a motion-planned grasped+lifted peg.
+        Reached by both the initial reset and every auto-reset.
+        """
+        self._lift_planner = planner
+
+    def _inject_planned_lift_state(self, env_idx, options):
+        import numpy as np
+
+        if hasattr(env_idx, "detach"):
+            gi = env_idx.detach().cpu().numpy()
+        else:
+            gi = np.asarray(env_idx)
+        gi = gi.reshape(-1).astype(np.int64).tolist()
+        state = self._lift_planner.plan_lifted_states(gi)
+        merged = dict(options)
+        merged.update(
+            {
+                "peg_pose": state["peg_pose"],
+                "hole_pose": state["hole_pose"],
+                "robot_qpos": state["robot_qpos"],
+                "pre_grasped": True,
+            }
+        )
+        return merged
 
     @property
     def peg_head_pose(self):
@@ -647,22 +726,11 @@ class PegInsertionVerticalEnv(BaseEnv):
         tcp_transform = (
             tcp_pose_in_root.to_transformation_matrix().detach().cpu().numpy()
         )
-
-        pos = torch.as_tensor(
-            tcp_transform[:, :3, 3], device=self.device, dtype=torch.float32
+        gripper = self.agent.robot.get_qpos().to(torch.float32)[:, -2:]
+        state = aligned_pi05_state_from_tcp_matrices(
+            tcp_transform, gripper.detach().cpu().numpy()
         )
-        euler = torch.as_tensor(
-            np.stack(
-                [
-                    mat2euler(tcp_transform[i, :3, :3], "sxyz")
-                    for i in range(self.num_envs)
-                ]
-            ),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        gripper = self.agent.robot.get_qpos().to(torch.float32)[:, -1:] * 2
-        return torch.cat([pos, euler, gripper], dim=1)
+        return torch.as_tensor(state, device=self.device, dtype=torch.float32)
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
         gripper_pos = self.agent.tcp.pose.p
