@@ -27,6 +27,40 @@ from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
 
+class _WeightedRandomSampler(torch.utils.data.Sampler):
+    """Weighted sampler with per-epoch re-seeding.
+
+    torch.utils.data.WeightedRandomSampler uses a fixed-seed generator, so every
+    epoch would re-draw the SAME frame indices. This variant re-seeds on each
+    ``__iter__`` (and honors ``set_epoch`` if ``forward_set_epoch`` reaches it),
+    giving epoch-to-epoch variation without on-disk duplication. Sampling is
+    with replacement, so per-rank overlap (DDP) is fine -- only the AGGREGATE
+    new-data fraction matters, and each rank's batches draw ~fraction new.
+    """
+
+    def __init__(self, weights, num_samples: int, seed: int = 0):
+        self._weights = torch.as_tensor(weights, dtype=torch.double)
+        self._num_samples = int(num_samples)
+        self._seed = int(seed)
+        self._epoch = 0
+        self._iter_count = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self._seed + self._epoch + self._iter_count * 7919)
+        self._iter_count += 1
+        idx = torch.multinomial(
+            self._weights, self._num_samples, replacement=True, generator=g
+        )
+        return iter(idx.tolist())
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+
 class FSDPVlaSftWorker(FSDPSftWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
@@ -132,6 +166,31 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             data_loader = openpi_data_loader.create_data_loader(
                 config, framework="pytorch", shuffle=True
             )
+            # HG-DAgger: controllable per-batch new-data fraction. When
+            # data.weighted_new_data_fraction is set and the merged dataset has a
+            # per-frame `source` column (0=historical, 1=HG-new, written by
+            # merge_datasets.py), swap the DataLoader's sampler for a
+            # WeightedRandomSampler so each batch draws ~fraction of its frames
+            # from the new HG-DAgger data -- no on-disk duplication. Default
+            # (key absent or no `source` column) is the unchanged sampler, so
+            # non-HG-DAgger SFT runs are unaffected. Use getattr (not OmegaConf.select)
+            # because this module only imports DictConfig.
+            _data_cfg = getattr(self.cfg, "data", None)
+            fraction = (
+                getattr(_data_cfg, "weighted_new_data_fraction", None)
+                if _data_cfg is not None
+                else None
+            )
+            if fraction is not None:
+                try:
+                    self._apply_weighted_new_data_sampler(
+                        data_loader, repo_id, float(fraction)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning(
+                        "WeightedRandomSampler disabled (using default sampler): %s",
+                        exc,
+                    )
             return data_loader, data_loader.data_config()
         elif SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.LINGBOTVLA
@@ -157,6 +216,86 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
             )
+
+    def _apply_weighted_new_data_sampler(
+        self, data_loader: Any, repo_id: str, fraction: float
+    ) -> None:
+        """Swap the OpenPI DataLoader's sampler for a per-frame WeightedRandomSampler.
+
+        Reads the ``source`` column (0=historical, 1=HG-new) straight from the
+        merged dataset's parquet -- ``len(LeRobotDataset) == total_frames`` so
+        the column is exactly aligned with the dataset index. Weights make each
+        sampled frame's marginal probability of being new-data equal to
+        ``fraction``: ``w_i = fraction/n_new`` if ``source_i==1`` else
+        ``(1-fraction)/n_orig``. The inner torch DataLoader is rebuilt with the
+        new sampler (its sampler is fixed at construction), copying the
+        original's collate/worker/drop_last kwargs.
+        """
+        import glob  # noqa: F401  (kept for parity with save_checkpoint)
+        from pathlib import Path
+
+        import numpy as np
+        import pandas as pd
+
+        torch_dl = self._openpi_pytorch_dataloader(data_loader)
+        dataset = torch_dl.dataset
+        src_dir = str(repo_id)
+        parquets = sorted(Path(src_dir).rglob("data/chunk-*/episode_*.parquet"))
+        if not parquets:
+            raise RuntimeError(
+                f"No parquet under {src_dir}; cannot read `source` column for "
+                "WeightedRandomSampler."
+            )
+        try:
+            source = pd.concat(
+                [pd.read_parquet(p, columns=["source"])["source"] for p in parquets],
+                ignore_index=True,
+            ).to_numpy()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Dataset {src_dir} has no per-frame `source` column "
+                f"(read_parquet failed: {exc}). Re-run merge_datasets.py to add "
+                "it, or unset data.weighted_new_data_fraction."
+            ) from exc
+        if len(source) != len(dataset):
+            raise RuntimeError(
+                f"source length {len(source)} != dataset length {len(dataset)}; "
+                "cannot align WeightedRandomSampler to the dataset index."
+            )
+        source = source.astype(np.int64)
+        n_new = int((source == 1).sum())
+        n_orig = int((source == 0).sum())
+        if n_new == 0 or n_orig == 0:
+            logging.info(
+                "WeightedRandomSampler skipped: only one source present "
+                "(new=%d, orig=%d).", n_new, n_orig,
+            )
+            return
+        w_new = fraction / n_new
+        w_orig = (1.0 - fraction) / n_orig
+        weights = np.where(source == 1, w_new, w_orig).astype(np.float64)
+        sampler = _WeightedRandomSampler(
+            weights, num_samples=len(dataset), seed=self._rank
+        )
+        new_torch_dl = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=torch_dl.batch_size,
+            sampler=sampler,
+            shuffle=False,
+            num_workers=torch_dl.num_workers,
+            collate_fn=torch_dl.collate_fn,
+            worker_init_fn=torch_dl.worker_init_fn,
+            drop_last=True,
+            persistent_workers=bool(torch_dl.persistent_workers),
+            multiprocessing_context=torch_dl.multiprocessing_context,
+        )
+        # DataLoaderImpl -> TorchDataLoader -> torch DataLoader
+        data_loader._data_loader._data_loader = new_torch_dl
+        logging.info(
+            "WeightedRandomSampler ON: fraction=%.3f new=%d orig=%d "
+            "per-rank samples=%d batch_size=%d",
+            fraction, n_new, n_orig, len(dataset), torch_dl.batch_size,
+        )
 
     def get_eval_model_output(self, batch: dict[str, Any]):
         # now the eval is not supported for embodied sft

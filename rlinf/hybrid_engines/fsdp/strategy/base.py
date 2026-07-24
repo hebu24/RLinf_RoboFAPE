@@ -330,6 +330,9 @@ class FSDPStrategyBase(ABC):
                 import glob
 
                 from torch.distributed import checkpoint as dcp
+                from torch.distributed.checkpoint.default_planner import (
+                    DefaultLoadPlanner,
+                )
 
                 dcp_dir = os.path.join(load_path, "dcp_checkpoint")
                 dcp_load_path = dcp_dir if os.path.isdir(dcp_dir) else load_path
@@ -345,9 +348,17 @@ class FSDPStrategyBase(ABC):
                         f"[Checkpoint] loading DCP checkpoint from {dcp_load_path}"
                     )
 
+                # allow_partial_load=True: tolerate checkpoint/torch version drift
+                # (e.g. an older checkpoint's lr_scheduler state lacks `verbose`,
+                # which current torch's DefaultLoadPlanner would otherwise reject
+                # with "Missing key in checkpoint state_dict"). Missing keys are
+                # skipped -- the model/optimizer keys (same architecture) all load
+                # strictly; only the drifted scheduler key is skipped. HG-DAgger
+                # resumes from a base student saved by an older torch.
                 dcp.load(
                     {"fsdp_checkpoint": training_state},
                     checkpoint_id=dcp_load_path,
+                    planner=DefaultLoadPlanner(allow_partial_load=True),
                 )
         except BaseException as e:
             import traceback
