@@ -50,6 +50,12 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+# Pure fns (no server) for down-sample index + progress->chunk mapping (must stay
+# in sync with RobometerHistoryRewardModel.compute_reward, which uses the same).
+from rlinf.models.embodiment.reward.robometer_reward_model import (
+    _robometer_downsample_indices,
+    _assign_downsampled_progress_to_chunks,
+)
 
 
 class EnvWorker(Worker):
@@ -412,6 +418,21 @@ class EnvWorker(Worker):
                     extracted_obs, _ = self.env_list[i].reset()
                     self.last_obs_list.append(extracted_obs)
                     self.last_intervened_info_list.append((None, None))
+                    # Initial reset stashed pick-up frames (pre-grasped). Prepend
+                    # them to this stage's history buffer so the first episode's
+                    # robometer video starts at the pick-up. History is empty
+                    # here, so prepend is unconditionally safe.
+                    if self.reward_mode == "history_buffer":
+                        _consume = get_env_attr(
+                            self.env_list[i], "consume_pickup_frames"
+                        )
+                        _consume = (
+                            _consume() if callable(_consume) else (_consume or {})
+                        )
+                        _hm = self.train_history_managers[i]
+                        for _e, _frs in (_consume or {}).items():
+                            if _frs:
+                                _hm.prepend_history_entries(int(_e), _frs)
                 if self.train_enable_offload and self.cfg.env.train.get(
                     "enable_init_offload", True
                 ):
@@ -709,11 +730,20 @@ class EnvWorker(Worker):
             return None
 
         if reward_model_output is not None:
-            reward_model_output = reward_model_output.to(rewards.dtype)
-            rewards = (
-                self.env_reward_weight * rewards
-                + self.reward_weight * reward_model_output
-            )
+            rm = reward_model_output.to(rewards.dtype)
+            # Per-step / terminal reward models return a scalar-per-env [B] (or
+            # [B, num_action_chunks]) tensor -> additive blend with the env
+            # reward. A per-chunk history reward (e.g. robometer progress)
+            # returns [B, T_history] with T_history != num_action_chunks; that
+            # cannot be blended into the per-sub-step env rewards and is instead
+            # scattered per-chunk by assign_history_reward -- skip the blend
+            # here (env reward is zeroed via env_reward_weight=0, so this is a
+            # no-op that avoids a shape broadcast error and double-counting).
+            if rm.dim() <= 1 or rm.shape == rewards.shape:
+                rewards = (
+                    self.env_reward_weight * rewards
+                    + self.reward_weight * rm
+                )
 
         adjusted_rewards = rewards.clone()
         if (
@@ -766,6 +796,12 @@ class EnvWorker(Worker):
         stage_id: int | None = None,
         last_run: bool = False,
     ):
+        if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
+            try:
+                with open("/tmp/robometer_rdebug.log", "a") as _f:
+                    _f.write(f"EW get_reward_model_output ENTER rank={getattr(self, '_rank', -1)} reward_mode={self.reward_mode}\n")
+            except Exception:
+                pass
         if self.reward_mode in {"per_step", "history_buffer"}:
             observations = (
                 env_output.final_obs
@@ -792,11 +828,40 @@ class EnvWorker(Worker):
                 raise ValueError("stage_id is required for history-buffer reward.")
             history_manager = self.train_history_managers[stage_id]
             history_manager.append_to_history_entries(observations)
+            # Stash done envs' (history_counts, pickup_counts) BEFORE
+            # build_history_input clears them, so assign_history_reward can map
+            # the down-sampled progress with the correct pickup offset + history
+            # length for the JUST-FINISHED episode (not the new one).
+            if dones is not None and bool(dones.any()):
+                if not hasattr(self, "_last_done_buffer_info"):
+                    self._last_done_buffer_info = {}
+                _stash = {}
+                for _e in dones.nonzero(as_tuple=False).reshape(-1).tolist():
+                    _stash[int(_e)] = (
+                        int(history_manager.history_counts[int(_e)]),
+                        int(history_manager.pickup_counts[int(_e)]),
+                    )
+                self._last_done_buffer_info[stage_id] = _stash
             history_input, history_lengths = history_manager.build_history_input(
                 dones=dones
             )
             reward_input["history_input"] = history_input
             self.history_lengths[stage_id] = dict(history_lengths)
+            # Auto-reset prepend: build_history_input just cleared done envs;
+            # the env's reset (inside the preceding chunk_step) already stashed
+            # this env's new pick-up frames via ManiskillEnv._render_pickup_frames.
+            # Prepend them now so the next chunk's append lands insert frames
+            # AFTER the pick-up (robometer sees the full pick-up+insert video).
+            # Pick-up frames never become rollout steps -> not in RL training data.
+            if dones is not None and bool(dones.any()):
+                _consume = get_env_attr(
+                    self.env_list[stage_id], "consume_pickup_frames"
+                )
+                _consume = _consume() if callable(_consume) else (_consume or {})
+                _hm = self.train_history_managers[stage_id]
+                for _e in dones.nonzero(as_tuple=False).reshape(-1).tolist():
+                    if _consume and _e in _consume and _consume[_e]:
+                        _hm.prepend_history_entries(int(_e), _consume[_e])
 
         if last_run:
             reward_input.update(
@@ -806,6 +871,15 @@ class EnvWorker(Worker):
                     )
                 }
             )
+        # Gate: query robometer ONLY at trajectory done (or last_run flush). The
+        # per-chunk append + build_history_input above MUST keep running every
+        # chunk so the buffer accumulates the whole trajectory + clears at done.
+        # Skipping send+recv on non-done chunks: the reward worker
+        # (_compute_rewards `while True: await recv`) idle-waits -> no deadlock;
+        # assign_history_reward auto-skips (gated on reward_model_output is not
+        # None). Returns None so send+recv stay a matched pair (no orphan recv).
+        if not (last_run or (dones is not None and bool(dones.any()))):
+            return None
         self.send_to(
             group_name=self.cfg.reward.group_name,
             channel=send_channel,
@@ -821,6 +895,12 @@ class EnvWorker(Worker):
             batch_size=self.train_batch_size,
             decoupled_mode=self.env_decoupled_mode,
         )
+        if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
+            try:
+                with open("/tmp/robometer_rdebug.log", "a") as _f:
+                    _f.write(f"EW get_reward_model_output RECV rank={getattr(self, '_rank', -1)} reward_output={type(reward_output)} is_none={reward_output is None}\n")
+            except Exception:
+                pass
         if self.reward_mode != "terminal" or reward_output is None:
             return reward_output
         return self._scatter_terminal_reward_output(
@@ -873,9 +953,98 @@ class EnvWorker(Worker):
         reward = (self.reward_weight * reward_model_output).to(
             rollout_rewards[-1].dtype
         )
+        # Per-chunk history rewards (e.g. robometer progress curve) return a
+        # 2-D [B, T_history] tensor: scatter reward[env, s] onto chunk -(s+1)'s
+        # sub-step rewards (one value per chunk, broadcast across the chunk's
+        # num_action_chunks sub-steps; GAE later reduces per-sub-step -> per-
+        # chunk). ADD (env reward is zeroed via env_reward_weight=0, and this
+        # fires once per trajectory at done -> no double-count). The 1-D
+        # scalar-per-env path (history_vlm) is unchanged.
+        is_per_chunk = reward_model_output.dim() == 2
+        _hm = self.train_history_managers[stage_id]
+        # Stash of (history_counts, pickup_counts) captured in
+        # get_reward_model_output BEFORE build_history_input cleared the done envs
+        # (the live _hm counters now hold the NEW episode's values, wrong here).
+        _stash = getattr(self, "_last_done_buffer_info", {}).get(stage_id, {})
+        _maxf = int(self.cfg.reward.model.get("max_robometer_frames", 60))
+        _rdebug = bool(__import__("os").environ.get("RLINF_REWARD_DEBUG"))
+        _loss_masks = self.rollout_results[stage_id].loss_mask
         for env_id, reward_assign_length in enumerate(reward_assign_lengths):
-            for reward_assign_step in range(2, reward_assign_length + 1):
-                rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
+            if not is_per_chunk:
+                # 1-D scalar-per-env path (history_vlm) — unchanged.
+                for reward_assign_step in range(2, reward_assign_length + 1):
+                    rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
+                continue
+            r_env = reward[env_id]
+            # (hist_len, pickup_count) for the JUST-FINISHED episode: stash for
+            # done envs (pre-clear), live for non-done envs at last_run flush.
+            if env_id in _stash:
+                hist_len_env, k_env = _stash[env_id]
+            else:
+                hist_len_env = _hm.history_counts[env_id]
+                k_env = _hm.pickup_counts[env_id]
+            r_env_np = (
+                r_env.detach().cpu().numpy().astype(np.float32)
+                if hasattr(r_env, "detach")
+                else np.asarray(r_env, dtype=np.float32)
+            )
+            per_chunk_reward, per_chunk_has_reward = (
+                _assign_downsampled_progress_to_chunks(
+                    r_env_np, hist_len_env, k_env, _maxf
+                )
+            )
+            insert_len = min(len(per_chunk_reward), rollout_rewards_length)
+            # Forward-map within the latest episode (its chunks are the LAST
+            # insert_len of the rollout list): per_chunk_reward[chunk] ->
+            # rollout_rewards[-insert_len + chunk]. OVERWRITE (not +=): fixes the
+            # old multi-fire accumulation; fires once at done via the gate.
+            for chunk in range(insert_len):
+                ci = chunk - insert_len  # negative index into the list
+                if -ci > len(rollout_rewards) or -ci > len(_loss_masks):
+                    continue
+                _rr = rollout_rewards[ci]
+                rollout_rewards[ci][env_id] = torch.tensor(
+                    float(per_chunk_reward[chunk]),
+                    dtype=_rr.dtype,
+                    device=_rr.device,
+                )
+                _loss_masks[ci][env_id] = bool(per_chunk_has_reward[chunk])
+            # First-trajectory debug dump (env 0): verify ds + reward + loss_mask
+            # alignment before letting RL run long. Gated by RLINF_REWARD_DEBUG.
+            if _rdebug and env_id == 0:
+                try:
+                    with open("/tmp/robometer_rdebug.log", "a") as _f:
+                        _ds = _robometer_downsample_indices(hist_len_env, _maxf)
+                        _lm_tail = (
+                            np.array(
+                                [bool(_loss_masks[ci][env_id]) for ci in range(-insert_len, 0)]
+                            )
+                            if insert_len > 0
+                            else np.array([])
+                        )
+                        _rew_tail = (
+                            np.round(
+                                [float(rollout_rewards[ci][env_id]) for ci in range(-insert_len, 0)],
+                                3,
+                            ).tolist()
+                            if insert_len > 0
+                            else []
+                        )
+                        _f.write(
+                            f"[assign] stage={stage_id} env={env_id} hist_len={hist_len_env} "
+                            f"pickup={k_env} maxf={_maxf} insert_len={insert_len} "
+                            f"rollout_len={rollout_rewards_length}\n"
+                        )
+                        _f.write(f"  ds={_ds}\n")
+                        _f.write(
+                            f"  per_chunk_reward[:10]={np.round(per_chunk_reward[:10], 3)}\n"
+                        )
+                        _f.write(
+                            f"  has_reward_chunks(in-ep)={np.where(per_chunk_has_reward[:insert_len])[0].tolist()} "
+                            f"loss_mask_tail={_lm_tail.tolist()} rewards_tail={_rew_tail}\n"
+                        )
+                except Exception:
+                    pass
 
     @Worker.timer("env/bootstrap_step")
     def bootstrap_step(self) -> list[EnvOutput]:
@@ -1000,6 +1169,17 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
+        if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
+            try:
+                with open("/tmp/robometer_rdebug.log", "a") as _f:
+                    _f.write(
+                        f"EW _run_interact_once rank={getattr(self, '_rank', -1)} "
+                        f"reward_channel_none={reward_channel is None} "
+                        f"use_reward_model={self.use_reward_model} "
+                        f"use_external_reward_model={self.use_external_reward_model}\n"
+                    )
+            except Exception:
+                pass
         self.rollout_results: list[EmbodiedRolloutResult] = [
             EmbodiedRolloutResult(
                 max_episode_length=self.cfg.env.train.max_episode_steps,

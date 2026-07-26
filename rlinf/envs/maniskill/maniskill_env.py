@@ -251,6 +251,24 @@ class ManiskillEnv(gym.Env):
                     wrist_back_images = sorted_images.pop("hand_camera_back")["rgb"]
                 else:
                     sorted_images.pop("hand_camera_back", None)
+                # Human render camera (third-person external view, 640x480) for the
+                # robometer progress-reward server. Gated by
+                # cfg.capture_render_image_for_reward so non-RL runs are unaffected.
+                # Popped from sorted_images so it is NOT bundled into
+                # extra_view_images (the policy ignores extra_view anyway for
+                # num_images_in_input==2). The reward path reads render_images from
+                # env_output.obs/final_obs; the policy path drops it via
+                # embodied_io_struct.prepare_observations (which only packs
+                # main/wrist/extra/states/task).
+                render_images = None
+                if bool(getattr(self.cfg, "capture_render_image_for_reward", False)):
+                    render_cam_key = getattr(
+                        self.cfg, "render_camera_key", "reward_camera"
+                    )
+                    if render_cam_key in sorted_images:
+                        render_images = sorted_images.pop(render_cam_key)["rgb"]
+                    elif render_cam_key in sensor_data:
+                        render_images = sensor_data[render_cam_key]["rgb"]
                 extra_view_images = (
                     torch.stack([v["rgb"] for v in sorted_images.values()], dim=1)
                     if sorted_images
@@ -261,6 +279,7 @@ class ManiskillEnv(gym.Env):
                     "extra_view_images": extra_view_images,
                     "wrist_images": wrist_images,
                     "wrist_back_images": wrist_back_images,
+                    "render_images": render_images,
                     "states": state,
                     "task_descriptions": self.instruction,
                 }
@@ -385,6 +404,26 @@ class ManiskillEnv(gym.Env):
             merged_options.update(options)
             options = merged_options
         raw_obs, infos = self.env.reset(seed=seed, options=options)
+        # Pick-up replay-render for the robometer (train only). The task env's
+        # _initialize_episode (above, when pre_grasped) stashed a per-env
+        # pick-up state trajectory; replay-render reward_camera at each state
+        # and stash the frames for env_worker / the smoke to prepend to the
+        # robometer history buffer. Pick-up frames never become rollout steps,
+        # so they do NOT enter RL training data. Eval (is_eval) is skipped.
+        self._pending_pickup_frames = {}
+        if (
+            bool(getattr(self.cfg, "capture_render_image_for_reward", False))
+            and not bool(getattr(self.cfg, "is_eval", False))
+            and getattr(self.env.unwrapped, "_pending_pickup_trajectories", None)
+        ):
+            env_idx = options.get("env_idx")
+            if env_idx is None:
+                env_idx = torch.arange(self.num_envs, device=self.device)
+            try:
+                self._pending_pickup_frames = self._render_pickup_frames(env_idx)
+            except Exception:  # noqa: BLE001  never break reset on a render hiccup
+                self._pending_pickup_frames = {}
+            self.env.unwrapped._pending_pickup_trajectories = {}
         self._show_goal_site_visual()
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
         if "env_idx" in options:
@@ -393,6 +432,92 @@ class ManiskillEnv(gym.Env):
         else:
             self._reset_metrics()
         return extracted_obs, infos
+
+    def consume_pickup_frames(self):
+        """Return and clear stashed pick-up render frames (for robometer prepend).
+
+        Called by env_worker (initial reset + auto-reset) and the single-process
+        smoke after reset. Returns ``{global_env_idx: [HxWxC uint8 np arrays]}``;
+        ``{}`` when nothing was stashed (non-pre-grasped / eval / render failed).
+        """
+        frames = getattr(self, "_pending_pickup_frames", None) or {}
+        self._pending_pickup_frames = {}
+        return frames
+
+    def _render_pickup_frames(self, env_idx):
+        """Replay-render the planner's pick-up state trajectory on the GPU env.
+
+        For each recorded pick-up state (approach -> grasp -> lift), set
+        peg/box/robot state, run the GPU kinematics sequence, render
+        reward_camera, and collect the frame. Non-subset envs are held at their
+        current state and the full sim state is restored at the end, so this is
+        safe mid-episode (auto-reset subset). Returns
+        ``{global_env_idx: [HxWxC uint8 np arrays]}``.
+        """
+        from mani_skill.utils.structs.pose import Pose
+
+        unw = self.env.unwrapped
+        trajs = getattr(unw, "_pending_pickup_trajectories", None) or {}
+        if hasattr(env_idx, "detach"):
+            gi = env_idx.detach().cpu().numpy()
+        else:
+            gi = np.asarray(env_idx)
+        gi = gi.reshape(-1).astype(np.int64).tolist()
+        max_len = max(
+            (len(trajs[g]) for g in gi if g in trajs and trajs[g]), default=0
+        )
+        if max_len == 0:
+            return {}
+
+        render_cam_key = getattr(self.cfg, "render_camera_key", "reward_camera")
+        # Snapshot current full per-env state to hold non-subset envs + restore.
+        peg_raw = unw.peg.pose.raw_pose.clone()  # [num_envs, 7] (p, q)
+        box_raw = unw.box.pose.raw_pose.clone()
+        qpos_cur = unw.agent.robot.get_qpos().clone()  # [num_envs, 9]
+        saved = unw.get_state_dict()  # full sim state for final restore
+
+        frames: dict[int, list] = {g: [] for g in gi}
+        for t in range(max_len):
+            peg_t = peg_raw.clone()
+            box_t = box_raw.clone()
+            qpos_t = qpos_cur.clone()
+            for g in gi:
+                traj = trajs.get(g)
+                if not traj:
+                    continue
+                rec = traj[min(t, len(traj) - 1)]
+                peg_t[g] = torch.as_tensor(
+                    rec["peg_pose"], dtype=peg_raw.dtype, device=self.device
+                )
+                box_t[g] = torch.as_tensor(
+                    rec["hole_pose"], dtype=box_raw.dtype, device=self.device
+                )
+                qpos_t[g] = torch.as_tensor(
+                    rec["robot_qpos"], dtype=qpos_cur.dtype, device=self.device
+                )
+            unw.peg.set_pose(Pose.create_from_pq(peg_t[:, :3], peg_t[:, 3:]))
+            unw.box.set_pose(Pose.create_from_pq(box_t[:, :3], box_t[:, 3:]))
+            unw.agent.robot.set_qpos(qpos_t)
+            if getattr(unw, "gpu_sim_enabled", False):
+                unw.scene._gpu_apply_all()
+                unw.scene.px.gpu_update_articulation_kinematics()
+                unw.scene._gpu_fetch_all()
+            unw.scene.update_render()
+            sensor_data = unw.get_obs()["sensor_data"]
+            if render_cam_key not in sensor_data:
+                continue
+            render = common.to_numpy(sensor_data[render_cam_key]["rgb"])
+            for g in gi:
+                frames[g].append(np.asarray(render[g]).astype(np.uint8))
+
+        # Restore full sim state (non-subset envs unchanged; subset envs left at
+        # the lift-end reset state the policy expects = the trajectory's last
+        # frame, which _initialize_episode already set).
+        try:
+            unw.set_state_dict(saved)
+        except Exception:  # noqa: BLE001
+            pass
+        return frames
 
     def step(
         self, actions: Union[Array, dict] = None, auto_reset=True

@@ -1,0 +1,62 @@
+# Peg-insertion insert-only env for dense-reward RL (robometer progress reward).
+# Mirrors the insert-only eval env (maniskill_peg_insertion_vertical.yaml) with RL
+# overrides: truncate on success (ignore_terminations=False), capture the scene's
+# human render camera (render_camera, 640x480 third-person external view) for the
+# robometer progress-reward server via the history_buffer reward path, insert-only
+# reset (pre_grasped -> env_worker auto-applies PreGraspedInitWrapper).
+
+env_type: maniskill
+
+total_num_envs: null
+wrap_obs_mode: simple
+use_wrist_image: True
+use_wrist_back_image: False
+auto_reset: True
+ignore_terminations: False        # RL: truncate on success (eval used True + success_once)
+use_rel_reward: False
+sync_target_pose_per_chunk: True
+reward_mode: raw                  # wrapper-level; env reward dropped via reward.env_reward_weight=0.0
+action_scale: 1.0
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 600
+max_episode_steps: 600
+task_description: "insert the peg into the hole"   # shadowed at runtime by get_language_instruction
+reset_options:
+  randomize_initial_poses: False
+  pre_grasped: True               # -> env_worker._setup_env_and_wrappers applies PreGraspedInitWrapper
+
+# Feed the scene's human render camera (640x480 third-person external view, defined
+# by PegInsertionVertical._default_human_render_camera_configs) to the robometer
+# progress-reward server. _wrap_obs pops it into `render_images` (gated), which the
+# history_buffer reward path accumulates one-frame-per-chunk and ships to the
+# reward worker (RobometerHistoryRewardModel) at trajectory done.
+capture_render_image_for_reward: True
+render_camera_key: "reward_camera"
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+
+init_params:
+  id: PegInsertionVertical-v1
+  num_envs: null
+  obs_mode: "rgb"
+  robot_uids: panda_wristcam
+  control_mode: pd_ee_target_delta_pose
+  sim_backend: "gpu"
+  reward_mode: normalized_dense   # unused (env_reward_weight=0) but kept for env compat
+  max_episode_steps: ${..max_episode_steps}
+  render_mode: all                # so render_camera RGB is in get_obs()["sensor_data"]
+  sensor_configs:
+    shader_pack: "default"
+    hand_camera:
+      width: 224
+      height: 224
+    hand_camera_back:
+      width: 224
+      height: 224

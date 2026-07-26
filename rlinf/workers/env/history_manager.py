@@ -40,6 +40,11 @@ class HistoryManager:
 
         self.history_counts = [0 for _ in range(num_envs)]
 
+        # Per-env count of prepended pick-up frames (for assign_history_reward
+        # to skip pick-up progress when scattering onto policy chunks). Reset in
+        # clear_history alongside the buffer.
+        self.pickup_counts = [0 for _ in range(num_envs)]
+
     def setup_history_buffers(self, reward_cfg: DictConfig) -> list[dict[str, Any]]:
         history_buffers = reward_cfg.get("model", {}).get("history_buffers", None)
         if history_buffers is None:
@@ -114,6 +119,24 @@ class HistoryManager:
                 history_entry[history_key] = clone_nested_to_cpu(history_values[env_id])
             self.history_entries[env_id].append(history_entry)
             self.history_counts[env_id] += 1
+
+    def prepend_history_entries(self, env_id: int, frames: list) -> None:
+        """Prepend pick-up render frames to the FRONT of the history buffer.
+
+        Called by env_worker (initial reset + auto-reset) so the robometer sees
+        the full pick-up+insert video. Pick-up frames never enter RL training
+        data (they are not rollout steps); ``pickup_counts[env_id]`` records the
+        count so ``assign_history_reward`` can skip pick-up progress when
+        scattering the curve onto policy chunks.
+        """
+        if not frames:
+            return
+        for frame in frames:
+            self.history_entries[env_id].insert(
+                0, {"render_images": clone_nested_to_cpu(frame)}
+            )
+        self.history_counts[env_id] += len(frames)
+        self.pickup_counts[env_id] = len(frames)
 
     def build_history_input(
         self, dones: torch.Tensor
@@ -193,6 +216,7 @@ class HistoryManager:
     def clear_history(self, env_id: int) -> None:
         self.history_entries[env_id].clear()
         self.history_counts[env_id] = 0
+        self.pickup_counts[env_id] = 0
 
     def trim_history(self, env_idx: int) -> None:
         self.history_entries[env_idx] = self.history_entries[env_idx][

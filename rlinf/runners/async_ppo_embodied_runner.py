@@ -45,7 +45,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         critic=None,
         reward=None,
     ):
-        super().__init__(cfg, actor, rollout, env, critic, reward)
+        super().__init__(cfg, actor, rollout, env, reward=reward, critic=critic)
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
         self.recompute_logprobs = bool(
@@ -113,6 +113,15 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.actor.set_global_step(self.global_step).wait()
         self.rollout.set_global_step(self.global_step).wait()
         self.update_rollout_weights()
+        if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
+            try:
+                with open("/tmp/robometer_rdebug.log", "a") as _f:
+                    _f.write(
+                        f"RUNNER run() reward_none={self.reward is None} "
+                        f"reward_channel_none={self.reward_channel is None}\n"
+                    )
+            except Exception:
+                pass
 
         env_handle: Handle = self.env.interact(
             input_channel=self.env_channel,
@@ -126,6 +135,12 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             output_channel=self.env_channel,
             metric_channel=self.rollout_metric_channel,
         )
+        reward_handle: Handle | None = None
+        if self.reward is not None:
+            reward_handle = self.reward.compute_rewards_async(
+                input_channel=self.reward_channel,
+                output_channel=self.env_channel,
+            )
 
         actor_handle: Handle = self.actor.recv_rollout_trajectories(
             input_channel=self.actor_channel
@@ -151,6 +166,14 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                     rollout_metrics_list = (
                         self.actor.compute_advantages_and_returns().wait()
                     )
+                # Accumulate training-data env steps (loss_mask=True chunks) for
+                # the ckpt `trainenvstep` label (Q2). The async runner overrides
+                # the parent run() and inlines check_progress/_save_checkpoint
+                # below (L275-280), so the parent's accumulate (in EmbodiedRunner.run)
+                # never executes -> must accumulate here, before the save.
+                self.total_train_env_steps += self._sum_rollout_key(
+                    rollout_metrics_list, "train_env_steps"
+                )
 
                 with self.timer("actor_training"):
                     actor_training_handle = self.actor.run_training()
@@ -277,6 +300,9 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
 
         self.env.stop().wait()
         self.rollout.stop().wait()
+        if self.reward is not None:
+            self.reward.stop().wait()
+            reward_handle.wait()
 
         env_handle.wait()
         rollout_handle.wait()

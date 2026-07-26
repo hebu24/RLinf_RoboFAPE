@@ -195,6 +195,21 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         }
         rollout_metrics.update(returns_metrics)
 
+    # Total training-data env steps this rollout = # of loss_mask=True chunks
+    # (down-sampled insert+hasReward only; pick-up + non-sampled chunks are
+    # excluded from the loss). All-reduced SUM across actor ranks so every
+    # rank returns the same global total (runner then sums the per-rank list,
+    # which is a no-op since all ranks hold the same value).
+    if loss_mask is not None:
+        from rlinf.scheduler.worker.worker import Worker
+
+        _device = Worker.torch_platform.current_device()
+        _lm_sum = loss_mask.to(device=_device).bool().sum()
+        torch.distributed.all_reduce(
+            _lm_sum, op=torch.distributed.ReduceOp.SUM
+        )
+        rollout_metrics["train_env_steps"] = _lm_sum.item()
+
     return rollout_metrics
 
 
@@ -227,6 +242,44 @@ def compute_loss_mask(dones):
     loss_mask_sum = loss_mask_sum.expand_as(loss_mask)
 
     return loss_mask, loss_mask_sum
+
+
+def resolve_loss_mask(
+    rollout_batch,
+    auto_reset: bool,
+    ignore_terminations: bool,
+    chunk_level: bool,
+):
+    """Resolve ``(loss_mask, loss_mask_sum)``.
+
+    A trajectory-provided ``loss_mask`` (``rollout_batch["loss_mask"]``, set by
+    env_worker.assign_history_reward for robometer-progress-labeled insert chunks)
+    WINS — only those chunks train (policy + value loss masked). Else build from
+    ``dones`` when ``not auto_reset and not ignore_terminations`` (the legacy
+    episode-boundary mask). Else ``(None, None)`` -> downstream defaults to
+    all-ones. Shared by the actor (fsdp_actor_worker) + the pipeline path
+    (utils.preprocess_embodied_batch) so both honor the trajectory-provided mask.
+    """
+    provided = rollout_batch.get("loss_mask", None)
+    if provided is not None:
+        loss_mask = provided
+        loss_mask_sum = rollout_batch.get("loss_mask_sum", None)
+        if loss_mask_sum is None:
+            loss_mask_sum = loss_mask.sum(dim=(0, 2), keepdim=True).expand_as(
+                loss_mask
+            )
+        if chunk_level:
+            loss_mask = loss_mask.any(dim=-1, keepdim=True)
+            loss_mask_sum = loss_mask_sum[..., -1:]
+        return loss_mask, loss_mask_sum
+    if not auto_reset and not ignore_terminations:
+        dones = rollout_batch["dones"]
+        loss_mask, loss_mask_sum = compute_loss_mask(dones)
+        if chunk_level:
+            loss_mask = loss_mask.any(dim=-1, keepdim=True)
+            loss_mask_sum = loss_mask_sum[..., -1:]
+        return loss_mask, loss_mask_sum
+    return None, None
 
 
 def print_metrics_table(

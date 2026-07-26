@@ -151,6 +151,36 @@ LIFT_HEIGHT_ABOVE_TABLE = 0.05
 PICKUP_XY_TOLERANCE = 0.03
 MAX_RETRIES = 4
 
+# Cap on the number of pick-up frames rendered + prepended to the robometer
+# history buffer per episode. The solver's full approach+grasp+lift run can be
+# many steps; uniform-subsampling to this many bounds GPU render cost and the
+# history buffer while still spanning the whole pick-up (state-set replay, so
+# no dynamics continuity is needed). Override via the env var below.
+N_PICKUP_FRAMES = int(os.environ.get("RLINF_PICKUP_N_FRAMES", "30"))
+
+
+def _subsample_pickup(records, cap: int = N_PICKUP_FRAMES):
+    """Uniformly subsample the pick-up trajectory to <= ``cap`` frames.
+
+    Always keeps the first and last records (approach start + lift-end; the
+    latter is the state injected at reset, so it must remain the final frame).
+    Returns a list of record dicts.
+    """
+    import numpy as np
+
+    if not records:
+        return []
+    if len(records) <= cap:
+        return list(records)
+    idxs = np.linspace(0, len(records) - 1, cap).astype(int)
+    seen: set[int] = set()
+    out = []
+    for i in idxs:
+        if int(i) not in seen:
+            seen.add(int(i))
+            out.append(records[int(i)])
+    return out
+
 
 def _select_lift_end(records, table_top_z, peg_half_length):
     """Pick the index of the lift-end frame.
@@ -253,10 +283,24 @@ def planner_worker_main() -> None:
                 if idx is None:
                     continue
                 rec = recorder.records[idx]
+                # Pick-up trajectory (approach -> grasp -> lift), subsampled
+                # to N_PICKUP_FRAMES. Fed to the robometer so it sees the
+                # full task; never enters RL training data (rendered out of
+                # the rollout via state-set replay in ManiskillEnv).
+                pickup_traj = _subsample_pickup(recorder.records[: idx + 1])
+                trajectory = [
+                    {
+                        "robot_qpos": r["robot_qpos"].tolist(),
+                        "peg_pose": r["peg_pose"].tolist(),
+                        "hole_pose": r["hole_pose"].tolist(),
+                    }
+                    for r in pickup_traj
+                ]
                 state = {
                     "robot_qpos": rec["robot_qpos"].tolist(),
                     "peg_pose": rec["peg_pose"].tolist(),
                     "hole_pose": rec["hole_pose"].tolist(),
+                    "trajectory": trajectory,
                 }
                 break
             if state is None:
@@ -363,10 +407,19 @@ class PegInsertionLiftPlanner:
         if "error" in resp:
             raise RuntimeError(f"PegInsertionLiftPlanner error: {resp['error']}")
         state = resp["state"]
+        trajectory = [
+            {
+                "robot_qpos": np.asarray(s["robot_qpos"], dtype=np.float32),
+                "peg_pose": np.asarray(s["peg_pose"], dtype=np.float32),
+                "hole_pose": np.asarray(s["hole_pose"], dtype=np.float32),
+            }
+            for s in state.get("trajectory", [])
+        ]
         return {
             "robot_qpos": np.asarray(state["robot_qpos"], dtype=np.float32),
             "peg_pose": np.asarray(state["peg_pose"], dtype=np.float32),
             "hole_pose": np.asarray(state["hole_pose"], dtype=np.float32),
+            "trajectory": trajectory,
         }
 
     def plan_lifted_states(self, env_global_indices):
@@ -387,6 +440,7 @@ class PegInsertionLiftPlanner:
         robot_qpos = np.zeros((b, 9), dtype=np.float32)
         peg_pose = np.zeros((b, 7), dtype=np.float32)
         hole_pose = np.zeros((b, 7), dtype=np.float32)
+        trajectories: list[list[dict]] = []
         for j, gi in enumerate(idxs):
             seed = (
                 self._base_seed * 1_000_003
@@ -394,14 +448,47 @@ class PegInsertionLiftPlanner:
                 + int(gi) * 97
                 + 7
             )
-            st = self.plan_lifted_state(seed=seed)
+            # Retry with a different seed on planner errors: some seeds yield no
+            # valid grasp/lift (e.g. "no lifted state for seed=..."). The env uses
+            # the lifted state the planner RETURNS (robot_qpos/peg_pose/hole_pose
+            # injected into reset), so a different seed just gives a different
+            # valid config -- safe. Without this, one bad seed crashes the whole
+            # run (RuntimeError -> ray.kill -> collective desync cascade).
+            # On failure also force-respawn the worker: it may have returned an
+            # error (still alive) OR died (segfault/OOM -> broken pipe); nulling
+            # self._proc makes _ensure_proc spawn a fresh worker for next try.
+            st = None
+            last_err = None
+            for _attempt in range(8):
+                try:
+                    st = self.plan_lifted_state(seed=seed)
+                    break
+                except RuntimeError as e:
+                    last_err = e
+                    try:
+                        if self._proc is not None and self._proc.poll() is None:
+                            self._proc.terminate()
+                            try:
+                                self._proc.wait(timeout=2)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    self._proc = None
+                    seed = seed + (_attempt + 1) * 1_009 + 17
+            if st is None:
+                raise RuntimeError(
+                    f"PegInsertionLiftPlanner: 8 retries failed for gi={gi}: {last_err}"
+                )
             robot_qpos[j] = st["robot_qpos"]
             peg_pose[j] = st["peg_pose"]
             hole_pose[j] = st["hole_pose"]
+            trajectories.append(st.get("trajectory", []))
         return {
             "robot_qpos": robot_qpos,
             "peg_pose": peg_pose,
             "hole_pose": hole_pose,
+            "trajectories": trajectories,
         }
 
     def close(self) -> None:

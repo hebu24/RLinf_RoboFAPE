@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
 from rlinf.scheduler import Worker
-from rlinf.utils.metric_utils import compute_loss_mask
+from rlinf.utils.metric_utils import compute_loss_mask, resolve_loss_mask
 
 
 def clear_memory(sync=True):
@@ -760,14 +760,10 @@ def preprocess_embodied_batch(
 ) -> dict[str, torch.Tensor]:
     batch = merge_rollout_epochs(batch, rollout_epoch)
 
-    if not auto_reset and not ignore_terminations:
-        dones = batch["dones"]
-        loss_mask, loss_mask_sum = compute_loss_mask(dones)
-
-        if reward_type == "chunk_level":
-            loss_mask = loss_mask.any(dim=-1, keepdim=True)
-            loss_mask_sum = loss_mask_sum[..., -1:]
-
+    loss_mask, loss_mask_sum = resolve_loss_mask(
+        batch, auto_reset, ignore_terminations, reward_type == "chunk_level"
+    )
+    if loss_mask is not None:
         batch["loss_mask"] = loss_mask
         batch["loss_mask_sum"] = loss_mask_sum
 

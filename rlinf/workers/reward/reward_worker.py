@@ -378,6 +378,12 @@ class EmbodiedRewardWorker(Worker):
                 batch_size=self.train_batch_size,
                 decoupled_mode=self.env_decoupled_mode,
             ).async_wait()
+            if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
+                try:
+                    with open("/tmp/robometer_rdebug.log", "a") as _f:
+                        _f.write(f"RW _compute_rewards received merged_data type={type(merged_data)} keys={list(merged_data.keys()) if isinstance(merged_data, dict) else None}\n")
+                except Exception:
+                    pass
             rewards = self.compute_image_rewards(observations=merged_data)
             if isinstance(rewards, torch.Tensor):
                 rewards = rewards.contiguous()

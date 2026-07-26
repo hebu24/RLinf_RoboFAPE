@@ -63,6 +63,7 @@ from rlinf.utils.metric_utils import (
     compute_loss_mask,
     compute_rollout_metrics,
     compute_split_num,
+    resolve_loss_mask,
 )
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
@@ -1166,19 +1167,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_epoch = self.cfg.env.train.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
 
-        if (
-            not self.cfg.env.train.auto_reset
-            and not self.cfg.env.train.ignore_terminations
-        ):
-            dones = rollout_batch[
-                "dones"
-            ]  # [n_chunk_step, rollout_epoch x bsz, num_action_chunks]
-            loss_mask, loss_mask_sum = compute_loss_mask(dones)
-
-            if self.cfg.algorithm.reward_type == "chunk_level":
-                loss_mask = loss_mask.any(dim=-1, keepdim=True)
-                loss_mask_sum = loss_mask_sum[..., -1:]
-
+        loss_mask, loss_mask_sum = resolve_loss_mask(
+            rollout_batch,
+            self.cfg.env.train.auto_reset,
+            self.cfg.env.train.ignore_terminations,
+            self.cfg.algorithm.reward_type == "chunk_level",
+        )
+        if loss_mask is not None:
             rollout_batch["loss_mask"] = loss_mask
             rollout_batch["loss_mask_sum"] = loss_mask_sum
 

@@ -349,6 +349,10 @@ class ChunkStepResult:
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    # [B, 1] bool; True iff this insert chunk has a robometer progress label
+    # (i.e. it was a down-sampled insert frame). Only loss_mask=True chunks train
+    # (policy + value loss masked). Set by env_worker.assign_history_reward.
+    loss_mask: torch.Tensor = None
 
     def __post_init__(self):
         if self.actions is not None:
@@ -369,6 +373,8 @@ class ChunkStepResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
+        if self.loss_mask is not None:
+            self.loss_mask = self.loss_mask.cpu().contiguous()
 
 
 @dataclass
@@ -388,6 +394,8 @@ class Trajectory:
     prev_logprobs: torch.Tensor = None
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
+    # [T, B, 1] bool; True iff chunk has a robometer progress label (trainable).
+    loss_mask: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
@@ -533,6 +541,8 @@ class EmbodiedRolloutResult:
         default_factory=list
     )  # trajectory_length + rollout_epoch
     versions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    # per-chunk loss_mask; default zeros (append_step_result fills when actions present)
+    loss_mask: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
     forward_inputs: list[dict[str, Any]] = field(
         default_factory=list
     )  # trajectory_length
@@ -548,6 +558,19 @@ class EmbodiedRolloutResult:
             )
         if result.rewards is not None:
             self.rewards.append(result.rewards)
+            # loss_mask aligns with rewards (T steps = num_chunk), NOT dones
+            # (T+1, which includes the bootstrap chunk). The advantages reshape
+            # (rlinf/algorithms/utils.py:preprocess_embodied_advantages_inputs)
+            # does loss_mask.transpose(1,2).reshape(n_steps, bsz) with
+            # n_steps = num_chunk*chunk_size, i.e. T not T+1 — appending loss_mask
+            # in the dones block made it T+1 and broke that reshape. Default zeros
+            # (no robometer label yet) — env_worker.assign_history_reward sets True
+            # per-chunk in place.
+            self.loss_mask.append(
+                result.loss_mask
+                if result.loss_mask is not None
+                else torch.zeros_like(result.rewards, dtype=torch.bool)
+            )
         if result.terminations is not None:
             self.terminations.append(result.terminations)
         if result.truncations is not None:
@@ -677,6 +700,10 @@ class EmbodiedRolloutResult:
             )
         if len(self.versions) > 0:
             trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
+        if len(self.loss_mask) > 0:
+            trajectory.loss_mask = (
+                torch.stack(self.loss_mask, dim=0).cpu().contiguous()
+            )
         if len(self.forward_inputs) > 0:
             trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
             for key in trajectory.forward_inputs.keys():

@@ -195,7 +195,16 @@ class PegInsertionVerticalEnv(BaseEnv):
         configs = [
             CameraConfig(
                 "base_camera", _external_camera_pose(), 224, 224, 0.6, 0.01, 100
-            )
+            ),
+            # Third-person external-view OBS sensor (same pose/size as the human
+            # render_camera) fed to the robometer progress-reward server via
+            # _wrap_obs (render_images -> history_buffer reward path). Renders in
+            # the normal obs pass alongside base/wrist. For non-RL runs it lands
+            # in the catch-all extra_view_images and is ignored by policies with
+            # num_images_in_input==2 (so it is a cheap no-op for eval).
+            CameraConfig(
+                "reward_camera", _external_camera_pose(), 640, 480, 1, 0.01, 100
+            ),
         ]
         # Back-facing wrist camera (eye-in-hand): mounted on the same camera_link
         # as the front hand_camera but flipped 180 deg about x for a rear view,
@@ -579,6 +588,14 @@ class PegInsertionVerticalEnv(BaseEnv):
             gi = np.asarray(env_idx)
         gi = gi.reshape(-1).astype(np.int64).tolist()
         state = self._lift_planner.plan_lifted_states(gi)
+        # Stash the per-env pick-up state trajectory (subsampled in the planner)
+        # so ManiskillEnv can replay-render it for the robometer. Keys are global
+        # env indices; values are lists of {robot_qpos, peg_pose, hole_pose}
+        # dicts. Consumed (and cleared) by ManiskillEnv.reset right after this.
+        _trajs = state.get("trajectories", []) or []
+        self._pending_pickup_trajectories = {
+            gi[j]: _trajs[j] if j < len(_trajs) else [] for j in range(len(gi))
+        }
         merged = dict(options)
         merged.update(
             {

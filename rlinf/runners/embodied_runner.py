@@ -15,6 +15,7 @@
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from collections import defaultdict
@@ -105,6 +106,10 @@ class EmbodiedRunner:
         self.consumed_samples = 0
         # the step here is GRPO step
         self.global_step = 0
+        # total env steps that actually entered RL training data (loss_mask=True
+        # chunks, i.e. down-sampled insert+hasReward frames, accumulated across
+        # rollouts). Used by _save_checkpoint for the `trainenvstep` ckpt label.
+        self.total_train_env_steps = 0
 
         # compute `max_steps`
         self.set_max_steps()
@@ -182,7 +187,10 @@ class EmbodiedRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        self.global_step = int(resume_dir.split("global_step_")[-1])
+        # parse (global_step, total_train_env_steps) from the ckpt dir name.
+        self.global_step, self.total_train_env_steps = self._parse_resume_dir(
+            resume_dir
+        )
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
@@ -304,6 +312,32 @@ class EmbodiedRunner:
         rollout_metrics = [result.get("rollout_metrics", {}) for result in results]
         training_metrics = [result.get("training_metrics", {}) for result in results]
         return rollout_metrics, training_metrics
+
+    def _sum_rollout_key(self, metrics_list: list[dict], key: str) -> float:
+        """Sum a scalar key across the per-rank rollout metrics list.
+
+        Missing keys default to 0 (defensive). All-reduced metrics already hold
+        the same value on every rank, so sum/N == the value; summing is robust to
+        a short list or a rank whose dict lacks the key.
+        """
+        total = 0.0
+        for m in metrics_list or []:
+            total += float(m.get(key, 0) or 0)
+        return total
+
+    def _parse_resume_dir(self, resume_dir: str) -> tuple[int, int]:
+        """Parse ``(global_step, total_train_env_steps)`` from a ckpt dir name.
+
+        Accepts the new ``global_step_{N}_trainenvstep_{M}`` and the legacy
+        ``global_step_{N}`` (trainenvstep defaults to 0). Regex-based so a
+        trailing suffix (e.g. ``/actor``) or a pasted full path does not break
+        the parse.
+        """
+        gs_match = re.search(r"global_step_(\d+)", resume_dir)
+        global_step = int(gs_match.group(1)) if gs_match else 0
+        tes_match = re.search(r"trainenvstep_(\d+)", resume_dir)
+        total_train_env_steps = int(tes_match.group(1)) if tes_match else 0
+        return global_step, total_train_env_steps
 
     def _maybe_eval_and_checkpoint(self, step: int) -> dict:
         run_val, save_model, _ = check_progress(
@@ -527,6 +561,11 @@ class EmbodiedRunner:
                     actor_rollout_metrics = (
                         self.actor.compute_advantages_and_returns().wait()
                     )
+                # accumulate training-data env steps (loss_mask=True chunks)
+                # for the ckpt `trainenvstep` label (Q2).
+                self.total_train_env_steps += self._sum_rollout_key(
+                    actor_rollout_metrics, "train_env_steps"
+                )
 
                 # actor training.
                 actor_training_handle: Handle = self.actor.run_training()
@@ -619,6 +658,12 @@ class EmbodiedRunner:
                 if env_bootstrap_handle is not None:
                     env_bootstrap_handle.wait()
 
+                # accumulate training-data env steps (loss_mask=True chunks)
+                # for the ckpt `trainenvstep` label (Q2).
+                self.total_train_env_steps += self._sum_rollout_key(
+                    actor_rollout_metrics, "train_env_steps"
+                )
+
                 self.global_step += 1
                 eval_metrics = self._maybe_eval_and_checkpoint(_step)
 
@@ -641,11 +686,25 @@ class EmbodiedRunner:
         self._finish_run()
 
     def _save_checkpoint(self):
-        self.logger.info(f"Saving checkpoint at step {self.global_step}.")
+        # Label ckpt with BOTH training step (global_step = epoch) AND total env
+        # steps that actually entered RL training data (loss_mask=True chunks =
+        # down-sampled insert+hasReward frames, accumulated across rollouts).
+        # Raw env steps (N * envs * steps_per_rollout_epoch) are logged for
+        # reference; the dir name uses *training* env steps so the count reflects
+        # only the data that contributed to the loss (per Q2).
+        _envs = int(self.cfg.env.train.total_num_envs)
+        _steps = int(self.cfg.env.train.max_steps_per_rollout_epoch)
+        _raw_env = self.global_step * _envs * _steps
+        _train_env = int(self.total_train_env_steps)
+        self.logger.info(
+            f"Saving checkpoint at training step {self.global_step} "
+            f"({_train_env} training env steps [loss_mask=True]; "
+            f"~{_raw_env} raw env steps collected)."
+        )
         base_output_dir = os.path.join(
             self.cfg.runner.logger.log_path,
             self.cfg.runner.logger.experiment_name,
-            f"checkpoints/global_step_{self.global_step}",
+            f"checkpoints/global_step_{self.global_step}_trainenvstep_{_train_env}",
         )
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
