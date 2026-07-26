@@ -440,6 +440,14 @@ class FSDPModelManager:
             lr_list = [0.0 for _ in self.optimizer.param_groups]
             if self.optimizer_steps >= self.critic_warmup_steps:
                 self.optimizer = self.build_optimizer(model=self.model)
+                # Re-attach lr_scheduler to the new optimizer so its param_groups
+                # get `initial_lr` (LambdaLR sets it on construction). Without
+                # this the scheduler still points at the OLD (dead) optimizer,
+                # future saves miss `initial_lr` -> resume fails (bug#5), and the
+                # LR schedule silently breaks after the warmup boundary.
+                self.lr_scheduler = self.build_lr_scheduler(
+                    optimizer=self.optimizer, optim_config=self._cfg.optim
+                )
                 self.critic_warmup_steps = 0
         else:
             lr_list = [group["lr"] for group in self.optimizer.param_groups]

@@ -345,10 +345,64 @@ class FSDPStrategyBase(ABC):
                         f"[Checkpoint] loading DCP checkpoint from {dcp_load_path}"
                     )
 
+                # Bug#5 workaround: the saved RL ckpt's optimizer state_dict load
+                # doesn't restore param_groups hyperparams to the live optimizer
+                # (the apply replaces live param_groups with loaded dicts that
+                # lack `betas`/`eps`/`initial_lr`/... -> KeyError in adamw.step;
+                # `initial_lr` is also missing from the ckpt entirely). Two-part
+                # fix: (1) allow_partial_load so dcp.load doesn't raise on the
+                # missing `initial_lr`; (2) snapshot the live param_groups'
+                # hyperparams before load and setdefault-restore them after, so
+                # the live optimizer keeps betas/eps/initial_lr/etc. from its
+                # fresh construction. The saved momentum/state still loads.
+                _opts = (
+                    [optimizers]
+                    if isinstance(optimizers, Optimizer)
+                    else list(optimizers)
+                )
+                _saved_hparams = [
+                    [
+                        {k: v for k, v in pg.items() if k not in ("params", "state")}
+                        for pg in o.param_groups
+                    ]
+                    for o in _opts
+                ]
+                from torch.distributed.checkpoint.default_planner import (
+                    DefaultLoadPlanner,
+                )
                 dcp.load(
                     {"fsdp_checkpoint": training_state},
                     checkpoint_id=dcp_load_path,
+                    planner=DefaultLoadPlanner(allow_partial_load=True),
                 )
+                # Restore hyperparams the load dropped (apply replaced live
+                # param_groups with loaded dicts lacking betas/eps/initial_lr/...).
+                for _o, _sgs in zip(_opts, _saved_hparams):
+                    for _pg, _sg in zip(_o.param_groups, _sgs):
+                        for _k, _v in _sg.items():
+                            _pg.setdefault(_k, _v)
+                # (debug) verify optimizer state right after load
+                if hasattr(cls, "logger") and cls.logger is not None:
+                    try:
+                        _pg0 = (
+                            _opts[0].param_groups[0]
+                            if _opts and _opts[0].param_groups
+                            else {}
+                        )
+                        _base = getattr(lr_schedulers, "base_lrs", None)
+                        _last = (
+                            lr_schedulers.get_last_lr()
+                            if hasattr(lr_schedulers, "get_last_lr")
+                            else None
+                        )
+                        cls.logger.info(
+                            f"[ckpt-load] pg0.lr={_pg0.get('lr')} "
+                            f"betas={_pg0.get('betas')} "
+                            f"initial_lr={_pg0.get('initial_lr')} "
+                            f"sched_base_lrs={_base} sched_last_lr={_last}"
+                        )
+                    except Exception:
+                        pass
         except BaseException as e:
             import traceback
 
