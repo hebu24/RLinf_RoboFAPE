@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import math
 from collections import defaultdict
 from typing import Any
 
@@ -34,6 +35,17 @@ from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import TemporalEnsembleBuffer, prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import RecordVideo
+
+# Pure fns (no server) for down-sample index + progress->chunk mapping (must stay
+# in sync with RobometerHistoryRewardModel.compute_reward, which uses the same).
+from rlinf.models.embodiment.reward.robometer_reward_model import (
+    RobometerEpisodeReward,
+    _robometer_boundary_frame_indices,
+    _robometer_downsample_indices,
+    reconstruct_robometer_delta_reward,
+    reconstruct_robometer_episode_reward,
+    robometer_assignment_metric_values,
+)
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.metric_utils import compute_split_num
@@ -49,14 +61,30 @@ from rlinf.utils.utils import (
     pack_batch,
     preprocess_embodied_batch,
 )
-from rlinf.workers.env.history_manager import HistoryManager
-# Pure fns (no server) for down-sample index + progress->chunk mapping (must stay
-# in sync with RobometerHistoryRewardModel.compute_reward, which uses the same).
-from rlinf.models.embodiment.reward.robometer_reward_model import (
-    _apply_stepwise_success_shift,
-    _robometer_downsample_indices,
-    _interpolate_insert_progress_from_downsampled_frames,
+from rlinf.workers.env.completed_episode_buffer import (
+    CompletedEpisodeBuffer,
+    split_trajectory_by_sizes,
 )
+from rlinf.workers.env.history_manager import (
+    HistoryManager,
+    history_obs_from_step,
+    history_success_from_step,
+)
+
+
+def _rdebug_log_path() -> str:
+    """Resolve the Robometer reward debug log path per-run.
+
+    Two concurrent RL runs share the codebase; without per-run paths their debug
+    writes interleave in one file. Set ``RLINF_REWARD_DEBUG_LOG`` to a distinct
+    path per run (e.g. ``/tmp/robometer_rdebug_absolute.log`` vs ``_delta.log``).
+    Defaults to the legacy shared path so single-run behavior is unchanged.
+    """
+    import os
+
+    return os.environ.get(
+        "RLINF_REWARD_DEBUG_LOG", "/tmp/robometer_rdebug.log"
+    )
 
 
 class EnvWorker(Worker):
@@ -94,9 +122,22 @@ class EnvWorker(Worker):
             self.use_reward_model and not self.use_realworld_reward
         )
         self.env_infos_reward_keys = ("success", "episode", "final_info")
+        self.use_completed_episode_buffer = (
+            self.reward_mode == "history_buffer"
+            and self.cfg.get("reward", {}).get("model", {}).get("model_type")
+            == "robometer"
+        )
         if self.use_external_reward_model:
             self.reward_weight = self.cfg.reward.get("reward_weight", 1.0)
             self.env_reward_weight = self.cfg.reward.get("env_reward_weight", 0.0)
+            # Reward shaping: absolute (progress / progress-1 per low-level step) or
+            # delta (per-chunk progress_{i+1}-progress_i + success_bonus on success
+            # chunks). Delta mode POSTs chunk-boundary frames instead of a uniformly
+            # down-sampled video; see reconstruct_robometer_delta_reward.
+            self.reward_shaping = self.cfg.reward.get("shaping", "absolute")
+            self.delta_success_bonus = float(
+                self.cfg.reward.get("delta", {}).get("success_bonus", 0.1)
+            )
 
         # Env configurations
         self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
@@ -173,6 +214,12 @@ class EnvWorker(Worker):
         )
         if self.use_training_pipeline and self.enable_train:
             self._init_pipeline_params()
+        if (
+            not self.use_training_pipeline
+            and self.enable_train
+            and self.cfg.algorithm.get("actor_channel_keyed_routing", False)
+        ):
+            self._init_async_actor_params()
 
         if self.enable_train:
             self.train_prev_done: list[torch.Tensor] = [
@@ -242,6 +289,19 @@ class EnvWorker(Worker):
                     for _ in range(self.stage_num)
                 ]
                 self.history_lengths = [{} for _ in range(self.stage_num)]
+                if self.use_completed_episode_buffer:
+                    max_chunks = math.ceil(
+                        self.cfg.env.train.max_episode_steps
+                        / self.cfg.env.train.execute_action_chunks
+                    )
+                    self.completed_episode_buffers = [
+                        CompletedEpisodeBuffer(
+                            self.train_num_envs_per_stage,
+                            max_chunks=max_chunks,
+                            max_episode_steps=self.cfg.env.train.max_episode_steps,
+                        )
+                        for _ in range(self.stage_num)
+                    ]
 
         self._init_env()
 
@@ -334,6 +394,37 @@ class EnvWorker(Worker):
                 )
                 for actor_rank in local_actor_ranks
             }
+
+    def _init_async_actor_params(self):
+        """Build per-actor-rank channel keys for deterministic non-pipeline routing.
+
+        Mirrors ``_init_pipeline_params`` but uses the ``"async_actor"`` tag so each
+        env worker writes each shard to a dedicated actor-rank queue (via
+        ``CommMapper.get_dst_ranks``) instead of the shared DEFAULT queue. Eliminates
+        the multi-rank DEFAULT-queue competition that starves actor ranks.
+        """
+        actor_ws = self._component_placement.get_world_size("actor")
+        logical_env_ws = self._world_size * self.stage_num
+        self.async_stage_actor_splits = [
+            CommMapper.get_dst_ranks(
+                batch_size=self.cfg.env.train.total_num_envs,
+                src_world_size=logical_env_ws,
+                dst_world_size=actor_ws,
+                src_rank=self._rank * self.stage_num + stage_id,
+            )
+            for stage_id in range(self.stage_num)
+        ]
+        local_actor_ranks = {
+            actor_rank
+            for actor_splits in self.async_stage_actor_splits
+            for actor_rank, _ in actor_splits
+        }
+        self.async_actor_keys = {
+            actor_rank: CommMapper.build_channel_key(
+                actor_rank, actor_rank, "async_actor"
+            )
+            for actor_rank in local_actor_ranks
+        }
 
     def _inject_realworld_reward_cfg(self, env_cfg: DictConfig):
         if not (self.use_reward_model and self.use_realworld_reward):
@@ -522,42 +613,7 @@ class EnvWorker(Worker):
     def _history_obs_from_step(
         self, obs: dict[str, Any] | None, infos: dict[str, Any] | None
     ) -> dict[str, Any] | None:
-        """Resolve the per-step observation that should enter reward history.
-
-        On auto-reset steps, use the true final observation for done envs rather
-        than the post-reset observation so the Robometer video ends on the real
-        insertion frame.
-        """
-        if obs is None:
-            return None
-        if not isinstance(infos, dict):
-            return obs
-        final_obs = infos.get("final_observation")
-        reset_mask = infos.get("_final_observation")
-        if final_obs is None or reset_mask is None:
-            return obs
-        merged = copy_dict_tensor(obs)
-        reset_mask = (
-            reset_mask.detach().cpu().numpy()
-            if isinstance(reset_mask, torch.Tensor)
-            else np.asarray(reset_mask)
-        )
-        done_mask = (
-            reset_mask.any(axis=-1) if reset_mask.ndim > 1 else reset_mask.astype(bool)
-        )
-        if not done_mask.any():
-            return merged
-        for key, value in merged.items():
-            if key not in final_obs:
-                continue
-            final_value = final_obs[key]
-            if isinstance(value, torch.Tensor) and isinstance(final_value, torch.Tensor):
-                dst_mask = torch.as_tensor(done_mask, device=value.device)
-                src_mask = dst_mask.to(device=final_value.device)
-                merged[key][dst_mask] = final_value[src_mask]
-            elif isinstance(value, np.ndarray) and isinstance(final_value, np.ndarray):
-                merged[key][done_mask] = final_value[done_mask]
-        return merged
+        return history_obs_from_step(obs, infos)
 
     def _append_chunk_history(
         self,
@@ -567,62 +623,17 @@ class EnvWorker(Worker):
     ) -> None:
         history_manager = self.train_history_managers[stage_id]
         step_history = [
-            self._history_obs_from_step(obs, infos)
+            history_obs_from_step(obs, infos)
             for obs, infos in zip(obs_list, infos_list, strict=True)
         ]
         step_success = [
-            self._history_success_from_step(infos)
+            history_success_from_step(infos, history_manager.num_envs)
             for infos in infos_list
         ]
         history_manager.append_history_sequence(step_history, success_list=step_success)
 
-    def _history_success_from_step(
-        self, infos: dict[str, Any] | None
-    ) -> list[bool]:
-        """Resolve per-env success for one low-level env step.
-
-        For auto-reset terminal steps, use ``final_info["success"]`` for the done
-        envs so the success trace aligns with the true terminal frame rather than
-        the post-reset observation.
-        """
-        if not isinstance(infos, dict):
-            raise ValueError("Reward history requires per-step env infos to resolve success.")
-
-        success = infos.get("success")
-        if success is None:
-            raise ValueError(
-                "Reward history requires per-step root `success` in env infos "
-                "to construct stepwise Robometer reward."
-            )
-        if isinstance(success, torch.Tensor):
-            success_values = success.detach().cpu().bool().clone()
-        else:
-            success_values = torch.as_tensor(np.asarray(success), dtype=torch.bool)
-
-        final_info = infos.get("final_info")
-        reset_mask = infos.get("_final_info")
-        if isinstance(final_info, dict) and reset_mask is not None and "success" in final_info:
-            final_success = final_info["success"]
-            if isinstance(final_success, torch.Tensor):
-                final_success_values = final_success.detach().cpu().bool()
-            else:
-                final_success_values = torch.as_tensor(
-                    np.asarray(final_success), dtype=torch.bool
-                )
-            reset_mask = (
-                reset_mask.detach().cpu().numpy()
-                if isinstance(reset_mask, torch.Tensor)
-                else np.asarray(reset_mask)
-            )
-            done_mask = (
-                reset_mask.any(axis=-1)
-                if reset_mask.ndim > 1
-                else reset_mask.astype(bool)
-            )
-            if done_mask.any():
-                done_mask_t = torch.as_tensor(done_mask, dtype=torch.bool)
-                success_values[done_mask_t] = final_success_values[done_mask_t]
-        return success_values.tolist()
+    def _history_success_from_step(self, infos: dict[str, Any] | None) -> list[bool]:
+        return history_success_from_step(infos, self.train_num_envs_per_stage)
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
@@ -680,8 +691,8 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
-        obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
-            env.chunk_step(chunk_actions)
+        obs_list, _, chunk_terminations, chunk_truncations, infos_list = env.chunk_step(
+            chunk_actions
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -711,9 +722,7 @@ class EnvWorker(Worker):
             # the next chunk's blend does not mix in pre-reset predictions.
             self.eval_ensemble_step[stage_id] += k
             if newly_done.any():
-                buffer.mark_reset(
-                    newly_done, step=self.eval_ensemble_step[stage_id]
-                )
+                buffer.mark_reset(newly_done, step=self.eval_ensemble_step[stage_id])
 
         if newly_done.any():
             if "final_info" in infos:
@@ -848,10 +857,7 @@ class EnvWorker(Worker):
             # here (env reward is zeroed via env_reward_weight=0, so this is a
             # no-op that avoids a shape broadcast error and double-counting).
             if rm.dim() <= 1 or rm.shape == rewards.shape:
-                rewards = (
-                    self.env_reward_weight * rewards
-                    + self.reward_weight * rm
-                )
+                rewards = self.env_reward_weight * rewards + self.reward_weight * rm
 
         adjusted_rewards = rewards.clone()
         if (
@@ -906,8 +912,10 @@ class EnvWorker(Worker):
     ):
         if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
             try:
-                with open("/tmp/robometer_rdebug.log", "a") as _f:
-                    _f.write(f"EW get_reward_model_output ENTER rank={getattr(self, '_rank', -1)} reward_mode={self.reward_mode}\n")
+                with open(_rdebug_log_path(), "a") as _f:
+                    _f.write(
+                        f"EW get_reward_model_output ENTER rank={getattr(self, '_rank', -1)} reward_mode={self.reward_mode}\n"
+                    )
             except Exception:
                 pass
         if self.reward_mode in {"per_step", "history_buffer"}:
@@ -929,7 +937,8 @@ class EnvWorker(Worker):
         dones = env_output.dones
         if dones is not None and getattr(dones, "ndim", 0) > 1:
             dones = dones[:, -1]
-            reward_input.update({"dones": dones})
+        if dones is not None:
+            reward_input["dones"] = dones
 
         if self.reward_mode == "history_buffer":
             if stage_id is None:
@@ -945,16 +954,33 @@ class EnvWorker(Worker):
                 _stash = {}
                 for _e in dones.nonzero(as_tuple=False).reshape(-1).tolist():
                     _stash[int(_e)] = (
-                        int(history_manager.history_counts[int(_e)]),
+                        int(len(history_manager.history_entries[int(_e)])),
                         int(history_manager.pickup_counts[int(_e)]),
                         list(history_manager.success_history_entries[int(_e)]),
                     )
                 self._last_done_buffer_info[stage_id] = _stash
+            emit_mask = (
+                dones.to(dtype=torch.bool)
+                if dones is not None
+                else torch.zeros(self.train_num_envs_per_stage, dtype=torch.bool)
+            )
+            # Capture pickup_counts BEFORE build_history_input clears done envs
+            # (delta mode needs the per-env pickup offset to select chunk-boundary
+            # frames in RobometerHistoryRewardModel.compute_reward).
+            _delta_pickup_counts = list(history_manager.pickup_counts)
             history_input, history_lengths = history_manager.build_history_input(
-                dones=dones
+                dones=dones, emit_mask=emit_mask
             )
             reward_input["history_input"] = history_input
             self.history_lengths[stage_id] = dict(history_lengths)
+            if self.reward_shaping == "delta":
+                reward_input["shaping"] = "delta"
+                reward_input["pickup_counts"] = _delta_pickup_counts
+                # chunk_size = num_action_chunks matches assign_history_reward's
+                # chunk_size (rollout_rewards[-1].shape[-1]); execute_action_chunks
+                # == num_action_chunks in this config so the boundary frame interval
+                # is the correct low-level step count per chunk.
+                reward_input["chunk_size"] = int(self.model_cfg.num_action_chunks)
             # Auto-reset prepend: build_history_input just cleared done envs;
             # the env's reset (inside the preceding chunk_step) already stashed
             # this env's new pick-up frames via ManiskillEnv._render_pickup_frames.
@@ -971,7 +997,7 @@ class EnvWorker(Worker):
                     if _consume and _e in _consume and _consume[_e]:
                         _hm.prepend_history_entries(int(_e), _consume[_e])
 
-        if last_run:
+        if last_run and self.reward_mode != "history_buffer":
             reward_input.update(
                 {
                     "last_run": torch.ones(
@@ -986,7 +1012,10 @@ class EnvWorker(Worker):
         # (_compute_rewards `while True: await recv`) idle-waits -> no deadlock;
         # assign_history_reward auto-skips (gated on reward_model_output is not
         # None). Returns None so send+recv stay a matched pair (no orphan recv).
-        if not (last_run or (dones is not None and bool(dones.any()))):
+        if self.reward_mode == "history_buffer":
+            if dones is None or not bool(dones.any()):
+                return None
+        elif not (last_run or (dones is not None and bool(dones.any()))):
             return None
         self.send_to(
             group_name=self.cfg.reward.group_name,
@@ -1005,8 +1034,10 @@ class EnvWorker(Worker):
         )
         if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
             try:
-                with open("/tmp/robometer_rdebug.log", "a") as _f:
-                    _f.write(f"EW get_reward_model_output RECV rank={getattr(self, '_rank', -1)} reward_output={type(reward_output)} is_none={reward_output is None}\n")
+                with open(_rdebug_log_path(), "a") as _f:
+                    _f.write(
+                        f"EW get_reward_model_output RECV rank={getattr(self, '_rank', -1)} reward_output={type(reward_output)} is_none={reward_output is None}\n"
+                    )
             except Exception:
                 pass
         if self.reward_mode != "terminal" or reward_output is None:
@@ -1042,162 +1073,140 @@ class EnvWorker(Worker):
         )
         return sparse_rewards
 
-    def assign_history_reward(self, stage_id: int, reward_model_output: torch.Tensor):
-        reward_assign_lengths = [
-            min(
-                history_buffer_length[env_id]
-                for history_buffer_length in self.history_lengths[stage_id].values()
-            )
-            for env_id in range(self.train_num_envs_per_stage)
-        ]
+    def assign_history_reward(
+        self, stage_id: int, reward_model_output: torch.Tensor
+    ) -> dict[int, RobometerEpisodeReward]:
         rollout_rewards = self.rollout_results[stage_id].rewards
-        rollout_rewards_length = len(rollout_rewards)
-        reward_assign_lengths = [
-            min(reward_assign_length, rollout_rewards_length)
-            for reward_assign_length in reward_assign_lengths
-        ]
-        if not any(reward_assign_lengths):
-            return
+        if not rollout_rewards:
+            return {}
         reward = (self.reward_weight * reward_model_output).to(
             rollout_rewards[-1].dtype
         )
-        # Per-frame history rewards (e.g. robometer progress curve) return a
-        # 2-D [B, T_history] tensor: interpolate the down-sampled insertion-frame
-        # rewards back onto the insertion low-level steps, then scatter those
-        # low-level rewards onto the last episode's chunk sub-steps. Chunk-level
-        # PPO later aggregates those low-level rewards back into one chunk reward.
-        is_per_chunk = reward_model_output.dim() == 2
-        _hm = self.train_history_managers[stage_id]
-        # Stash of (history_counts, pickup_counts) captured in
-        # get_reward_model_output BEFORE build_history_input cleared the done envs
-        # (the live _hm counters now hold the NEW episode's values, wrong here).
-        _stash = getattr(self, "_last_done_buffer_info", {}).get(stage_id, {})
-        _maxf = int(self.cfg.reward.model.get("max_robometer_frames", 60))
-        _rdebug = bool(__import__("os").environ.get("RLINF_REWARD_DEBUG"))
-        _loss_masks = self.rollout_results[stage_id].loss_mask
-        for env_id, reward_assign_length in enumerate(reward_assign_lengths):
-            if not is_per_chunk:
-                # 1-D scalar-per-env path (history_vlm) — unchanged.
-                for reward_assign_step in range(2, reward_assign_length + 1):
+        if reward_model_output.dim() != 2:
+            reward_assign_lengths = [
+                min(
+                    history_buffer_length[env_id]
+                    for history_buffer_length in self.history_lengths[stage_id].values()
+                )
+                for env_id in range(self.train_num_envs_per_stage)
+            ]
+            for env_id, reward_assign_length in enumerate(reward_assign_lengths):
+                for reward_assign_step in range(
+                    2, min(reward_assign_length, len(rollout_rewards)) + 1
+                ):
                     rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
-                continue
-            r_env = reward[env_id]
-            # (hist_len, pickup_count) for the JUST-FINISHED episode: stash for
-            # done envs (pre-clear), live for non-done envs at last_run flush.
-            if env_id in _stash:
-                hist_len_env, k_env, success_trace_env = _stash[env_id]
+            return {}
+
+        stash = getattr(self, "_last_done_buffer_info", {}).pop(stage_id, {})
+        if not stash:
+            raise ValueError(
+                "Received per-frame history reward without a completed env stash."
+            )
+        max_frames = int(self.cfg.reward.model.get("max_robometer_frames", 60))
+        fail_shift = float(self.cfg.reward.model.get("fail_shift", 1.0))
+        chunk_size = int(rollout_rewards[-1].shape[-1])
+        delta_mode = self.reward_shaping == "delta"
+        assignments: dict[int, RobometerEpisodeReward] = {}
+        for env_id, (history_len, pickup_count, success_trace) in stash.items():
+            insert_steps = history_len - pickup_count
+            total_chunks = math.ceil(insert_steps / chunk_size)
+            env_progress = reward[env_id].detach().cpu().numpy().astype(np.float32)
+            if delta_mode:
+                # Delta shaping: progress is one value per chunk-boundary frame
+                # (total_chunks + 1). max_robometer_frames is NOT applied; the
+                # boundary frame count is already bounded by episode chunk count.
+                expected_progress = len(
+                    _robometer_boundary_frame_indices(
+                        history_len, pickup_count, chunk_size
+                    )
+                )
+                if env_progress.shape[0] < expected_progress:
+                    raise ValueError(
+                        "Robometer boundary progress is shorter than the completed "
+                        f"episode's boundary frame count: env_id={env_id}, "
+                        f"expected={expected_progress}, got={env_progress.shape[0]}."
+                    )
+                assignment = reconstruct_robometer_delta_reward(
+                    env_progress[:expected_progress],
+                    history_len=history_len,
+                    pickup_count=pickup_count,
+                    success_trace=success_trace,
+                    chunk_size=chunk_size,
+                    total_chunks=total_chunks,
+                    success_bonus=self.delta_success_bonus,
+                )
             else:
-                hist_len_env = _hm.history_counts[env_id]
-                k_env = _hm.pickup_counts[env_id]
-                success_trace_env = list(_hm.success_history_entries[env_id])
-            r_env_np = (
-                r_env.detach().cpu().numpy().astype(np.float32)
-                if hasattr(r_env, "detach")
-                else np.asarray(r_env, dtype=np.float32)
-            )
-            per_step_progress, per_step_has_reward = (
-                _interpolate_insert_progress_from_downsampled_frames(
-                    r_env_np, hist_len_env, k_env, _maxf
+                expected_progress = len(
+                    _robometer_downsample_indices(history_len, max_frames)
                 )
-            )
-            if len(success_trace_env) < k_env:
-                raise ValueError(
-                    "Stored success trace is shorter than pickup prefix; cannot align "
-                    f"trajectory reward. stage_id={stage_id}, env_id={env_id}, "
-                    f"pickup_count={k_env}, success_trace_len={len(success_trace_env)}."
+                if env_progress.shape[0] < expected_progress:
+                    raise ValueError(
+                        "Robometer progress is shorter than the completed episode's "
+                        f"downsampled history: env_id={env_id}, "
+                        f"expected={expected_progress}, got={env_progress.shape[0]}."
+                    )
+                assignment = reconstruct_robometer_episode_reward(
+                    env_progress[:expected_progress],
+                    history_len=history_len,
+                    pickup_count=pickup_count,
+                    success_trace=success_trace,
+                    max_frames=max_frames,
+                    fail_shift=fail_shift,
+                    chunk_size=chunk_size,
+                    total_chunks=total_chunks,
                 )
-            insert_success_trace = np.asarray(success_trace_env[k_env:hist_len_env], dtype=bool)
-            if insert_success_trace.shape[0] != per_step_progress.shape[0]:
-                raise ValueError(
-                    "Stepwise success trace length does not match interpolated insertion "
-                    "progress length. stage_id="
-                    f"{stage_id}, env_id={env_id}, hist_len={hist_len_env}, pickup={k_env}, "
-                    f"success_trace_len={insert_success_trace.shape[0]}, "
-                    f"progress_len={per_step_progress.shape[0]}."
-                )
-            per_step_reward = _apply_stepwise_success_shift(
-                per_step_progress,
-                insert_success_trace,
-                fail_shift=float(self.cfg.reward.model.get("fail_shift", 1.0)),
-            )
-            total_rollout_steps = rollout_rewards_length * int(
-                rollout_rewards[-1].shape[-1]
-            )
-            insert_len = min(len(per_step_reward), total_rollout_steps)
-            first_flat_step = total_rollout_steps - insert_len
-            for step_idx in range(insert_len):
-                flat_step = first_flat_step + step_idx
-                chunk_idx = flat_step // int(rollout_rewards[-1].shape[-1])
-                substep_idx = flat_step % int(rollout_rewards[-1].shape[-1])
-                if chunk_idx >= len(rollout_rewards) or chunk_idx >= len(_loss_masks):
-                    continue
-                _rr = rollout_rewards[chunk_idx]
-                _rr[env_id, substep_idx] = torch.tensor(
-                    float(per_step_reward[step_idx]),
-                    dtype=_rr.dtype,
-                    device=_rr.device,
-                )
-                _loss_masks[chunk_idx][env_id, substep_idx] = bool(
-                    per_step_has_reward[step_idx]
-                )
-            # First-trajectory debug dump (env 0): verify ds + reward + loss_mask
-            # alignment before letting RL run long. Gated by RLINF_REWARD_DEBUG.
-            if _rdebug and env_id == 0:
+            if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
                 try:
-                    with open("/tmp/robometer_rdebug.log", "a") as _f:
-                        _ds = _robometer_downsample_indices(hist_len_env, _maxf)
-                        _lm_tail = (
-                            np.array(
-                                [
-                                    bool(
-                                        _loss_masks[(first_flat_step + s) // int(rollout_rewards[-1].shape[-1])][
-                                            env_id,
-                                            (first_flat_step + s) % int(rollout_rewards[-1].shape[-1]),
-                                        ]
-                                    )
-                                    for s in range(insert_len)
-                                ]
-                            )
-                            if insert_len > 0
-                            else np.array([])
+                    with open(_rdebug_log_path(), "a") as _f:
+                        _n_boundary = (
+                            len(assignment.downsample_indices)
+                            if delta_mode
+                            else 0
                         )
-                        _rew_tail = (
-                            np.round(
-                                [
-                                    float(
-                                        rollout_rewards[(first_flat_step + s) // int(rollout_rewards[-1].shape[-1])][
-                                            env_id,
-                                            (first_flat_step + s) % int(rollout_rewards[-1].shape[-1]),
-                                        ]
-                                    )
-                                    for s in range(insert_len)
-                                ],
-                                3,
-                            ).tolist()
-                            if insert_len > 0
-                            else []
-                        )
+                        _delta_sum = float(
+                            np.asarray(assignment.chunk_reward[:, 0]).sum()
+                        ) if delta_mode else 0.0
+                        _success_chunks = int(
+                            np.asarray(assignment.chunk_reward[:, 0] > 0).sum()
+                        ) if delta_mode else 0
                         _f.write(
-                            f"[assign] stage={stage_id} env={env_id} hist_len={hist_len_env} "
-                            f"pickup={k_env} maxf={_maxf} insert_len={insert_len} "
-                            f"rollout_len={rollout_rewards_length}\n"
-                        )
-                        _f.write(f"  ds={_ds}\n")
-                        _f.write(
-                            f"  per_step_progress[:10]={np.round(per_step_progress[:10], 3)}\n"
-                        )
-                        _f.write(
-                            f"  step_success[:10]={insert_success_trace[:10].tolist()}\n"
-                        )
-                        _f.write(
-                            f"  per_step_reward[:10]={np.round(per_step_reward[:10], 3)}\n"
-                        )
-                        _f.write(
-                            f"  has_reward_steps(in-ep)={np.where(per_step_has_reward[:insert_len])[0].tolist()} "
-                            f"loss_mask_tail={_lm_tail.tolist()} rewards_tail={_rew_tail}\n"
+                            f"[assign] env_id={env_id} shaping={self.reward_shaping} "
+                            f"history_len={history_len} pickup={pickup_count} "
+                            f"total_chunks={total_chunks} chunk_size={chunk_size} "
+                            f"n_boundary={_n_boundary} delta_sum={_delta_sum:.4f} "
+                            f"success_chunks={_success_chunks} "
+                            f"episode_success={assignment.episode_success}\n"
                         )
                 except Exception:
                     pass
+            assignments[env_id] = assignment
+
+            if not self.use_completed_episode_buffer:
+                episode_chunks = assignment.chunk_reward.shape[0]
+                if episode_chunks > len(rollout_rewards):
+                    raise ValueError(
+                        "Completed episode crosses the retained rollout boundary; "
+                        "enable the completed episode buffer for terminal history rewards."
+                    )
+                start_chunk = len(rollout_rewards) - episode_chunks
+                for chunk_offset in range(episode_chunks):
+                    target = rollout_rewards[start_chunk + chunk_offset]
+                    target[env_id] = torch.as_tensor(
+                        assignment.chunk_reward[chunk_offset],
+                        dtype=target.dtype,
+                        device=target.device,
+                    )
+                    self.rollout_results[stage_id].loss_mask[
+                        start_chunk + chunk_offset
+                    ][env_id] = torch.as_tensor(
+                        assignment.chunk_loss_mask[chunk_offset],
+                        dtype=torch.bool,
+                        device=target.device,
+                    )
+
+        if self.use_completed_episode_buffer:
+            self.completed_episode_buffers[stage_id].add_rewards(assignments)
+        return assignments
 
     @Worker.timer("env/bootstrap_step")
     def bootstrap_step(self) -> list[EnvOutput]:
@@ -1301,16 +1310,80 @@ class EnvWorker(Worker):
 
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
-        self, rollout_result: EmbodiedRolloutResult, channel: Channel
+        self,
+        rollout_result: EmbodiedRolloutResult | Trajectory,
+        channel: Channel,
+        stage_id: int = 0,
+        keyed: bool = False,
     ):
-        trajectories: list[Trajectory] = rollout_result.to_splited_trajectories(
-            self.actor_split_num
-        )
-        rollout_result.clear()
+        if keyed:
+            # Deterministic per-actor-rank routing: split this env worker's batch by
+            # CommMapper.get_dst_ranks shards and write each to a dedicated queue, so
+            # every actor rank receives exactly its shard (no DEFAULT-queue racing).
+            actor_splits = self.async_stage_actor_splits[stage_id]
+            split_sizes = [size for _, size in actor_splits]
+            if isinstance(rollout_result, EmbodiedRolloutResult):
+                trajectories = rollout_result.to_splited_trajectories_by_sizes(
+                    split_sizes
+                )
+                rollout_result.clear()
+            else:
+                trajectories = split_trajectory_by_sizes(rollout_result, split_sizes)
+            for (actor_rank, _), trajectory in zip(actor_splits, trajectories):
+                channel.put(
+                    trajectory,
+                    key=self.async_actor_keys[actor_rank],
+                    async_op=True,
+                )
+            del trajectories
+            gc.collect()
+            return
+        if isinstance(rollout_result, EmbodiedRolloutResult):
+            trajectories = rollout_result.to_splited_trajectories(self.actor_split_num)
+            rollout_result.clear()
+        else:
+            batch_size = int(rollout_result.rewards.shape[1])
+            if batch_size % self.actor_split_num != 0:
+                raise ValueError(
+                    f"Completed episode batch {batch_size} is not divisible by "
+                    f"actor_split_num={self.actor_split_num}."
+                )
+            trajectories = split_trajectory_by_sizes(
+                rollout_result,
+                [batch_size // self.actor_split_num] * self.actor_split_num,
+            )
         for trajectory in trajectories:
             channel.put(trajectory, async_op=True)
         del trajectories
         gc.collect()
+
+    def _completed_episode_batch(
+        self, stage_id: int, rollout_result: EmbodiedRolloutResult
+    ) -> Trajectory:
+        buffer = self.completed_episode_buffers[stage_id]
+        buffer.ingest(rollout_result.to_trajectory())
+        return buffer.pop_batch(self.train_num_envs_per_stage)
+
+    @staticmethod
+    def _record_completed_episode_metrics(env_metrics, buffer) -> None:
+        wait_rounds = list(buffer.completed_wait_rounds)
+        metrics = {
+            "reward/pending_episodes": buffer.pending_count,
+            "reward/ready_episodes": buffer.ready_episodes,
+            "reward/completed_episodes": buffer.completed_episodes,
+            "reward/cross_rollout_episodes": buffer.cross_rollout_episodes,
+            "reward/valid_chunks": buffer.last_batch_valid_chunks,
+            "reward/padding_chunks": buffer.last_batch_padding_chunks,
+            "reward/episode_wait_rollouts": (
+                float(sum(wait_rounds) / len(wait_rounds)) if wait_rounds else 0.0
+            ),
+            "reward/superseded_completed_episodes": buffer.superseded_completed_episodes,
+            "reward/selected_episode_version_min": buffer.selected_episode_version_min,
+            "reward/selected_episode_version_max": buffer.selected_episode_version_max,
+            "reward/selected_episode_wait_rollouts": buffer.selected_episode_wait_rollouts,
+        }
+        for key, value in metrics.items():
+            env_metrics[key].append(torch.tensor([value], dtype=torch.float32))
 
     @Worker.timer("run_interact_once")
     async def _run_interact_once(
@@ -1324,7 +1397,7 @@ class EnvWorker(Worker):
     ) -> dict[str, torch.Tensor]:
         if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
             try:
-                with open("/tmp/robometer_rdebug.log", "a") as _f:
+                with open(_rdebug_log_path(), "a") as _f:
                     _f.write(
                         f"EW _run_interact_once rank={getattr(self, '_rank', -1)} "
                         f"reward_channel_none={reward_channel is None} "
@@ -1413,7 +1486,13 @@ class EnvWorker(Worker):
                         and self.history_reward_assign
                         and reward_model_output is not None
                     ):
-                        self.assign_history_reward(stage_id, reward_model_output)
+                        assignments = self.assign_history_reward(
+                            stage_id, reward_model_output
+                        )
+                        for key, values in robometer_assignment_metric_values(
+                            assignments
+                        ).items():
+                            env_metrics[key].append(values)
                     if rollout_result.save_flags is not None:
                         self.rollout_results[stage_id].mark_last_step_with_flags(
                             rollout_result.save_flags
@@ -1501,11 +1580,27 @@ class EnvWorker(Worker):
                     and self.history_reward_assign
                     and reward_model_output is not None
                 ):
-                    self.assign_history_reward(stage_id, reward_model_output)
+                    assignments = self.assign_history_reward(
+                        stage_id, reward_model_output
+                    )
+                    for key, values in robometer_assignment_metric_values(
+                        assignments
+                    ).items():
+                        env_metrics[key].append(values)
 
             if self.use_training_pipeline and actor_channel is not None:
+                send_results: list[EmbodiedRolloutResult | Trajectory]
+                if self.use_completed_episode_buffer:
+                    send_results = [
+                        self._completed_episode_batch(stage_id, rollout_result)
+                        for stage_id, rollout_result in enumerate(self.rollout_results)
+                    ]
+                    for buffer in self.completed_episode_buffers:
+                        self._record_completed_episode_metrics(env_metrics, buffer)
+                else:
+                    send_results = self.rollout_results
                 await self.send_rollout_trajectories_pipeline(
-                    self.rollout_results, actor_channel
+                    send_results, actor_channel
                 )
                 self.rollout_results: list[EmbodiedRolloutResult] = [
                     EmbodiedRolloutResult(
@@ -1519,8 +1614,20 @@ class EnvWorker(Worker):
 
         if not self.use_training_pipeline and actor_channel is not None:
             for stage_id in range(self.stage_num):
+                send_result: EmbodiedRolloutResult | Trajectory
+                if self.use_completed_episode_buffer:
+                    send_result = self._completed_episode_batch(
+                        stage_id, self.rollout_results[stage_id]
+                    )
+                    buffer = self.completed_episode_buffers[stage_id]
+                    self._record_completed_episode_metrics(env_metrics, buffer)
+                else:
+                    send_result = self.rollout_results[stage_id]
                 await self.send_rollout_trajectories(
-                    self.rollout_results[stage_id], actor_channel
+                    send_result,
+                    actor_channel,
+                    stage_id=stage_id,
+                    keyed=self.cfg.algorithm.get("actor_channel_keyed_routing", False),
                 )
             # reduce memory peak
             self.rollout_results = []
@@ -1720,7 +1827,7 @@ class EnvWorker(Worker):
 
     async def send_rollout_trajectories_pipeline(
         self,
-        rollout_results: list[EmbodiedRolloutResult],
+        rollout_results: list[EmbodiedRolloutResult | Trajectory],
         channel: Channel,
     ) -> None:
         pending_batches: list[tuple[int, dict[str, torch.Tensor]]] = []
@@ -1731,9 +1838,15 @@ class EnvWorker(Worker):
         with self.worker_timer("prepare_micro_batches"):
             for stage_id, rollout_result in enumerate(rollout_results):
                 actor_splits = self.pipeline_stage_actor_splits[stage_id]
-                trajectories = rollout_result.to_splited_trajectories_by_sizes(
-                    [split_size for _, split_size in actor_splits]
-                )
+                split_sizes = [split_size for _, split_size in actor_splits]
+                if isinstance(rollout_result, EmbodiedRolloutResult):
+                    trajectories = rollout_result.to_splited_trajectories_by_sizes(
+                        split_sizes
+                    )
+                else:
+                    trajectories = split_trajectory_by_sizes(
+                        rollout_result, split_sizes
+                    )
 
                 for (actor_rank, _), trajectory in zip(actor_splits, trajectories):
                     batch = self.prepare_pipeline_batch(trajectory)

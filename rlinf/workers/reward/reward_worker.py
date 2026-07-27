@@ -44,6 +44,13 @@ from rlinf.utils.utils import (
 )
 
 
+def _rdebug_log_path() -> str:
+    """Per-run Robometer reward debug log path (see env_worker._rdebug_log_path)."""
+    import os
+
+    return os.environ.get("RLINF_REWARD_DEBUG_LOG", "/tmp/robometer_rdebug.log")
+
+
 class RewardWorker(Worker):
     """Reward Worker for inference during reasoning and agentic RL training."""
 
@@ -380,7 +387,7 @@ class EmbodiedRewardWorker(Worker):
             ).async_wait()
             if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
                 try:
-                    with open("/tmp/robometer_rdebug.log", "a") as _f:
+                    with open(_rdebug_log_path(), "a") as _f:
                         _f.write(f"RW _compute_rewards received merged_data type={type(merged_data)} keys={list(merged_data.keys()) if isinstance(merged_data, dict) else None}\n")
                 except Exception:
                     pass

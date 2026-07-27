@@ -64,6 +64,48 @@ def kl_penalty(
     raise NotImplementedError
 
 
+def aggregate_embodied_chunk_rewards(
+    chunk_rewards: torch.Tensor,
+    chunk_loss_mask: Optional[torch.Tensor],
+    gamma: float,
+    aggregation: str,
+) -> torch.Tensor:
+    """Aggregate low-level rewards into the chunk rewards consumed by PPO."""
+    if aggregation == "sum":
+        aggregated_rewards = chunk_rewards
+        if chunk_loss_mask is not None:
+            aggregated_rewards = aggregated_rewards * chunk_loss_mask.to(
+                dtype=chunk_rewards.dtype
+            )
+        return aggregated_rewards.sum(dim=-1, keepdim=True)
+    if aggregation == "mean":
+        aggregated_rewards = chunk_rewards
+        if chunk_loss_mask is not None:
+            mask = chunk_loss_mask.to(dtype=chunk_rewards.dtype)
+            denominator = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            return (aggregated_rewards * mask).sum(dim=-1, keepdim=True) / denominator
+        return aggregated_rewards.mean(dim=-1, keepdim=True)
+    if aggregation == "discounted_sum":
+        steps = torch.arange(
+            chunk_rewards.shape[-1],
+            device=chunk_rewards.device,
+            dtype=chunk_rewards.dtype,
+        )
+        weights = torch.pow(
+            torch.as_tensor(
+                gamma, device=chunk_rewards.device, dtype=chunk_rewards.dtype
+            ),
+            steps,
+        ).view(1, 1, -1)
+        aggregated_rewards = chunk_rewards * weights
+        if chunk_loss_mask is not None:
+            aggregated_rewards = aggregated_rewards * chunk_loss_mask.to(
+                dtype=chunk_rewards.dtype
+            )
+        return aggregated_rewards.sum(dim=-1, keepdim=True)
+    raise ValueError(f"Unsupported chunk reward aggregation: {aggregation}")
+
+
 def preprocess_embodied_advantages_inputs(
     rewards: torch.Tensor,
     dones: torch.Tensor,
@@ -76,49 +118,15 @@ def preprocess_embodied_advantages_inputs(
     Preprocess inputs before computing advantages & returns.
     Unify names & formats, align with math interfaces.
     """
-    def _aggregate_chunk_rewards(
-        chunk_rewards: torch.Tensor,
-        chunk_loss_mask: Optional[torch.Tensor],
-        gamma: float,
-        agg: str,
-    ) -> torch.Tensor:
-        if agg == "sum":
-            agg_rewards = chunk_rewards
-            if chunk_loss_mask is not None:
-                agg_rewards = agg_rewards * chunk_loss_mask.to(dtype=chunk_rewards.dtype)
-            return agg_rewards.sum(dim=-1, keepdim=True)
-        if agg == "mean":
-            agg_rewards = chunk_rewards
-            if chunk_loss_mask is not None:
-                mask = chunk_loss_mask.to(dtype=chunk_rewards.dtype)
-                denom = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                return (agg_rewards * mask).sum(dim=-1, keepdim=True) / denom
-            return agg_rewards.mean(dim=-1, keepdim=True)
-        if agg == "discounted_sum":
-            steps = torch.arange(
-                chunk_rewards.shape[-1],
-                device=chunk_rewards.device,
-                dtype=chunk_rewards.dtype,
-            )
-            weights = torch.pow(
-                torch.as_tensor(gamma, device=chunk_rewards.device, dtype=chunk_rewards.dtype),
-                steps,
-            ).view(1, 1, -1)
-            agg_rewards = chunk_rewards * weights
-            if chunk_loss_mask is not None:
-                agg_rewards = agg_rewards * chunk_loss_mask.to(dtype=chunk_rewards.dtype)
-            return agg_rewards.sum(dim=-1, keepdim=True)
-        raise ValueError(f"Unsupported chunk reward aggregation: {agg}")
-
     if kwargs["reward_type"] == "chunk_level":
         chunk_reward_aggregation = kwargs.get("chunk_reward_aggregation", "sum")
         gamma = float(kwargs.get("gamma", 1.0))
         # rewards, dones, loss_mask, loss_mask_sum: [n_chunk_steps, bsz, num_action_chunks] -> [n_chunk_steps, bsz, 1]
-        rewards = _aggregate_chunk_rewards(
+        rewards = aggregate_embodied_chunk_rewards(
             rewards,
             loss_mask,
             gamma=gamma,
-            agg=chunk_reward_aggregation,
+            aggregation=chunk_reward_aggregation,
         )
         dones = dones.max(dim=-1, keepdim=True)[0]
         if loss_mask is not None:

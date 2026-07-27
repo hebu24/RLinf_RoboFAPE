@@ -244,3 +244,59 @@ Keep tests proportional to risk. For user-facing embodied behavior, add or updat
 ## Style and Contribution Rules
 
 Use Google-style Python docstrings and type hints for public APIs. Use project logging (`rlinf.utils.logging.get_logger()` or worker `self.log_*`) instead of `print`. Keep config YAML static and avoid silently overwriting user-facing config fields in code. New user-facing behavior needs tests and docs. If behavior is unclear, add `TODO(agent)` and note the limitation.
+
+---
+
+## Async-PPO completed-episode staleness fix (`staleness_filter_mode: chunk_mask`)
+
+Async PPO retains completed episodes across rollouts (a long episode may span
+multiple policy versions + collection windows). The legacy `trajectory` mode
+drops a WHOLE trajectory when `versions.min()` is stale, which starves actor
+ranks and deadlocks the FSDP collective. `chunk_mask` mode instead keeps the
+whole episode (needed for Robometer reward reconstruction + GAE) and only masks
+stale CHUNKS out of the loss / reward aggregation.
+
+Enable for peg-insertion Robometer async PPO (config `algorithm:` block):
+- `staleness_filter_mode: chunk_mask` — default `trajectory` keeps legacy behavior.
+- `actor_channel_keyed_routing: true` — each env worker shards completed episodes
+  to a per-actor-rank dedicated channel key (`CommMapper.get_dst_ranks` /
+  `build_channel_key`), so no two actor ranks contend for one shared queue.
+  Generic M:N (not 4-card-specific).
+- `staleness_threshold: 1` — a chunk is fresh iff `version >= actor_version - threshold`.
+- `rollout_store_wait_timeout_s: 600` / `rollout_store_status_interval_s: 30` —
+  readiness-collective timeout + 30s periodic status log.
+
+**Readiness collective (chunk_mask only):** two-phase `all_reduce(MIN)` —
+(1) every actor rank has a candidate trajectory; (2) every rank's candidates
+contain >=1 fresh chunk. If any rank lacks candidates, all wait. If all have
+candidates but any rank has 0 fresh chunks, all ranks `discard_topn()` and
+re-collect. On success, all ranks `take_topn()`. On timeout, `all_reduce(MAX)`
+syncs the abort and all ranks raise together. The collective is the sync point
+(no standalone `torch.distributed.barrier()`).
+
+**Bounded completed-episode queue (`CompletedEpisodeBuffer`):** per-env ready
+slot; within one collection window only the LATEST completed episode per env
+survives (older ones counted in `superseded_completed_episodes`, never sent to
+the actor channel). Each training batch takes one episode per env id. Raises if
+an env has no completed episode after a full `max_episode_steps` window.
+
+**Shape note:** `versions` is `[n_chunk, B, ...]` (dims 0,1 = chunk-step, batch;
+trailing dims = action/extra, which may NOT match `loss_mask`'s trailing dims).
+`compute_staleness_mask` / `count_fresh_chunks` reduce versions to a per-chunk-step
+version (min over trailing dims) before computing freshness, so the AND broadcasts
+cleanly regardless of the trailing rank.
+
+**New metrics:**
+- `rollout/staleness_received_trajectories`, `rollout/staleness_masked_chunks`,
+  `rollout/staleness_masked_fraction`, `rollout/staleness_effective_chunks`,
+  `rollout/staleness_global_retry_rounds`, `rollout/staleness_wait_seconds`,
+  `rollout/staleness_version_min/mean/max`
+- `env/reward/superseded_completed_episodes`,
+  `env/reward/selected_episode_version_min/max`,
+  `env/reward/selected_episode_wait_rollouts`
+
+See `ASYNC_STALENESS_FIX_PLAN.md` for the full design. Unit tests:
+`tests/unit_tests/test_staleness_mask.py`, `test_priority_store.py`,
+`test_readiness_collective.py`, `test_completed_episode_buffer.py`,
+`test_async_actor_routing.py`, `test_reward_metrics.py`.
+

@@ -33,6 +33,13 @@ if TYPE_CHECKING:
     )
 
 
+def _rdebug_log_path() -> str:
+    """Per-run Robometer reward debug log path (see env_worker._rdebug_log_path)."""
+    import os
+
+    return os.environ.get("RLINF_REWARD_DEBUG_LOG", "/tmp/robometer_rdebug.log")
+
+
 class AsyncPPOEmbodiedRunner(EmbodiedRunner):
     """Runner for async PPO with long-running env and rollout workers."""
 
@@ -115,7 +122,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.update_rollout_weights()
         if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
             try:
-                with open("/tmp/robometer_rdebug.log", "a") as _f:
+                with open(_rdebug_log_path(), "a") as _f:
                     _f.write(
                         f"RUNNER run() reward_none={self.reward is None} "
                         f"reward_channel_none={self.reward_channel is None}\n"

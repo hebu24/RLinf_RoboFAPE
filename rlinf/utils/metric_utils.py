@@ -113,6 +113,119 @@ def compute_evaluate_metrics(eval_metrics_list):
     return all_eval_metrics
 
 
+def embodied_reward_metric_values(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor | None,
+    *,
+    reward_type: str,
+    chunk_reward_aggregation: str,
+    gamma: float,
+) -> dict[str, torch.Tensor]:
+    """Build masked reward values at each level of the PPO reward pipeline."""
+    low_level_mask = (
+        torch.ones_like(rewards, dtype=torch.bool)
+        if loss_mask is None
+        else loss_mask.to(device=rewards.device, dtype=torch.bool)
+    )
+    if low_level_mask.shape != rewards.shape:
+        low_level_mask = torch.broadcast_to(low_level_mask, rewards.shape)
+    low_level_values = rewards[low_level_mask]
+
+    if reward_type == "chunk_level":
+        # Lazy import: rlinf.algorithms.utils -> algorithms/__init__ -> advantages
+        # -> rlinf.utils.utils would form a circular import at module load time
+        # (metric_utils is imported by utils.utils). Import at call time instead.
+        from rlinf.algorithms.utils import aggregate_embodied_chunk_rewards
+
+        chunk_rewards = aggregate_embodied_chunk_rewards(
+            rewards,
+            low_level_mask,
+            gamma=gamma,
+            aggregation=chunk_reward_aggregation,
+        )
+        chunk_mask = low_level_mask.any(dim=-1, keepdim=True)
+    else:
+        chunk_rewards = rewards
+        chunk_mask = low_level_mask
+
+    chunk_values = chunk_rewards[chunk_mask]
+    episode_mask = chunk_mask.reshape(chunk_mask.shape[0], chunk_mask.shape[1], -1).any(
+        dim=(0, 2)
+    )
+    episode_sums = (
+        (chunk_rewards * chunk_mask.to(dtype=chunk_rewards.dtype))
+        .reshape(chunk_rewards.shape[0], chunk_rewards.shape[1], -1)
+        .sum(dim=(0, 2))
+    )
+    episode_sums = episode_sums[episode_mask]
+    return {
+        "reward_low_level": low_level_values,
+        "reward_chunk": chunk_values,
+        "reward_episode_sum": episode_sums,
+    }
+
+
+def _distributed_reward_stats(values: torch.Tensor) -> dict[str, float]:
+    from rlinf.scheduler.worker.worker import Worker
+
+    device = Worker.torch_platform.current_device()
+    values = values.detach().to(device=device, dtype=torch.float32).reshape(-1)
+    if values.numel() == 0:
+        local_sum = torch.tensor(0.0, device=device)
+        local_count = torch.tensor(0.0, device=device)
+        local_positive = torch.tensor(0.0, device=device)
+        local_min = torch.tensor(float("inf"), device=device)
+        local_max = torch.tensor(float("-inf"), device=device)
+    else:
+        local_sum = values.sum()
+        local_count = torch.tensor(float(values.numel()), device=device)
+        local_positive = (values > 0).to(dtype=torch.float32).sum()
+        local_min = values.min()
+        local_max = values.max()
+
+    totals = torch.stack([local_sum, local_count, local_positive])
+    extrema = torch.stack([-local_min, local_max])
+    torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(extrema, op=torch.distributed.ReduceOp.MAX)
+    total_sum, total_count, total_positive = totals.tolist()
+    if total_count <= 0:
+        return {
+            "mean": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+            "positive_fraction": float("nan"),
+        }
+    return {
+        "mean": total_sum / total_count,
+        "min": -extrema[0].item(),
+        "max": extrema[1].item(),
+        "positive_fraction": total_positive / total_count,
+    }
+
+
+def compute_embodied_reward_metrics(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor | None,
+    *,
+    reward_type: str,
+    chunk_reward_aggregation: str,
+    gamma: float,
+) -> dict[str, float]:
+    """Compute distributed scalar metrics for rewards actually consumed by PPO."""
+    metric_values = embodied_reward_metric_values(
+        rewards,
+        loss_mask,
+        reward_type=reward_type,
+        chunk_reward_aggregation=chunk_reward_aggregation,
+        gamma=gamma,
+    )
+    metrics = {}
+    for prefix, values in metric_values.items():
+        stats = _distributed_reward_stats(values)
+        metrics.update({f"{prefix}_{name}": value for name, value in stats.items()})
+    return metrics
+
+
 def compute_rollout_metrics(data_buffer: dict) -> dict:
     rollout_metrics = {}
     loss_mask = data_buffer.get("loss_mask", None)
@@ -205,9 +318,7 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
 
         _device = Worker.torch_platform.current_device()
         _lm_sum = loss_mask.to(device=_device).bool().sum()
-        torch.distributed.all_reduce(
-            _lm_sum, op=torch.distributed.ReduceOp.SUM
-        )
+        torch.distributed.all_reduce(_lm_sum, op=torch.distributed.ReduceOp.SUM)
         rollout_metrics["train_env_steps"] = _lm_sum.item()
 
     return rollout_metrics
@@ -249,6 +360,7 @@ def resolve_loss_mask(
     auto_reset: bool,
     ignore_terminations: bool,
     chunk_level: bool,
+    staleness_filter_mode: str = "trajectory",
 ):
     """Resolve ``(loss_mask, loss_mask_sum)``.
 
@@ -264,10 +376,12 @@ def resolve_loss_mask(
     if provided is not None:
         loss_mask = provided
         loss_mask_sum = rollout_batch.get("loss_mask_sum", None)
+        if staleness_filter_mode == "chunk_mask":
+            # Keep low-level resolution; sum is recomputed after freshness masking
+            # by compute_staleness_mask on the async actor.
+            return loss_mask, None
         if loss_mask_sum is None:
-            loss_mask_sum = loss_mask.sum(dim=(0, 2), keepdim=True).expand_as(
-                loss_mask
-            )
+            loss_mask_sum = loss_mask.sum(dim=(0, 2), keepdim=True).expand_as(loss_mask)
         if chunk_level:
             loss_mask = loss_mask.any(dim=-1, keepdim=True)
             loss_mask_sum = loss_mask_sum[..., -1:]
@@ -275,6 +389,8 @@ def resolve_loss_mask(
     if not auto_reset and not ignore_terminations:
         dones = rollout_batch["dones"]
         loss_mask, loss_mask_sum = compute_loss_mask(dones)
+        if staleness_filter_mode == "chunk_mask":
+            return loss_mask, None
         if chunk_level:
             loss_mask = loss_mask.any(dim=-1, keepdim=True)
             loss_mask_sum = loss_mask_sum[..., -1:]

@@ -199,13 +199,18 @@ What the launcher sets for you:
 - `PYTHONPATH=/data/yingxi/RLinf_RoboFAPE:${PYTHONPATH}`
 - `MUJOCO_GL=egl`
 - `PYOPENGL_PLATFORM=egl`
+- `RAY_ADDRESS=127.0.0.1:${RL_RAY_PORT}` (pins driver+workers to this cluster)
 - `RAY_TMPDIR=/data/yingxi/ray_tmp_rl_${RL_RAY_PORT}`
+- Its own `ray start --head` on `RL_RAY_PORT` with a scoped EXIT trap
+  (`_rl_scoped_ray_kill` by port) — it no longer relies on `cluster.py`'s
+  `ray.init(address="auto")` (which ps-scans to any GCS) and never does a bare
+  `ray stop` (which would kill other clusters on the host).
 
-Logs and checkpoints:
+Logs and checkpoints (the launcher appends the reward shaping tag — `_<absolute|delta>` — to the log dir, parsed from the `reward.shaping=` Hydra override):
 
-- Training log: `logs/<timestamp>-peg_insertion_rl_async/run.log`
-- TensorBoard + metrics: under the same `logs/<timestamp>-peg_insertion_rl_async/`
-- Checkpoints: `logs/<timestamp>-peg_insertion_rl_async/checkpoints/global_step_<N>/`
+- Training log: `logs/<timestamp>-peg_insertion_rl_async_<shaping>/run.log`
+- TensorBoard + metrics: under the same `logs/<timestamp>-peg_insertion_rl_async_<shaping>/`
+- Checkpoints: `logs/<timestamp>-peg_insertion_rl_async_<shaping>/<experiment_name>/checkpoints/global_step_<N>/`
 
 ### 3.3 Ray isolation and shared-host rules
 
@@ -213,11 +218,18 @@ Logs and checkpoints:
 - RL, SFT, and eval must use different Ray GCS ports, dashboard agent ports,
   temp dirs, and disjoint GPU sets.
 - The current convention is:
-  - SFT: port `6379`
-  - wrist eval: port `6380`
-  - RL: port `6381`
+  - SFT: port `6379`, dashboard `52366`
+  - wrist eval: port `6380`, dashboard `52365`
+  - RL (absolute): port `6381`, dashboard `52367`
+  - RL (delta): port `6382`, dashboard `52368`
+- The RL launcher now starts its own `ray start --head` with `RAY_ADDRESS` set
+  and a scoped EXIT trap (`_rl_scoped_ray_kill` by port). It no longer relies on
+  a pre-existing head or on `cluster.py`'s `ray.init(address="auto")`.
 - Put `TMPDIR`, `HF_HOME`, and every `RAY_TMPDIR` on `/data`, not `/`.
-- The Robometer server must run outside Ray on its own physical GPU.
+- The Robometer server runs outside Ray (an HTTP server on `:8000`). It may
+  overlap one RL cluster's GPU set (HBM contention accepted — monitor with
+  `nvidia-smi`); both RL runs point `server_url` to `http://127.0.0.1:8000`
+  (the config default). See §3.5 for the shared-server dual-run setup.
 
 See `RAY_ISOLATION.md` for the full host-level isolation rules.
 
@@ -287,7 +299,7 @@ PYTHONPATH=/data/yingxi/RLinf_RoboFAPE \
 /data/yingxi/kairan/envs/rlinf/bin/python \
   run_train/peginsertion_maniskill_pi0.5/robometer_smoke_rollout.py \
   --ckpt /data/yingxi/RLinf_RoboFAPE/logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/checkpoints/global_step_40000/actor \
-  --gpu 1 \
+  --gpu 7 \
   --num-traj 8 \
   --max-chunks 60 \
   --max-robometer-frames 60 \
@@ -328,6 +340,9 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 export RL_RAY_PORT=6381
 export RAY_DASHBOARD_AGENT_PORT=52367
 export RLINF_REWARD_DEBUG=1
+# Optional: write the reward debug log to a per-run path (defaults to the shared
+# /tmp/robometer_rdebug.log when unset).
+export RLINF_REWARD_DEBUG_LOG=/tmp/robometer_rdebug.log
 bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
   actor.model.model_path=/data/yingxi/RLinf_RoboFAPE/logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/checkpoints/global_step_40000/actor \
   rollout.model.model_path=/data/yingxi/RLinf_RoboFAPE/logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/checkpoints/global_step_40000/actor \
@@ -336,8 +351,9 @@ bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
   runner.save_interval=-1
 ```
 
-This one-epoch run is the training-path validation. It should generate
-`/tmp/robometer_rdebug.log`.
+This one-epoch run is the training-path validation (the log dir is
+`logs/<timestamp>-peg_insertion_rl_async_absolute/` since no `reward.shaping=`
+override is passed). It should generate `/tmp/robometer_rdebug.log`.
 
 Key debug fields in that file:
 
@@ -386,8 +402,8 @@ Concretely, review:
   - `logs/robometer_smoke_gs40000/traj_XXX/low_level_reward.npy`
   - `logs/robometer_smoke_gs40000/traj_XXX/meta.json`
 - RL reward side:
-  - `/tmp/robometer_rdebug.log`
-  - `logs/<rl-run>/run.log`
+  - `/tmp/robometer_rdebug.log` (or the `RLINF_REWARD_DEBUG_LOG` path)
+  - `logs/<timestamp>-peg_insertion_rl_async_<shaping>/run.log`
 
 Expected outcomes:
 
@@ -404,6 +420,103 @@ If Step A succeeds but Step B does not produce matching labels, the success
 semantics are not yet aligned. If Step B produces aligned labels but no
 positive reward on successful trajectories, the interpolation or reward shift
 logic is wrong.
+
+### 3.5 Dual concurrent RL runs (absolute vs delta)
+
+Two async-PPO runs with different reward shaping can train at once on the 8-GPU
+box: Run A with `reward.shaping=absolute` on GPUs 0-3 (port `6381`), Run B with
+`reward.shaping=delta` on GPUs 4-7 (port `6382`). They share one Robometer
+server (`:8000`) and use disjoint GPU sets + distinct Ray ports/dashboard-agent
+ports/temp-dirs, so each run's scoped teardown touches only its own head.
+
+| run | shaping | GPUs | GCS port | dashboard | experiment_name override |
+|---|---|---|---|---|---|
+| A | `absolute` | 0,1,2,3 | `6381` | `52367` | `..._robometer_absolute` |
+| B | `delta` | 4,5,6,7 | `6382` | `52368` | `..._robometer_delta` |
+
+Launch order: Robometer → wait for `/health` → Run A → Run B (A/B order does not
+matter — ports are distinct). Each `tmux new-session -d` survives SSH disconnect;
+attach with `tmux attach -t rl_absolute` / `rl_delta` (detach: `Ctrl-b d`).
+
+```bash
+# Step 0 — shared Robometer server (GPU 0; overlaps Run A, HBM contention accepted)
+tmux new-session -d -s robometer_server \
+  "cd /home/yingxi/RoboFAC/robometer && \
+   CUDA_VISIBLE_DEVICES=0 uv run python robometer/evals/eval_server.py \
+     model_path=/data/yingxi/robometer/logs/checkpoint-400 \
+     server_url=0.0.0.0 server_port=8000 num_gpus=1 batch_size=4 \
+   2>&1 | tee /data/yingxi/RLinf_RoboFAPE/logs/robometer_server.log"
+until curl -sS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1; do sleep 2; done && echo "Robometer healthy"
+
+# Step 1 — Run A: absolute reward, GPUs 0-3, port 6381
+tmux new-session -d -s rl_absolute \
+  "cd /data/yingxi/RLinf_RoboFAPE && \
+   CUDA_VISIBLE_DEVICES=0,1,2,3 \
+   RL_RAY_PORT=6381 RAY_DASHBOARD_AGENT_PORT=52367 \
+   RLINF_REWARD_DEBUG_LOG=/tmp/robometer_rdebug_absolute.log \
+   bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
+     reward.shaping=absolute \
+     runner.logger.experiment_name=peg_insertion_async_ppo_pi05_robometer_absolute \
+   ; echo ===EXIT=\$?=== ; exec bash"
+
+# Step 2 — Run B: delta reward, GPUs 4-7, port 6382
+tmux new-session -d -s rl_delta \
+  "cd /data/yingxi/RLinf_RoboFAPE && \
+   CUDA_VISIBLE_DEVICES=4,5,6,7 \
+   RL_RAY_PORT=6382 RAY_DASHBOARD_AGENT_PORT=52368 \
+   RLINF_REWARD_DEBUG_LOG=/tmp/robometer_rdebug_delta.log \
+   bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
+     reward.shaping=delta \
+     runner.logger.experiment_name=peg_insertion_async_ppo_pi05_robometer_delta \
+   ; echo ===EXIT=\$?=== ; exec bash"
+```
+
+Each run writes its Robometer reward debug log to its own file when
+`RLINF_REWARD_DEBUG=1` is also set (the path is read from
+`RLINF_REWARD_DEBUG_LOG`, defaulting to the shared
+`/tmp/robometer_rdebug.log`); the two runs above use `_absolute.log` /
+`_delta.log` so their debug output never interleaves.
+
+The `experiment_name` override keeps the two runs distinguishable in TensorBoard
+(checkpoint paths are already separated by the timestamped `LOG_DIR`, but the
+override makes the dirs self-documenting). Confirm both clusters coexist:
+
+```bash
+pgrep -fa gcs_server | grep -oE 'gcs_server_port=[0-9]+' | sort -u   # both 6381 and 6382
+ss -tlnp | grep -E '6381|6382|52367|52368'
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader         # 0-3 vs 4-7 disjoint
+```
+
+Scoped teardown of one run leaves the other alive — replace `P` with the run's
+GCS port (see `RAY_ISOLATION.md`):
+
+```bash
+P=6381
+pkill -9 -f "gcs_server.*--gcs_server_port=${P}"  || true
+pkill -9 -f "raylet.*--gcs-address=[^ ]*:${P}"     || true
+pkill -9 -f "dashboard.*--gcs-address=[^ ]*:${P}"  || true
+sleep 2
+```
+
+**Known risks / caveats:**
+
+- **HBM contention on the Robometer GPU** (GPU 0 here): the Robometer VLM server
+  (~20-40 GB) shares the GPU with Run A's FSDP workers. Monitor with
+  `watch nvidia-smi`; if it OOMs, move the Robometer to a GPU outside both
+  clusters (requires re-splitting) or lower Robometer `batch_size`.
+- **`staleness_filter_mode` desync (affects both runs):** the config defaults to
+  `trajectory` (stale trajectories are silently dropped → data-pipeline desync →
+  NCCL collective timeout). The `chunk_mask` mode is implemented but not yet
+  enabled. To enable for one run, add `algorithm.staleness_filter_mode=chunk_mask`;
+  validate it separately before flipping the default.
+- **`RLINF_REWARD_DEBUG` logs:** set `RLINF_REWARD_DEBUG=1` plus a per-run
+  `RLINF_REWARD_DEBUG_LOG` (the launch commands above use `_absolute.log` /
+  `_delta.log`) so the two runs' reward-debug output lands in separate files
+  instead of interleaving. Without `RLINF_REWARD_DEBUG_LOG`, both fall back to the
+  shared `/tmp/robometer_rdebug.log`.
+- **Disk:** two runs each save ~16-32 GB checkpoints every `save_interval` steps;
+  verify `df -h /data` has ≥ ~500 GB free before launching.
+
 
 ## Troubleshooting
 

@@ -1172,6 +1172,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.cfg.env.train.auto_reset,
             self.cfg.env.train.ignore_terminations,
             self.cfg.algorithm.reward_type == "chunk_level",
+            self.cfg.algorithm.get("staleness_filter_mode", "trajectory"),
         )
         if loss_mask is not None:
             rollout_batch["loss_mask"] = loss_mask

@@ -18,14 +18,17 @@ Host: `xulab` (`/data/yingxi/RLinf_RoboFAPE`), multi-GPU H100, shared by multipl
 | wrist SFT | `sft_finetune_pi05base.sh` (CONFIG=..._wrist) | `6379` (`SFT_RAY_PORT`) | `52366` (`SFT_DASHBOARD_AGENT_PORT`) | `/tmp/ray_sft_6379` | 4-7 |
 | eval sweep | `sweep_peginsertion_wrist.py` | `6380` (`--ray-port`) | `52365` (Ray default) | `/tmp/ray_eval_wrist_sweep_<pid>` | 0-3 |
 | single ckpt eval | `run_peginsertion*.sh` (`MANAGE_RAY=true`) | `6380` (`EVAL_RAY_PORT`) | `52365` | `/tmp/ray_eval_wrist` | per `GPU_IDS` |
+| RL (absolute) | `run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh` | `6381` (`RL_RAY_PORT`) | `52367` (`RAY_DASHBOARD_AGENT_PORT`) | `/data/yingxi/ray_tmp_rl_6381` | 0-3 |
+| RL (delta) | `run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh` | `6382` (`RL_RAY_PORT`) | `52368` (`RAY_DASHBOARD_AGENT_PORT`) | `/data/yingxi/ray_tmp_rl_6382` | 4-7 |
 
-Both GCS ports (6379/6380) and the non-default dashboard-agent port (52366) are distinct → these can run at once. **Two eval sweeps at once would collide on 6380 + 52365** — don't; give the second `--ray-port 6390` and a distinct dashboard-agent port.
+Both GCS ports (6379/6380) and the non-default dashboard-agent port (52366) are distinct → these can run at once. **Two eval sweeps at once would collide on 6380 + 52365** — don't; give the second `--ray-port 6390` and a distinct dashboard-agent port. The two RL runs (6381/6382 + dashboards 52367/52368 + disjoint GPUs 0-3 vs 4-7) can run concurrently; see README §3.5.
 
 ## The fixed scripts (what makes them safe)
 
 - **`sft_finetune*.sh`** (all variants): sets `SFT_RAY_PORT` (default 6379), `RAY_TMPDIR=/tmp/ray_sft_${SFT_RAY_PORT}` (per-port), `SFT_DASHBOARD_AGENT_PORT` (default 52366), `RAY_ADDRESS=127.0.0.1:${SFT_RAY_PORT}`; `ray start --head --port --temp-dir --dashboard-agent-listen-port`; `_sft_scoped_ray_kill()` pkill by **port** (gcs_server `--gcs_server_port=P`, raylet/dashboard `--gcs-address=...:P`) + `sleep 2`; EXIT trap scoped to own port. No bare `ray stop`.
 - **`run_train/eval_checkpoint/sweep_peginsertion_wrist.py`**: `--ray-port` (default 6380), `--object-store-memory`; `_scoped_ray_kill(port)`; `start_shared_ray` pops `RAY_ADDRESS`, starts head with `--include-dashboard=false`, sets `RAY_ADDRESS`; per-checkpoint subprocesses get `RAY_ADDRESS` in env + `MANAGE_RAY=false`. No bare `ray stop`.
 - **`run_train/eval_checkpoint/run_peginsertion*.sh`** (single-eval): `EVAL_RAY_PORT` (default 6380), `RAY_ADDRESS` pin, `MANAGE_RAY=true` starts a head with `--port --include-dashboard=false` + scoped EXIT trap. No bare `ray stop`.
+- **`run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh`**: sets `RL_RAY_PORT` (default 6381), `RAY_TMPDIR=/data/yingxi/ray_tmp_rl_${RL_RAY_PORT}` (per-port, on `/data` because `/` is full), `RAY_DASHBOARD_AGENT_PORT` (default 52367), `RAY_ADDRESS=127.0.0.1:${RL_RAY_PORT}`; `ray start --head --port --temp-dir --dashboard-agent-listen-port`; `_rl_scoped_ray_kill()` pkill by **port** (gcs_server `--gcs_server_port=P`, raylet/dashboard `--gcs-address=...:P`) + `sleep 2`; EXIT trap scoped to own port. No bare `ray stop`. Two concurrent runs use disjoint `CUDA_VISIBLE_DEVICES` (0-3 vs 4-7) + distinct `RL_RAY_PORT`/`RAY_DASHBOARD_AGENT_PORT`.
 
 ## How to run concurrent jobs (copy-paste)
 
@@ -129,4 +132,5 @@ Rule of thumb: before assuming N GPUs = Nx speed, check `nvidia-smi` util — if
 - `sft_finetune_pi05base.sh`, `run_sft_insert_wrist_v2.sh` — SFT detached-head + scoped.
 - `run_train/eval_checkpoint/sweep_peginsertion_wrist.py` — `--ray-port`, `_scoped_ray_kill`.
 - `run_train/eval_checkpoint/run_peginsertion_wrist.sh`, `run_peginsertion_wrist_insert_only.sh`, `run.sh` — `EVAL_RAY_PORT`, scoped trap.
-- `README.md §2` has the Ray-isolation note + commands.
+- `run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh` — RL detached-head + scoped (port 6381/6382, dashboard 52367/52368, temp-dir on `/data`).
+- `README.md §2` has the Ray-isolation note + commands; `README.md §3.5` has the dual concurrent RL run setup.

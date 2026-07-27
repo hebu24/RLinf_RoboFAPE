@@ -58,6 +58,45 @@ class PriorityStore:
             self._used_seqs.add(seq)
         return list(reversed([data for _, _, data in items]))
 
+    def peek_topn(self, n: int) -> list[Trajectory]:
+        """View the top-n highest-priority candidates without marking or removing.
+
+        Used by the chunk_mask readiness collective to inspect candidates across
+        all ranks before deciding to take or discard them synchronously.
+        """
+        items = self.sl[-n:]
+        return list(reversed([data for _, _, data in items]))
+
+    def take_topn(self, n: int) -> list[Trajectory]:
+        """Remove and return the top-n highest-priority candidates, marking them used.
+
+        Guarantees a completed episode is trained on at most once per global step:
+        consumed candidates are removed from the store and their seqs are marked
+        used so that later eviction does not double-count them as discarded-unused.
+        """
+        items = self.sl[-n:]
+        for item in items:
+            self._used_seqs.add(item[1])
+            self.sl.remove(item)
+        return list(reversed([data for _, _, data in items]))
+
+    def discard_topn(self, n: int) -> None:
+        """Discard the top-n highest-priority candidates without marking them used.
+
+        Called by every rank in lockstep when the readiness collective observes
+        that some rank has zero fresh chunks: all ranks drop their current
+        candidates so fresh data can refill the store. Never-used discards
+        increment ``_discarded_unused`` (matching ``remove_below`` semantics).
+        """
+        items = self.sl[-n:]
+        for item in items:
+            seq = item[1]
+            if seq not in self._used_seqs:
+                self._discarded_unused += 1
+            else:
+                self._used_seqs.discard(seq)
+            self.sl.remove(item)
+
     def remove_below(self, threshold):
         to_remove = [item for item in self.sl if item[0][0] < threshold]
         for item in to_remove:

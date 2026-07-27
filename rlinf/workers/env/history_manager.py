@@ -17,10 +17,94 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from rlinf.utils.nested_dict_process import clone_nested_to_cpu
+from rlinf.utils.nested_dict_process import clone_nested_to_cpu, copy_dict_tensor
+
+
+def history_obs_from_step(
+    obs: dict[str, Any] | None, infos: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Use the true terminal observation for auto-reset low-level steps."""
+    if obs is None or not isinstance(infos, dict):
+        return obs
+    final_obs = infos.get("final_observation")
+    reset_mask = infos.get("_final_observation")
+    if final_obs is None or reset_mask is None:
+        return obs
+    merged = copy_dict_tensor(obs)
+    reset_mask = (
+        reset_mask.detach().cpu().numpy()
+        if isinstance(reset_mask, torch.Tensor)
+        else np.asarray(reset_mask)
+    )
+    done_mask = (
+        reset_mask.any(axis=-1) if reset_mask.ndim > 1 else reset_mask.astype(bool)
+    )
+    if not done_mask.any():
+        return merged
+    for key, value in merged.items():
+        if key not in final_obs:
+            continue
+        final_value = final_obs[key]
+        if isinstance(value, torch.Tensor) and isinstance(final_value, torch.Tensor):
+            dst_mask = torch.as_tensor(done_mask, device=value.device)
+            src_mask = dst_mask.to(device=final_value.device)
+            merged[key][dst_mask] = final_value[src_mask]
+        elif isinstance(value, np.ndarray) and isinstance(final_value, np.ndarray):
+            merged[key][done_mask] = final_value[done_mask]
+    return merged
+
+
+def history_success_from_step(
+    infos: dict[str, Any] | None, num_envs: int
+) -> list[bool]:
+    """Resolve root/final success for one low-level vector-env step."""
+    if not isinstance(infos, dict):
+        raise ValueError(
+            "Reward history requires per-step env infos to resolve success."
+        )
+    success = infos.get("success")
+    if success is None:
+        raise ValueError(
+            "Reward history requires per-step root `success` in env infos."
+        )
+    success_values = (
+        success.detach().cpu().bool().clone()
+        if isinstance(success, torch.Tensor)
+        else torch.as_tensor(np.asarray(success), dtype=torch.bool)
+    )
+    if success_values.numel() != num_envs:
+        raise ValueError(
+            f"Expected {num_envs} success values, got {success_values.numel()}."
+        )
+    final_info = infos.get("final_info")
+    reset_mask = infos.get("_final_info")
+    if (
+        isinstance(final_info, dict)
+        and reset_mask is not None
+        and "success" in final_info
+    ):
+        final_success = final_info["success"]
+        final_success_values = (
+            final_success.detach().cpu().bool()
+            if isinstance(final_success, torch.Tensor)
+            else torch.as_tensor(np.asarray(final_success), dtype=torch.bool)
+        )
+        reset_mask = (
+            reset_mask.detach().cpu().numpy()
+            if isinstance(reset_mask, torch.Tensor)
+            else np.asarray(reset_mask)
+        )
+        done_mask = (
+            reset_mask.any(axis=-1) if reset_mask.ndim > 1 else reset_mask.astype(bool)
+        )
+        if done_mask.any():
+            done_mask_t = torch.as_tensor(done_mask, dtype=torch.bool)
+            success_values[done_mask_t] = final_success_values[done_mask_t]
+    return success_values.tolist()
 
 
 class HistoryManager:
@@ -169,15 +253,23 @@ class HistoryManager:
         """
         if not frames:
             return
-        for frame in frames:
-            self.history_entries[env_id].insert(
-                0, {"render_images": clone_nested_to_cpu(frame)}
-            )
-        self.history_counts[env_id] += len(frames)
-        self.pickup_counts[env_id] = len(frames)
+        # The final planner frame is the lift-end reset state and is duplicated by
+        # the first insertion observation. Keep this normalization here so RL and
+        # smoke use the exact same pick-up prefix.
+        pickup_frames = list(frames[:-1]) if len(frames) > 1 else list(frames)
+        pickup_entries = [
+            {"render_images": clone_nested_to_cpu(frame)} for frame in pickup_frames
+        ]
+        # Preserve the planner's chronological approach -> grasp -> lift order.
+        self.history_entries[env_id][0:0] = pickup_entries
+        self.success_history_entries[env_id][0:0] = [False] * len(pickup_entries)
+        self.history_counts[env_id] += len(pickup_entries)
+        self.pickup_counts[env_id] = len(pickup_entries)
 
     def build_history_input(
-        self, dones: torch.Tensor
+        self,
+        dones: torch.Tensor,
+        emit_mask: torch.Tensor | None = None,
     ) -> tuple[dict[str, Any], dict[str, list[int]]]:
         history_input: dict[str, dict[str, list[list]]] = {}
         history_length: dict[str, list[int]] = {}
@@ -212,8 +304,19 @@ class HistoryManager:
                 f"Expect the dones to have a shape of (self.num_envs,) = ({self.num_envs},), got {dones.shape}"
             )
 
+        if emit_mask is None:
+            emit_mask = torch.ones_like(dones, dtype=torch.bool)
+        if emit_mask.shape != dones.shape:
+            raise ValueError(
+                "HistoryManager emit_mask must match dones: "
+                f"{emit_mask.shape=} vs {dones.shape=}."
+            )
+        emit_mask = emit_mask.to(dtype=torch.bool, device=dones.device)
+
         for env_idx, done in enumerate(dones):
             for history_buffer in self.history_buffers:
+                if not bool(emit_mask[env_idx]):
+                    continue
                 if (
                     len(self.history_entries[env_idx])
                     < history_buffer["min_history_size"]
@@ -258,9 +361,17 @@ class HistoryManager:
         self.pickup_counts[env_id] = 0
 
     def trim_history(self, env_idx: int) -> None:
+        cur_len = len(self.history_entries[env_idx])
+        if cur_len <= self.max_history_size:
+            return
+        dropped = cur_len - self.max_history_size
         self.history_entries[env_idx] = self.history_entries[env_idx][
             -self.max_history_size :
         ]
         self.success_history_entries[env_idx] = self.success_history_entries[env_idx][
             -self.max_history_size :
         ]
+        # Preprended pick-up frames live at the front of the buffer, so when we
+        # trim from the front we may discard some or all of that prefix. Keep
+        # pickup_counts aligned with the *current* retained history window.
+        self.pickup_counts[env_idx] = max(0, self.pickup_counts[env_idx] - dropped)

@@ -61,6 +61,20 @@ algorithm:
   group_size: 1
   reward_coef: 1.0
   staleness_threshold: 1
+  # --- async-PPO completed-episode staleness fix (ASYNC_STALENESS_FIX_PLAN.md) ---
+  # chunk_mask: keep the WHOLE completed episode for GAE + Robometer reward
+  # reconstruction, only mask stale CHUNKS out of loss/reward aggregation (do
+  # NOT drop the trajectory by versions.min()). The actor readiness loop uses a
+  # two-phase all_reduce(MIN) collective (peek/take/discard_topn) so every rank
+  # has a fresh chunk before take_topn. Default "trajectory" keeps legacy behavior.
+  staleness_filter_mode: chunk_mask
+  # Keyed routing: each env worker shards completed episodes to a per-actor-rank
+  # dedicated channel key (CommMapper.get_dst_ranks/build_channel_key), so no two
+  # actor ranks contend for one shared queue. Generic M:N, not 4-card-specific.
+  actor_channel_keyed_routing: true
+  # Readiness collective timeout + periodic status log interval (seconds).
+  rollout_store_wait_timeout_s: 600
+  rollout_store_status_interval_s: 30
   behave_weight_threshold: 2
   reward_type: chunk_level
   chunk_reward_aggregation: discounted_sum
@@ -151,7 +165,7 @@ actor:
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 10       # warmup value head 10 steps (cold-start, no SFT value) so EV turns positive before actor learns from it; normalize_returns keeps value_loss O(1)
+    critic_warmup_steps: 100       # warmup value head 100 steps (cold-start, no SFT value) so EV turns positive before actor learns from it; normalize_returns keeps value_loss O(1)
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"   # shard the ~4B model+optim across the RL GPUs (shared xulab GPUs have limited free mem)
@@ -168,6 +182,9 @@ reward:
   env_reward_weight: 0.0          # drop ManiSkill reward; robometer progress only
   reward_weight: 1.0
   group_name: "RewardGroup"
+  shaping: absolute               # absolute | delta ; delta = per-chunk (progress_{i+1} - progress_i) + success_bonus*1[success_i]
+  delta:
+    success_bonus: 0.1            # C: bonus added to every success chunk in delta mode (delta telescopes to ~1.0; ~20 success chunks -> bonus ~2.0)
   model:
     model_type: robometer
     server_url: "http://127.0.0.1:8000"
@@ -182,8 +199,9 @@ reward:
     history_buffers:
       render_buffer:
         history_keys: [render_images]
-        history_size: 120         # >= max pickup (30) + max insert chunks (600 / num_action_chunks 10) + headroom;
-                                  #   bumped from 60 so prepended pick-up frames stay in the robometer window.
+        history_size: 720         # Keep the full low-level pick-up+insert window for a 600-step episode.
+                                  # 600 insert steps + ~30 pick-up prefix is the practical minimum; use extra
+                                  # headroom so trimming never drops early insertion context before Robometer query.
         min_history_size: 2
         input_interval: 1
         input_on_done: True

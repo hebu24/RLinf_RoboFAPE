@@ -34,6 +34,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import threading
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
@@ -42,14 +45,13 @@ from omegaconf import DictConfig
 
 from rlinf.models.embodiment.reward.base_reward_model import BaseRewardModel
 
-import os
-import threading
-
 # --- Robometer smoke capture (env-var gated; no-op when RLINF_ROBOMETER_SMOKE_DIR unset) ---
 _SMOKE_DIR = os.environ.get("RLINF_ROBOMETER_SMOKE_DIR", "").strip() or None
 _SMOKE_CAP = int(os.environ.get("RLINF_ROBOMETER_SMOKE_CAP", "10")) if _SMOKE_DIR else 0
 _SMOKE_LOCAL_LOCK = threading.Lock()
 _SMOKE_PREV = {}  # per-process: env_id -> {arr,prog,success,shift,len} for reset-detection
+
+ROBOMETER_REWARD_PIPELINE_VERSION = "episode-v1"
 
 
 def _robometer_downsample_indices(total: int, cap: int = 60):
@@ -71,6 +73,37 @@ def _robometer_downsample_indices(total: int, cap: int = 60):
         if int(i) not in seen:
             seen.add(int(i))
             out.append(int(i))
+    return out
+
+
+def _robometer_boundary_frame_indices(
+    history_len: int, pickup_count: int, chunk_size: int
+):
+    """Deterministic chunk-boundary frame indices for delta shaping.
+
+    Returns the frame index at the start of insertion and after each chunk:
+    ``pickup_count + i * chunk_size`` for ``i = 0..n_chunks``, each clamped to
+    ``[0, history_len - 1]``. ``n_chunks = ceil(insert_steps / chunk_size)`` where
+    ``insert_steps = history_len - pickup_count``. The result always has exactly
+    ``n_chunks + 1`` entries (duplicates from clamping are kept -- a repeated frame
+    just yields a zero delta for that chunk, which is correct).
+
+    Shared by ``RobometerHistoryRewardModel.compute_reward`` (selects the boundary
+    frames to POST in delta mode) AND ``env_worker.assign_history_reward``
+    (recomputes the SAME indices' count to map boundary progress -> chunks). MUST
+    stay in sync, mirroring ``_robometer_downsample_indices`` for absolute mode.
+    """
+    if history_len <= 0:
+        return []
+    n_insert = max(0, history_len - pickup_count)
+    if n_insert == 0 or chunk_size <= 0:
+        return [max(0, min(pickup_count, history_len - 1))]
+    n_chunks = (n_insert + chunk_size - 1) // chunk_size
+    out: list[int] = []
+    for i in range(n_chunks + 1):
+        idx = pickup_count + i * chunk_size
+        idx = max(0, min(idx, history_len - 1))
+        out.append(idx)
     return out
 
 
@@ -157,7 +190,9 @@ def _interpolate_insert_progress_from_downsampled_frames(
         return per_step_reward, per_step_has_reward
 
     ds = _robometer_downsample_indices(history_len, max_frames)
-    prog = np.asarray(progress, dtype=np.float32) if progress is not None else np.zeros(0)
+    prog = (
+        np.asarray(progress, dtype=np.float32) if progress is not None else np.zeros(0)
+    )
 
     labeled_steps: list[int] = []
     labeled_values: list[float] = []
@@ -199,8 +234,8 @@ def _interpolate_insert_progress_from_downsampled_frames(
         steps = np.arange(start_step, end_step + 1, dtype=np.float32)
         alpha = (steps - float(start_step)) / float(end_step - start_step)
         per_step_reward[start_step : end_step + 1] = (
-            (1.0 - alpha) * start_value + alpha * end_value
-        )
+            1.0 - alpha
+        ) * start_value + alpha * end_value
 
     first_step = unique_steps[0]
     last_step = unique_steps[-1]
@@ -226,6 +261,228 @@ def _apply_stepwise_success_shift(
     reward = progress.copy()
     reward[~success] -= float(fail_shift)
     return reward
+
+
+@dataclass(frozen=True)
+class RobometerEpisodeReward:
+    """Shared Robometer reward reconstruction result for one completed episode."""
+
+    downsample_indices: list[int]
+    per_step_progress: np.ndarray
+    per_step_reward: np.ndarray
+    per_step_loss_mask: np.ndarray
+    chunk_reward: np.ndarray
+    chunk_loss_mask: np.ndarray
+    episode_success: bool = False
+
+
+def robometer_assignment_metric_values(
+    assignments: dict[int, RobometerEpisodeReward],
+    *,
+    positive_tolerance: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Build per-episode diagnostics from the rewards queued for PPO."""
+    if not assignments:
+        return {}
+    assignment_values = list(assignments.values())
+    metrics = {
+        "reward/robometer_episode_success_rate": torch.tensor(
+            [float(assignment.episode_success) for assignment in assignment_values],
+            dtype=torch.float32,
+        )
+    }
+    failed_assignments = [
+        assignment for assignment in assignment_values if not assignment.episode_success
+    ]
+    if not failed_assignments:
+        return metrics
+
+    failed_episode_sums = []
+    failed_episode_violations = []
+    failed_positive_steps = []
+    for assignment in failed_assignments:
+        valid_rewards = np.asarray(assignment.per_step_reward, dtype=np.float32)[
+            np.asarray(assignment.per_step_loss_mask, dtype=bool)
+        ]
+        failed_episode_sums.append(float(valid_rewards.sum()))
+        failed_episode_violations.append(
+            float(np.any(valid_rewards > positive_tolerance))
+        )
+        failed_positive_steps.extend((valid_rewards > 0).astype(np.float32).tolist())
+
+    metrics.update(
+        {
+            "reward/failed_episode_reward_sum": torch.tensor(
+                failed_episode_sums, dtype=torch.float32
+            ),
+            "reward/failed_episode_positive_violation_rate": torch.tensor(
+                failed_episode_violations, dtype=torch.float32
+            ),
+            "reward/failed_low_level_positive_fraction": torch.tensor(
+                failed_positive_steps, dtype=torch.float32
+            ),
+        }
+    )
+    return metrics
+
+
+def reconstruct_robometer_episode_reward(
+    progress: Any,
+    *,
+    history_len: int,
+    pickup_count: int,
+    success_trace: Any,
+    max_frames: int,
+    fail_shift: float,
+    chunk_size: int,
+    total_chunks: int,
+) -> RobometerEpisodeReward:
+    """Reconstruct low-level and chunk-aligned reward for a completed episode."""
+    if chunk_size <= 0 or total_chunks <= 0:
+        raise ValueError(
+            f"chunk_size and total_chunks must be positive, got {chunk_size=} {total_chunks=}."
+        )
+    success = np.asarray(success_trace, dtype=bool)
+    if success.shape[0] != history_len:
+        raise ValueError(
+            "Success trace must align with the complete Robometer history: "
+            f"{success.shape[0]=} vs {history_len=}."
+        )
+    per_step_progress, per_step_loss_mask = (
+        _interpolate_insert_progress_from_downsampled_frames(
+            progress, history_len, pickup_count, max_frames
+        )
+    )
+    insert_success = success[pickup_count:history_len]
+    if insert_success.shape != per_step_progress.shape:
+        raise ValueError(
+            "Insertion success trace does not align with reconstructed progress: "
+            f"{insert_success.shape=} vs {per_step_progress.shape=}."
+        )
+    per_step_reward = _apply_stepwise_success_shift(
+        per_step_progress, insert_success, fail_shift=fail_shift
+    )
+    capacity = total_chunks * chunk_size
+    if per_step_reward.shape[0] > capacity:
+        raise ValueError(
+            "Completed episode reward exceeds trajectory capacity: "
+            f"{per_step_reward.shape[0]=} vs {capacity=}."
+        )
+    chunk_reward = np.zeros((total_chunks, chunk_size), dtype=np.float32)
+    chunk_loss_mask = np.zeros((total_chunks, chunk_size), dtype=bool)
+    start = capacity - per_step_reward.shape[0]
+    chunk_reward.reshape(-1)[start:] = per_step_reward
+    chunk_loss_mask.reshape(-1)[start:] = per_step_loss_mask
+    return RobometerEpisodeReward(
+        downsample_indices=_robometer_downsample_indices(history_len, max_frames),
+        per_step_progress=per_step_progress,
+        per_step_reward=per_step_reward,
+        per_step_loss_mask=per_step_loss_mask,
+        chunk_reward=chunk_reward,
+        chunk_loss_mask=chunk_loss_mask,
+        episode_success=bool(insert_success.any()),
+    )
+
+
+def reconstruct_robometer_delta_reward(
+    boundary_progress: Any,
+    *,
+    history_len: int,
+    pickup_count: int,
+    success_trace: Any,
+    chunk_size: int,
+    total_chunks: int,
+    success_bonus: float = 0.1,
+) -> RobometerEpisodeReward:
+    """Reconstruct per-chunk delta reward for a completed episode (delta shaping).
+
+    Delta shaping (Option 2): Robometer is queried only at chunk-boundary frames
+    (``n_chunks + 1`` frames). The per-chunk reward is::
+
+        chunk_reward[i] = (p[i+1] - p[i]) + success_bonus * 1[success[i]]
+
+    where ``p`` is the boundary-frame progress and ``success[i]`` is whether chunk
+    ``i`` ends in a success step. No interpolation, no per-step success shift -- the
+    reward is already chunk-level.
+
+    Reward tensor placement (verified against ``masked_mean_ratio`` in losses.py):
+    the per-chunk scalar is placed at index 0 of the ``[chunk_size]`` sub-step
+    vector (zeros elsewhere), and ``loss_mask`` is True for ALL ``chunk_size``
+    sub-steps of each insertion chunk (matching absolute mode's
+    ``per_step_has_reward[:] = True``). This keeps ``discounted_sum`` exact
+    (``gamma^0 = 1``, the zeroed tail contributes nothing) and keeps
+    ``loss_mask_ratio = loss_mask_sum / max_episode_steps`` identical to absolute
+    mode (~insert_steps / max_episode_steps) -- setting loss_mask True only at
+    index 0 would shrink ``loss_mask_sum`` ~10x and inflate the loss via
+    ``masked_mean_ratio``.
+    """
+    if chunk_size <= 0 or total_chunks <= 0:
+        raise ValueError(
+            f"chunk_size and total_chunks must be positive, got {chunk_size=} {total_chunks=}."
+        )
+    success = np.asarray(success_trace, dtype=bool)
+    if success.shape[0] != history_len:
+        raise ValueError(
+            "Success trace must align with the complete Robometer history: "
+            f"{success.shape[0]=} vs {history_len=}."
+        )
+    # Expected boundary-frame count = total_chunks + 1 (one before each chunk + one
+    # after the last). env_worker recomputes total_chunks = ceil(insert_steps /
+    # chunk_size) from the same (history_len, pickup_count), so this matches the
+    # frame count selected in compute_reward.
+    n_expected = total_chunks + 1
+    prog = np.asarray(boundary_progress, dtype=np.float32)
+    if prog.shape[0] < n_expected:
+        raise ValueError(
+            "Robometer boundary progress is shorter than the completed episode's "
+            f"boundary frame count: expected={n_expected}, got {prog.shape[0]=}."
+        )
+    prog = prog[:n_expected]
+    if not np.isfinite(prog).all():
+        raise ValueError("Robometer returned non-finite boundary progress.")
+
+    chunk_reward = np.zeros((total_chunks, chunk_size), dtype=np.float32)
+    chunk_loss_mask = np.zeros((total_chunks, chunk_size), dtype=bool)
+
+    # Per-chunk delta + success bonus. success[i] = success at the END boundary step
+    # of chunk i (the step just before the next chunk's start frame). Once inserted,
+    # env success is sticky, so this marks the achieving chunk and all after it.
+    for i in range(total_chunks):
+        delta = float(prog[i + 1] - prog[i])
+        end_step = min(pickup_count + (i + 1) * chunk_size - 1, history_len - 1)
+        chunk_success = bool(success[end_step]) if end_step >= pickup_count else False
+        chunk_reward[i, 0] = delta + (
+            float(success_bonus) if chunk_success else 0.0
+        )
+        # loss_mask True for ALL sub-steps of insertion chunks (matching absolute
+        # mode) so masked_mean_ratio's loss_mask_ratio matches absolute scaling.
+        chunk_loss_mask[i, :] = True
+
+    insert_success = success[pickup_count:history_len]
+    episode_success = (
+        bool(insert_success.any()) if insert_success.size > 0 else False
+    )
+
+    # per_step_* diagnostics: report per-chunk delta + bonus as the low-level
+    # proxy so robometer_assignment_metric_values still has arrays to summarize.
+    # (In delta mode a failed-but-progressing episode legitimately has positive
+    # deltas, so the absolute-mode "positive violation" metric is not meaningful
+    # here -- it is diagnostic-only and does not gate training.)
+    per_step_progress = prog[1:] - prog[:-1]
+    per_step_reward = chunk_reward[:, 0].copy()
+    per_step_loss_mask = np.ones(total_chunks, dtype=bool)
+
+    return RobometerEpisodeReward(
+        downsample_indices=_robometer_boundary_frame_indices(
+            history_len, pickup_count, chunk_size
+        ),
+        per_step_progress=per_step_progress,
+        per_step_reward=per_step_reward,
+        per_step_loss_mask=per_step_loss_mask,
+        chunk_reward=chunk_reward,
+        chunk_loss_mask=chunk_loss_mask,
+        episode_success=episode_success,
+    )
 
 
 def _smoke_acquire_slot(smoke_dir, cap):
@@ -280,15 +537,24 @@ def _smoke_save_video(frames, path, fps=30):
 
     stem = os.path.splitext(os.path.basename(path))[0]
     for i, f in enumerate(frames):
-        plt.imsave(os.path.join(os.path.dirname(path), f"{stem}_{i:03d}.png"), np.asarray(f))
+        plt.imsave(
+            os.path.join(os.path.dirname(path), f"{stem}_{i:03d}.png"), np.asarray(f)
+        )
 
 
-def _smoke_dump(smoke_dir, slot, env_id, arr, prog, env_success, shift, task, dones_present):
+def _smoke_dump(
+    smoke_dir, slot, env_id, arr, prog, env_success, shift, task, dones_present
+):
     tdir = os.path.join(smoke_dir, f"traj_{slot:03d}")
     os.makedirs(tdir, exist_ok=True)
-    _smoke_save_video(np.asarray(arr), os.path.join(tdir, "robometer_input.mp4"), fps=30)
+    _smoke_save_video(
+        np.asarray(arr), os.path.join(tdir, "robometer_input.mp4"), fps=30
+    )
     np.save(os.path.join(tdir, "progress.npy"), np.asarray(prog, dtype=np.float32))
-    np.save(os.path.join(tdir, "reward.npy"), np.asarray(prog, dtype=np.float32) - float(shift))
+    np.save(
+        os.path.join(tdir, "reward.npy"),
+        np.asarray(prog, dtype=np.float32) - float(shift),
+    )
     with open(os.path.join(tdir, "success.txt"), "w") as f:
         f.write("1" if env_success else "0")
     with open(os.path.join(tdir, "meta.json"), "w") as f:
@@ -376,9 +642,7 @@ class RobometerHistoryRewardModel(BaseRewardModel):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self.server_url = cfg.get("server_url", "http://127.0.0.1:8000")
-        self.task = cfg.get(
-            "task", "Insert the peg vertically into the target hole."
-        )
+        self.task = cfg.get("task", "Insert the peg vertically into the target hole.")
         self.timeout_s = float(cfg.get("timeout_s", 120.0))
         self.use_frame_steps = bool(cfg.get("use_frame_steps", True))
         self.success_threshold = float(cfg.get("success_threshold", 0.5))
@@ -412,29 +676,67 @@ class RobometerHistoryRewardModel(BaseRewardModel):
             return None
 
         env_infos = observations.get("env_infos")
+        dones = observations.get("dones")
+        if dones is None:
+            raise ValueError("Robometer reward requires a done mask.")
+        dones = np.asarray(dones, dtype=bool).reshape(-1)
+        if dones.shape[0] != n_envs:
+            raise ValueError(
+                "Robometer done mask must contain one value per env: "
+                f"{dones.shape[0]=} vs {n_envs=}."
+            )
+
+        # Delta shaping: env_worker passes per-env pickup_counts + chunk_size so we
+        # select chunk-boundary frames (n_chunks+1) instead of uniformly
+        # down-sampling. max_robometer_frames is NOT applied in delta mode (boundary
+        # count is already small, bounded by episode chunk count).
+        shaping = observations.get("shaping", "absolute")
+        pickup_counts = observations.get("pickup_counts", None)
+        chunk_size = int(observations.get("chunk_size", 0) or 0)
+        delta_mode = shaping == "delta"
+        if delta_mode:
+            if pickup_counts is None:
+                raise ValueError(
+                    "Delta shaping requires `pickup_counts` in the reward input."
+                )
+            if chunk_size <= 0:
+                raise ValueError(
+                    f"Delta shaping requires a positive `chunk_size`, got {chunk_size}."
+                )
 
         ready: list[tuple[int, np.ndarray, int]] = []  # (env_id, real arr, real_t)
         for env_id, frames in enumerate(frame_lists):
-            if not frames:
+            if not dones[env_id]:
                 continue
+            if not frames:
+                raise ValueError(
+                    f"Completed env {env_id} has no emitted Robometer history frames."
+                )
             arr = np.stack([np.asarray(f, dtype=np.uint8) for f in frames])
             if arr.shape[0] < self.min_history_size:
-                continue
-            # Uniform down-sample the full pick-up+insert buffer to <= max frames
-            # before the single POST (use_frame_steps=False). env_worker recomputes
-            # the SAME indices to map progress -> chunks + set loss_mask.
-            ds = _robometer_downsample_indices(
-                arr.shape[0], self.max_robometer_frames
-            )
-            if len(ds) < arr.shape[0]:
+                raise ValueError(
+                    "Completed Robometer history is shorter than min_history_size: "
+                    f"env_id={env_id}, frames={arr.shape[0]}, "
+                    f"min_history_size={self.min_history_size}."
+                )
+            if delta_mode:
+                # Select chunk-boundary frames (start of insertion + after each
+                # chunk). env_worker recomputes the SAME indices' count to map
+                # boundary progress -> chunks in reconstruct_robometer_delta_reward.
+                ds = _robometer_boundary_frame_indices(
+                    arr.shape[0], int(pickup_counts[env_id]), chunk_size
+                )
                 arr = arr[ds]
+            else:
+                # Uniform down-sample the full pick-up+insert buffer to <= max frames
+                # before the single POST (use_frame_steps=False). env_worker recomputes
+                # the SAME indices to map progress -> chunks + set loss_mask.
+                ds = _robometer_downsample_indices(arr.shape[0], self.max_robometer_frames)
+                if len(ds) < arr.shape[0]:
+                    arr = arr[ds]
             ready.append((env_id, arr, arr.shape[0]))
         if not ready:
-            # Return a real (zero) tensor, not None: the reward worker always
-            # sends this back to the env_worker, whose blocking recv_from would
-            # hang on a None payload (no channel message) at non-done chunk steps.
-            # Zeros are a harmless no-op (env_reward_weight=0 blends nothing).
-            return torch.zeros((n_envs, 1), dtype=torch.float32)
+            return None
 
         # Pad each env's frames to the batch max with repeat-last-frame so the
         # server's per-batch torch.stack(progress_list) sees EQUAL sequence
@@ -468,16 +770,26 @@ class RobometerHistoryRewardModel(BaseRewardModel):
             self.server_url, samples, self.timeout_s, self.use_frame_steps
         )
         prog_lists = outputs.get("outputs_progress", {}).get("progress_pred", [])
+        if len(prog_lists) != len(ready):
+            raise ValueError(
+                "Robometer returned an unexpected number of progress sequences: "
+                f"expected {len(ready)}, got {len(prog_lists)}."
+            )
 
         out = torch.zeros((n_envs, max_t), dtype=torch.float32)
         for idx, (env_id, arr, real_t) in enumerate(ready):
+            if prog_lists[idx] is None or len(prog_lists[idx]) < real_t:
+                raise ValueError(
+                    "Robometer returned an empty or truncated progress sequence: "
+                    f"env_id={env_id}, expected at least {real_t}, got "
+                    f"{0 if prog_lists[idx] is None else len(prog_lists[idx])}."
+                )
+            prog = np.asarray(prog_lists[idx], dtype=np.float32)[:real_t]
+            if not np.isfinite(prog).all():
+                raise ValueError(
+                    f"Robometer returned non-finite progress for env_id={env_id}."
+                )
             t = real_t
-            if idx < len(prog_lists) and prog_lists[idx]:
-                prog = np.asarray(prog_lists[idx], dtype=np.float32)
-                t = min(prog.shape[0], real_t)
-                prog = prog[:t]
-            else:
-                prog = np.zeros(t, dtype=np.float32)
             env_success = _resolve_env_success_from_infos(env_infos, env_id)
             shift = 0.0 if env_success else self.fail_shift
             out[env_id, :t] = torch.from_numpy(prog)

@@ -108,3 +108,82 @@ def test_append_history_sequence_appends_each_low_level_step():
         [False, False, True],
         [False, True, True],
     ]
+
+
+def test_prepend_history_entries_keeps_success_timeline_aligned():
+    manager = HistoryManager(_history_cfg(), num_envs=1)
+
+    manager.prepend_history_entries(
+        0, [torch.tensor([1]), torch.tensor([2]), torch.tensor([3])]
+    )
+    manager.append_to_history_entries(
+        {"main_images": torch.tensor([[4]])},
+        step_success=[True],
+    )
+
+    assert len(manager.history_entries[0]) == 3
+    assert len(manager.success_history_entries[0]) == 3
+    assert [
+        int(entry["render_images"].item()) for entry in manager.history_entries[0][:2]
+    ] == [1, 2]
+    assert manager.success_history_entries[0] == [False, False, True]
+    assert manager.pickup_counts[0] == 2
+
+
+def test_trim_history_reduces_pickup_prefix_when_front_is_dropped():
+    cfg = OmegaConf.create(
+        {
+            "model": {
+                "history_buffers": {
+                    "main": {
+                        "history_size": 4,
+                        "min_history_size": 1,
+                        "input_interval": 1,
+                        "history_keys": ["main_images"],
+                        "input_on_done": True,
+                    }
+                }
+            }
+        }
+    )
+    manager = HistoryManager(cfg, num_envs=1)
+
+    manager.prepend_history_entries(
+        0,
+        [torch.tensor([1]), torch.tensor([2]), torch.tensor([3])],
+    )
+    manager.append_to_history_entries(
+        {"main_images": torch.tensor([[4]])},
+        step_success=[False],
+    )
+    manager.append_to_history_entries(
+        {"main_images": torch.tensor([[5]])},
+        step_success=[True],
+    )
+    manager.trim_history(0)
+
+    assert len(manager.history_entries[0]) == 4
+    assert len(manager.success_history_entries[0]) == 4
+    assert manager.pickup_counts[0] == 2
+    assert manager.success_history_entries[0] == [False, False, False, True]
+
+
+def test_build_history_input_emits_only_selected_envs():
+    manager = HistoryManager(_history_cfg(), num_envs=2)
+    _append_step(manager, 1)
+    _append_step(manager, 2)
+    _append_step(manager, 3)
+
+    history_input, history_length = manager.build_history_input(
+        torch.tensor([True, False]),
+        emit_mask=torch.tensor([True, False]),
+    )
+
+    assert history_length == {"main": [2, 0]}
+    assert history_input["main"]["main_images"][0] == [
+        torch.tensor([2]),
+        torch.tensor([3]),
+    ]
+    assert history_input["main"]["main_images"][1] == []
+    assert manager.history_entries[0] == []
+    assert len(manager.history_entries[1]) == 2

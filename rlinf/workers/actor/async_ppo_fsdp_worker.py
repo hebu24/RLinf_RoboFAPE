@@ -16,6 +16,7 @@ import asyncio
 import os
 import queue
 import threading
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -25,9 +26,14 @@ from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.priority_store import PriorityStore
-from rlinf.scheduler import Worker
+from rlinf.data.staleness_mask import compute_staleness_mask, count_fresh_chunks
+from rlinf.scheduler import CommMapper, Worker
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
-from rlinf.utils.metric_utils import append_to_dict, compute_rollout_metrics
+from rlinf.utils.metric_utils import (
+    append_to_dict,
+    compute_embodied_reward_metrics,
+    compute_rollout_metrics,
+)
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
@@ -74,6 +80,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             "rollout_store_size_per_rank", 1
         )
         self.rollout_store = PriorityStore(maxsize=self.rollout_store_size)
+        # Captured by the receive thread on a fatal error so the readiness
+        # collective can sync an all-reduce abort instead of deadlocking.
+        self._recv_thread_exc: Exception | None = None
 
     async def recv_rollout_trajectories(self, input_channel):
         # drain channel
@@ -83,6 +92,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             getattr(self, "_recv_rollout_thread", None) is None
             or not self._recv_rollout_thread.is_alive()
         ):
+            self._recv_thread_exc = None
             self._recv_rollout_thread = threading.Thread(
                 target=self._recv_rollout_thread_main,
                 args=(input_channel,),
@@ -91,34 +101,72 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             self._recv_rollout_thread.start()
 
     def _recv_rollout_thread_main(self, input_channel):
+        staleness_filter_mode = self.cfg.algorithm.get(
+            "staleness_filter_mode", "trajectory"
+        )
+        staleness_threshold = self.cfg.algorithm.get("staleness_threshold", None)
+        keyed_routing = self.cfg.algorithm.get("actor_channel_keyed_routing", False)
+        recv_key = (
+            CommMapper.build_channel_key(self._rank, self._rank, "async_actor")
+            if keyed_routing
+            else None
+        )
         while not self.should_stop:
-            trajectory: Trajectory = input_channel.get()
+            try:
+                trajectory: Trajectory = (
+                    input_channel.get(key=recv_key)
+                    if keyed_routing
+                    else input_channel.get()
+                )
+            except Exception as exc:  # noqa: BLE001 - never let daemon die silently
+                self._recv_thread_exc = exc
+                self.log_info(
+                    f"recv thread aborting rank={self._rank} version={self.version} "
+                    f"exc={exc!r}"
+                )
+                return
             self.log_info(
-                f"recv trajectory versions.shape={trajectory.versions.shape} "
-                f"input_channel.qsize={input_channel.qsize()}"
+                f"recv trajectory rank={self._rank} version={self.version} "
+                f"versions.shape={trajectory.versions.shape} "
+                f"v_min={float(trajectory.versions.min())} "
+                f"v_mean={float(trajectory.versions.float().mean()):.2f} "
+                f"v_max={float(trajectory.versions.max())} "
+                f"recv_queue={self._recv_queue.qsize() if self._recv_queue else 0}"
             )
-            if trajectory.versions.min() < self.version - self.cfg.algorithm.get(
-                "staleness_threshold", None
+            # chunk_mask mode never drops a trajectory here: stale chunks are masked
+            # later in _compute_staleness_mask so the episode stays whole for GAE.
+            if (
+                staleness_filter_mode != "chunk_mask"
+                and staleness_threshold is not None
+                and trajectory.versions.min() < (self.version - staleness_threshold)
             ):
                 continue
             self._recv_queue.put(trajectory)
 
     @Worker.timer("drain_received_trajectories")
     def _drain_received_trajectories(self):
+        staleness_filter_mode = self.cfg.algorithm.get(
+            "staleness_filter_mode", "trajectory"
+        )
+        staleness_threshold = self.cfg.algorithm.get("staleness_threshold", None)
         while True:
             try:
                 traj: Trajectory = self._recv_queue.get_nowait()
-                self.log_info(
-                    f"drain traj versions.shape={traj.versions.shape} "
-                    f"versions.min={traj.versions.min()} version={self.version} "
-                    f"recv_queue.size={self._recv_queue.qsize()}"
-                )
-                if traj.versions.min() < self.version - self.cfg.algorithm.get(
-                    "staleness_threshold", None
-                ):
-                    continue
                 min_v = float(traj.versions.min().item())
                 mean_v = float(traj.versions.float().mean().item())
+                max_v = float(traj.versions.max().item())
+                self.log_info(
+                    f"drain traj rank={self._rank} version={self.version} "
+                    f"versions.shape={traj.versions.shape} "
+                    f"v_min={min_v} v_mean={mean_v:.2f} v_max={max_v} "
+                    f"recv_queue={self._recv_queue.qsize()}"
+                )
+                if (
+                    staleness_filter_mode != "chunk_mask"
+                    and staleness_threshold is not None
+                    and min_v < (self.version - staleness_threshold)
+                ):
+                    continue
                 self.rollout_store.add((min_v, mean_v), traj)
                 self.log_info(f"rollout_store size={len(self.rollout_store)}")
             except queue.Empty:
@@ -126,39 +174,199 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     @Worker.timer("wait_for_rollout_store_ready")
     async def _wait_for_rollout_store_ready(self):
+        """Wait until this rank (and, in chunk_mask mode, ALL ranks) have fresh
+        rollout data; returns the taken ``list[Trajectory]`` batch.
+
+        trajectory mode (default): per-rank ``remove_below`` + ``topn`` (legacy).
+        chunk_mask mode: a two-phase ``all_reduce(MIN)`` readiness collective so
+        every rank enters training together -- phase 1 confirms every rank has a
+        candidate, phase 2 confirms every rank has >=1 fresh chunk; on success
+        ``take_topn`` consumes the batch in lockstep, on all-stale every rank
+        ``discard_topn`` together. A per-iteration ``all_reduce(MAX)`` abort
+        syncs all ranks out on timeout / receive-thread crash (the collective is
+        the sync point, so no rank can break out alone -> no deadlock).
+        """
         while getattr(self, "_recv_queue", None) is None:
             await asyncio.sleep(1)
 
+        staleness_filter_mode = self.cfg.algorithm.get(
+            "staleness_filter_mode", "trajectory"
+        )
+        staleness_threshold = self.cfg.algorithm.get("staleness_threshold", None)
         on_policy_min_ratio = self.cfg.algorithm.get("on_policy_min_ratio", 0.0)
+        n = self.rollout_store_size
+
+        if staleness_filter_mode != "chunk_mask":
+            while True:
+                self._drain_received_trajectories()
+                if staleness_threshold is not None:
+                    with self.worker_timer("remove_below"):
+                        self.rollout_store.remove_below(
+                            self.version - staleness_threshold
+                        )
+                if len(self.rollout_store) >= n:
+                    if on_policy_min_ratio <= 0.0:
+                        break
+                    metrics_data = self.rollout_store.get_metric()
+                    on_policy_ratio = metrics_data.get(int(self.version), {}).get(
+                        "ratio", 0.0
+                    )
+                    self.log_info(
+                        f"rollout store metrics={metrics_data} "
+                        f"on_policy_ratio={on_policy_ratio:.4f} "
+                        f"on_policy_min_ratio={on_policy_min_ratio}"
+                    )
+                    if on_policy_ratio >= on_policy_min_ratio:
+                        break
+                await asyncio.sleep(1)
+            batch = self.rollout_store.topn(n)
+            self._staleness_readiness = {
+                "staleness_received_trajectories": len(batch),
+                "staleness_global_retry_rounds": 0,
+                "staleness_wait_seconds": 0.0,
+            }
+            return batch
+
+        # ---- chunk_mask: two-phase all-reduce readiness collective ----
+        timeout = float(self.cfg.algorithm.get("rollout_store_wait_timeout_s", 600))
+        status_interval = float(
+            self.cfg.algorithm.get("rollout_store_status_interval_s", 30)
+        )
+        device = (
+            torch.cuda.current_device()
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        cutoff = (
+            int(self.version) - int(staleness_threshold)
+            if staleness_threshold is not None
+            else -(10**9)
+        )
+        start = time.time()
+        global_retry = 0
+        last_status = 0.0
+        received = 0
+
         while True:
             self._drain_received_trajectories()
-            with self.worker_timer("remove_below"):
-                self.rollout_store.remove_below(
-                    self.version - self.cfg.algorithm.get("staleness_threshold", None)
+            candidates = self.rollout_store.peek_topn(n)
+            received = max(received, len(candidates))
+
+            # Per-iteration abort sync (all_reduce is the sync point): any rank
+            # timed out OR its recv thread crashed -> every rank raises together.
+            now = time.time()
+            local_abort = 1.0 if (
+                (now - start) >= timeout
+                or self._recv_thread_exc is not None
+            ) else 0.0
+            abort = torch.tensor([local_abort], device=device)
+            torch.distributed.all_reduce(abort, op=torch.distributed.ReduceOp.MAX)
+            if abort.item() >= 1.0:
+                reason = (
+                    f"recv thread crash: {self._recv_thread_exc!r}"
+                    if self._recv_thread_exc is not None
+                    else f"timeout after {now - start:.1f}s"
                 )
-            if len(self.rollout_store) >= self.rollout_store_size:
-                if on_policy_min_ratio <= 0.0:
-                    break
-                metrics_data = self.rollout_store.get_metric()
-                on_policy_ratio = metrics_data.get(int(self.version), {}).get(
-                    "ratio", 0.0
+                self._staleness_readiness = {
+                    "staleness_received_trajectories": received,
+                    "staleness_global_retry_rounds": global_retry,
+                    "staleness_wait_seconds": now - start,
+                }
+                raise RuntimeError(
+                    f"rollout store readiness abort rank={self._rank} "
+                    f"version={self.version} {reason} global_retry={global_retry}"
                 )
-                self.log_info(
-                    f"rollout store metrics={metrics_data} "
-                    f"on_policy_ratio={on_policy_ratio:.4f} "
-                    f"on_policy_min_ratio={on_policy_min_ratio}"
-                )
-                if on_policy_ratio >= on_policy_min_ratio:
-                    break
-            await asyncio.sleep(1)
+
+            # Phase 1: every rank has >= n candidates?
+            has = torch.tensor(
+                [1.0 if len(candidates) >= n else 0.0], device=device
+            )
+            torch.distributed.all_reduce(has, op=torch.distributed.ReduceOp.MIN)
+            if has.item() < 1.0:
+                if now - last_status >= status_interval:
+                    self._log_wait_status(start, global_retry, candidates, cutoff, "phase1 wait-candidate")
+                    last_status = now
+                await asyncio.sleep(1)
+                continue
+
+            # Phase 2: every rank has >= 1 fresh chunk?
+            fresh = torch.tensor(
+                [float(self._count_fresh_chunks(candidates, cutoff))],
+                device=device,
+            )
+            torch.distributed.all_reduce(fresh, op=torch.distributed.ReduceOp.MIN)
+            if fresh.item() < 1.0:
+                # All ranks have candidates but some rank has zero fresh chunks:
+                # discard in lockstep and wait for fresh data to refill.
+                self.rollout_store.discard_topn(n)
+                global_retry += 1
+                if now - last_status >= status_interval:
+                    self._log_wait_status(start, global_retry, candidates, cutoff, "phase2 all-stale discard")
+                    last_status = now
+                await asyncio.sleep(1)
+                continue
+
+            batch = self.rollout_store.take_topn(n)
+            self._staleness_readiness = {
+                "staleness_received_trajectories": len(batch),
+                "staleness_global_retry_rounds": global_retry,
+                "staleness_wait_seconds": time.time() - start,
+            }
+            self.log_info(
+                f"readiness ready rank={self._rank} version={self.version} "
+                f"took={len(batch)} global_retry={global_retry} "
+                f"wait_s={time.time()-start:.1f}"
+            )
+            return batch
+
+    def _count_fresh_chunks(self, candidates, cutoff: int) -> int:
+        """Count fresh chunk-steps across candidate trajectories (readiness phase 2)."""
+        return count_fresh_chunks(candidates, cutoff)["fresh"]
+
+    def _log_wait_status(self, start, global_retry, candidates, cutoff, stage):
+        now = time.time()
+        alive = (
+            self._recv_rollout_thread.is_alive()
+            if getattr(self, "_recv_rollout_thread", None) is not None
+            else False
+        )
+        stats = count_fresh_chunks(candidates, cutoff)
+        self.log_info(
+            f"readiness {stage} rank={self._rank} version={self.version} "
+            f"wait_s={now-start:.1f} global_retry={global_retry} "
+            f"recv_alive={alive} candidates={len(candidates)} "
+            f"recv_queue={self._recv_queue.qsize() if self._recv_queue else 0} "
+            f"store={len(self.rollout_store)} "
+            f"trainable_chunks={stats['trainable']} fresh_chunks={stats['fresh']} "
+            f"stale_chunks={stats['stale']} "
+            f"v_min={stats['version_min']} v_mean={stats['version_mean']:.3f} "
+            f"v_max={stats['version_max']}"
+        )
+
+    def _compute_staleness_mask(self) -> dict:
+        """AND the low-level loss_mask with a per-chunk-step freshness mask.
+
+        Stale chunks (version < actor_version - staleness_threshold) are masked
+        out of loss + reward aggregation, but the episode stays whole for GAE.
+        Stores effective low-level + chunk masks on rollout_batch; see
+        ``rlinf.data.staleness_mask.compute_staleness_mask`` for details.
+        """
+        return compute_staleness_mask(
+            self.rollout_batch,
+            self.version,
+            self.cfg.algorithm.get("staleness_threshold", None),
+        )
 
     @Worker.timer("construct_rollout_batch")
     async def construct_rollout_batch(self, max_trajectories: int | None = None):
         # from _recv_queue to rollout_batch
-        await self._wait_for_rollout_store_ready()
-        torch.distributed.barrier()
+        rollout_batch = await self._wait_for_rollout_store_ready()
+        if self.cfg.algorithm.get("staleness_filter_mode", "trajectory") != "chunk_mask":
+            # trajectory mode: the wait is per-rank, so the barrier is the
+            # cross-rank sync point before FSDP training. chunk_mask mode's
+            # two-phase collective already synchronized all ranks.
+            torch.distributed.barrier()
 
-        rollout_batch = self.rollout_store.topn(self.rollout_store_size)
         version_metrics = self.rollout_store.get_metric()
         self.log_info(f"rollout store version metrics={version_metrics}")
 
@@ -172,6 +380,10 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         self.rollout_batch = convert_trajectories_to_batch(rollout_batch)
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        if self.cfg.algorithm.get("staleness_filter_mode", "trajectory") == "chunk_mask":
+            staleness_metrics.update(self._compute_staleness_mask())
+        if getattr(self, "_staleness_readiness", None):
+            staleness_metrics.update(self._staleness_readiness)
         self.log_info(f"staleness metrics={staleness_metrics}")
         return staleness_metrics
 
@@ -179,6 +391,15 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         proximal_values = self.rollout_batch.get("proximal_values", None)
         prev_values = self.rollout_batch.get("prev_values", None)
+        reward_metrics = compute_embodied_reward_metrics(
+            self.rollout_batch["rewards"],
+            self.rollout_batch.get("loss_mask", None),
+            reward_type=self.cfg.algorithm.reward_type,
+            chunk_reward_aggregation=self.cfg.algorithm.get(
+                "chunk_reward_aggregation", "sum"
+            ),
+            gamma=float(self.cfg.algorithm.get("gamma", 1.0)),
+        )
 
         kwargs = {
             "task_type": self.cfg.runner.task_type,
@@ -205,12 +426,25 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         adv_and_ret = calculate_adv_and_returns(**kwargs)
         self.rollout_batch.update(adv_and_ret)
 
-        if kwargs["loss_mask"] is not None:
-            self.rollout_batch["loss_mask"] = kwargs["loss_mask"]
-        if kwargs["loss_mask_sum"] is not None:
-            self.rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
+        if self.cfg.algorithm.get("staleness_filter_mode", "trajectory") == "chunk_mask":
+            # GAE consumed the effective low-level mask for reward aggregation;
+            # expose the chunk-level effective mask to policy/value/entropy loss
+            # (preprocess_loss_inputs flattens the mask, so a low-level mask would
+            # mismatch the logprob target_shape).
+            self.rollout_batch["loss_mask"] = self.rollout_batch[
+                "staleness_chunk_loss_mask"
+            ]
+            self.rollout_batch["loss_mask_sum"] = self.rollout_batch[
+                "staleness_chunk_loss_mask_sum"
+            ]
+        else:
+            if kwargs["loss_mask"] is not None:
+                self.rollout_batch["loss_mask"] = kwargs["loss_mask"]
+            if kwargs["loss_mask_sum"] is not None:
+                self.rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics.update(reward_metrics)
         return rollout_metrics
 
     @torch.inference_mode()
