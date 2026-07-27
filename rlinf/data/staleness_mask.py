@@ -90,16 +90,18 @@ def compute_staleness_mask(
 
     rollout_batch["loss_mask"] = effective_low
     rollout_batch["staleness_chunk_loss_mask"] = effective_chunk
-    # loss_mask_sum: per-batch count of effective low-level positions (sum over
-    # chunk-step + trailing, keep batch). Shape [1, B, 1, ...] broadcast to loss_mask.
+    # Per-batch count of effective LOW-LEVEL positions (sum over chunk-step +
+    # trailing, keep batch). Both loss_mask_sum and staleness_chunk_loss_mask_sum
+    # use this SAME low-level count: masked_mean_ratio normalizes the loss by it,
+    # and using the chunk count (effective_chunk.sum) here inflated value_loss by
+    # ~na (the per-chunk action factor) vs trajectory mode. staleness_chunk_loss_mask_sum
+    # keeps the chunk-level [n,B,1] shape to match the chunk-level loss_mask.
     sum_dims = [0] + list(range(2, effective_low.ndim))
-    rollout_batch["loss_mask_sum"] = (
-        effective_low.sum(dim=sum_dims, keepdim=True).expand_as(effective_low)
-    )
-    chunk_sum_dims = [0] + list(range(2, effective_chunk.ndim))
-    rollout_batch["staleness_chunk_loss_mask_sum"] = (
-        effective_chunk.sum(dim=chunk_sum_dims, keepdim=True).expand_as(effective_chunk)
-    )
+    low_level_count = effective_low.sum(dim=sum_dims, keepdim=True)  # [1,B,1,...]
+    rollout_batch["loss_mask_sum"] = low_level_count.expand_as(effective_low)
+    rollout_batch["staleness_chunk_loss_mask_sum"] = low_level_count.reshape(
+        1, -1, 1
+    ).expand_as(effective_chunk)
 
     # Version statistics over trainable chunk-steps only (pickup / padding with
     # loss_mask=False are excluded so they do not skew the range).

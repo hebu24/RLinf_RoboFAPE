@@ -368,15 +368,21 @@ def compute_ppo_critic_loss(
         masked_returns = returns
         masked_values = values
 
-    var_returns = torch.var(masked_returns)
-    if torch.isnan(var_returns) or var_returns == 0:
+    # Guard <=1 element: var() on <=1 point has dof 0 -> NaN + a PyTorch warning.
+    # This happens in chunk_mask mode when a rank's batch has only 1 effective
+    # (fresh) chunk. EV is undefined there; return NaN cleanly without the warning.
+    if masked_returns.numel() <= 1:
         explained_variance = torch.tensor(float("nan"), device=returns.device)
     else:
-        var_diff = torch.var(masked_returns - masked_values)
-        if torch.isnan(var_diff):
+        var_returns = torch.var(masked_returns)
+        if torch.isnan(var_returns) or var_returns == 0:
             explained_variance = torch.tensor(float("nan"), device=returns.device)
         else:
-            explained_variance = 1 - var_diff / var_returns
+            var_diff = torch.var(masked_returns - masked_values)
+            if torch.isnan(var_diff):
+                explained_variance = torch.tensor(float("nan"), device=returns.device)
+            else:
+                explained_variance = 1 - var_diff / var_returns
 
     # Compile metrics for logging
     metrics_data = {
