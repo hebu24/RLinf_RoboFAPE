@@ -37,6 +37,7 @@ class HistoryManager:
         )
 
         self.history_entries: list[list[dict[str, Any]]] = [[] for _ in range(num_envs)]
+        self.success_history_entries: list[list[bool]] = [[] for _ in range(num_envs)]
 
         self.history_counts = [0 for _ in range(num_envs)]
 
@@ -107,9 +108,24 @@ class HistoryManager:
                 "History buffer names must be unique for proper extraction."
             )
 
-    def append_to_history_entries(self, observations: dict[str, Any] | None) -> None:
+    def append_to_history_entries(
+        self,
+        observations: dict[str, Any] | None,
+        step_success: list[bool] | torch.Tensor | None = None,
+    ) -> None:
         if observations is None:
             return
+        success_values: list[bool] | None = None
+        if step_success is not None:
+            if isinstance(step_success, torch.Tensor):
+                success_values = step_success.detach().cpu().bool().tolist()
+            else:
+                success_values = [bool(v) for v in step_success]
+            if len(success_values) != self.num_envs:
+                raise ValueError(
+                    "HistoryManager step_success must have one value per env: "
+                    f"expected {self.num_envs}, got {len(success_values)}."
+                )
         for env_id in range(self.num_envs):
             history_entry = {}
             for history_key in self.history_keys:
@@ -118,7 +134,29 @@ class HistoryManager:
                     continue
                 history_entry[history_key] = clone_nested_to_cpu(history_values[env_id])
             self.history_entries[env_id].append(history_entry)
+            self.success_history_entries[env_id].append(
+                False if success_values is None else bool(success_values[env_id])
+            )
             self.history_counts[env_id] += 1
+
+    def append_history_sequence(
+        self,
+        observations_list: list[dict[str, Any] | None],
+        success_list: list[list[bool]] | list[torch.Tensor] | None = None,
+    ) -> None:
+        """Append a time-ordered sequence of per-step observations.
+
+        Used by the peg-insertion Robometer reward path so the history buffer
+        stores one entry per low-level env step instead of one entry per chunk.
+        """
+        if success_list is not None and len(success_list) != len(observations_list):
+            raise ValueError(
+                "HistoryManager success_list must align with observations_list: "
+                f"{len(success_list)=} vs {len(observations_list)=}."
+            )
+        for step_idx, observations in enumerate(observations_list):
+            step_success = None if success_list is None else success_list[step_idx]
+            self.append_to_history_entries(observations, step_success=step_success)
 
     def prepend_history_entries(self, env_id: int, frames: list) -> None:
         """Prepend pick-up render frames to the FRONT of the history buffer.
@@ -215,10 +253,14 @@ class HistoryManager:
 
     def clear_history(self, env_id: int) -> None:
         self.history_entries[env_id].clear()
+        self.success_history_entries[env_id].clear()
         self.history_counts[env_id] = 0
         self.pickup_counts[env_id] = 0
 
     def trim_history(self, env_idx: int) -> None:
         self.history_entries[env_idx] = self.history_entries[env_idx][
+            -self.max_history_size :
+        ]
+        self.success_history_entries[env_idx] = self.success_history_entries[env_idx][
             -self.max_history_size :
         ]

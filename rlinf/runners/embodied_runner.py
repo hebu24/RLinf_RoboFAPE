@@ -325,6 +325,18 @@ class EmbodiedRunner:
             total += float(m.get(key, 0) or 0)
         return total
 
+    def _reduced_rollout_key(self, metrics_list: list[dict], key: str) -> float:
+        """Take an all-reduced metric from rank0 ONCE.
+
+        All-reduced metrics (e.g. ``train_env_steps`` = loss_mask.sum() across
+        ranks) hold the SAME global value on every rank. Summing across ranks
+        (``_sum_rollout_key``) would over-count by world_size (bug: step-50 ckpt
+        was labeled 142936 = 4x the real ~35000). Use this for all-reduced keys.
+        """
+        if not metrics_list:
+            return 0.0
+        return float(metrics_list[0].get(key, 0) or 0)
+
     def _parse_resume_dir(self, resume_dir: str) -> tuple[int, int]:
         """Parse ``(global_step, total_train_env_steps)`` from a ckpt dir name.
 
@@ -563,7 +575,7 @@ class EmbodiedRunner:
                     )
                 # accumulate training-data env steps (loss_mask=True chunks)
                 # for the ckpt `trainenvstep` label (Q2).
-                self.total_train_env_steps += self._sum_rollout_key(
+                self.total_train_env_steps += self._reduced_rollout_key(
                     actor_rollout_metrics, "train_env_steps"
                 )
 
@@ -660,7 +672,7 @@ class EmbodiedRunner:
 
                 # accumulate training-data env steps (loss_mask=True chunks)
                 # for the ckpt `trainenvstep` label (Q2).
-                self.total_train_env_steps += self._sum_rollout_key(
+                self.total_train_env_steps += self._reduced_rollout_key(
                     actor_rollout_metrics, "train_env_steps"
                 )
 

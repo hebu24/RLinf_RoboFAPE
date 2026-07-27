@@ -190,8 +190,16 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
             "group_size": self.cfg.algorithm.get("group_size", 8),
             "reward_type": self.cfg.algorithm.reward_type,
+            "chunk_reward_aggregation": self.cfg.algorithm.get(
+                "chunk_reward_aggregation", "sum"
+            ),
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            # Wire normalize_returns from cfg to the GAE (advantages.py:83). Default
+            # False; set True in config so returns -> O(1), which keeps value_loss
+            # O(1) and prevents the value_head grad from dominating the merged
+            # clip_grad_norm (which starves the actor's policy grad).
+            "normalize_returns": self.cfg.algorithm.get("normalize_returns", False),
         }
 
         adv_and_ret = calculate_adv_and_returns(**kwargs)

@@ -16,26 +16,18 @@
 
 Plugs into RLinf's ``history_buffer`` reward path: the env worker accumulates
 the scene's human render-camera frames (``render_images`` -- one frame per
-chunk step, since ``HistoryManager.append_to_history_entries`` is called once
-per ``get_reward_model_output``) and, at trajectory done, sends them to this
-model (which runs in the reward-worker Ray group). This model POSTs the per-env
-frame stacks to a running robometer eval server
-(``POST /evaluate_batch_npy``), parses the per-frame progress curve in
-``[0, 1]``, and returns a per-chunk reward tensor::
+low-level env step) and, at trajectory done, sends them to this model (which
+runs in the reward-worker Ray group). This model POSTs the per-env frame stacks
+to a running robometer eval server (``POST /evaluate_batch_npy``), parses the
+per-frame progress curve in ``[0, 1]``, and returns a per-frame reward tensor::
 
-    reward[env, chunk_i] = progress[i]        if the trajectory succeeded
+    reward[env, frame_i] = progress[i]        if the trajectory succeeded
                            progress[i] - 1.0  if it did not
 
-``success`` is the env's test-time criterion (``has_peg_inserted()``) forwarded
-in ``env_infos["success"]``; if that is unavailable we fall back to robometer's
-own ``success_probs[-1] > success_threshold``. Because the history holds one
-frame per chunk step, the robometer per-frame curve maps 1:1 to per-chunk
-rewards (no env-step<->chunk resampling needed). Output shape
-``[n_envs, max_T]`` (per-env trajectories padded with 0 to the batch max; the
-env worker's ``assign_history_reward`` scatters only ``history_lengths[env]``
-entries per env, so padding is never read). Returns ``None`` when no env has a
-ready trajectory, so the per-step reward path is a no-op and only the
-done-step scatter fires (no double-count).
+``success`` must come from the env/eval side success signals; if it is missing,
+we raise instead of falling back to robometer ``success_probs``. The env worker
+later interpolates these down-sampled frame rewards back onto low-level
+insertion steps, then aggregates them back to chunk rewards for chunk-level PPO.
 """
 
 from __future__ import annotations
@@ -82,45 +74,158 @@ def _robometer_downsample_indices(total: int, cap: int = 60):
     return out
 
 
-def _assign_downsampled_progress_to_chunks(
+def _extract_env_value(value: Any, env_id: int) -> Any:
+    """Extract one env's entry from a possibly-batched success container."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float, np.bool_, np.number)):
+        return value
+    try:
+        env_value = value[env_id]
+    except Exception:
+        return None
+    if isinstance(env_value, np.ndarray) and env_value.shape == ():
+        return env_value.item()
+    if hasattr(env_value, "item"):
+        try:
+            return env_value.item()
+        except Exception:
+            return env_value
+    return env_value
+
+
+def _resolve_env_success_from_infos(
+    env_infos: dict[str, Any] | None, env_id: int
+) -> bool:
+    """Resolve success using the same priority as peg-insertion eval.
+
+    Priority:
+    1. final_info.episode.success_once
+    2. episode.success_once
+    3. root success
+
+    Raises:
+        ValueError: When no reliable env-side success signal is available.
+    """
+    if not isinstance(env_infos, dict):
+        raise ValueError(
+            f"Missing env_infos for env_id={env_id}; cannot resolve success_once."
+        )
+
+    final_info = env_infos.get("final_info")
+    if isinstance(final_info, dict):
+        final_episode = final_info.get("episode")
+        if isinstance(final_episode, dict):
+            value = _extract_env_value(final_episode.get("success_once"), env_id)
+            if value is not None:
+                return bool(value)
+
+    episode = env_infos.get("episode")
+    if isinstance(episode, dict):
+        value = _extract_env_value(episode.get("success_once"), env_id)
+        if value is not None:
+            return bool(value)
+
+    value = _extract_env_value(env_infos.get("success"), env_id)
+    if value is not None:
+        return bool(value)
+
+    raise ValueError(
+        "Robometer reward requires an env-side success signal but none was found. "
+        f"env_id={env_id}, available env_info keys={sorted(env_infos.keys())}."
+    )
+
+
+def _interpolate_insert_progress_from_downsampled_frames(
     progress, history_len: int, pickup_count: int, max_frames: int = 60
 ):
-    """Map down-sampled robometer progress -> per-chunk reward + has_reward mask.
+    """Map down-sampled robometer progress -> per-step insertion reward + mask.
 
-    Pure (no I/O). ``progress`` is the 1-D array of len = len(ds) (the down-sampled
-    frame progress values, produced by ``compute_reward`` after down-sampling the
-    full pick-up+insert buffer). ``history_len`` is the ORIGINAL (pre-down-sample)
-    buffer length per env (= pickup_count + n_insert_chunks). ``pickup_count`` =
-    number of prepended pick-up frames (insert chunks start at index pickup_count
-    in the original buffer).
+    ``history_len`` is the original full video length = pickup + insertion low-level
+    steps. The history is uniformly downsampled before the Robometer POST; this
+    function reprojects the returned frame rewards back onto insertion low-level
+    steps and linearly interpolates between labeled insertion frames.
 
-    Returns ``(per_chunk_reward[n_insert], per_chunk_has_reward[n_insert])`` where
-    n_insert = max(0, history_len - pickup_count). For each down-sampled frame j
-    whose original index is in the insert portion (>= pickup_count), the
-    corresponding chunk (orig_idx - pickup_count) gets progress[j] + has_reward=True;
-    chunks not in the down-sampled set get reward 0 + has_reward=False. Pick-up
-    down-sampled frames (< pickup_count) are dropped (not in the rollout trajectory).
-
-    Used by env_worker.assign_history_reward (which recomputes the SAME ds indices
-    via _robometer_downsample_indices) so progress[j] <-> chunk alignment is exact.
+    Returns:
+        ``(per_step_reward, per_step_has_reward)`` where both have length
+        ``max(0, history_len - pickup_count)``.
     """
-    import numpy as np
-
     n_insert = max(0, history_len - pickup_count)
-    per_chunk_reward = np.zeros(n_insert, dtype=np.float32)
-    per_chunk_has_reward = np.zeros(n_insert, dtype=bool)
+    per_step_reward = np.zeros(n_insert, dtype=np.float32)
+    per_step_has_reward = np.zeros(n_insert, dtype=bool)
+    if n_insert == 0:
+        return per_step_reward, per_step_has_reward
+
     ds = _robometer_downsample_indices(history_len, max_frames)
     prog = np.asarray(progress, dtype=np.float32) if progress is not None else np.zeros(0)
+
+    labeled_steps: list[int] = []
+    labeled_values: list[float] = []
     for j, orig_idx in enumerate(ds):
-        if orig_idx < pickup_count:
-            continue  # pick-up frame, not in rollout trajectory
         if j >= prog.shape[0]:
             break
-        chunk = int(orig_idx) - pickup_count
-        if 0 <= chunk < n_insert:
-            per_chunk_reward[chunk] = float(prog[j])
-            per_chunk_has_reward[chunk] = True
-    return per_chunk_reward, per_chunk_has_reward
+        if orig_idx < pickup_count:
+            continue
+        step_idx = int(orig_idx) - pickup_count
+        if 0 <= step_idx < n_insert:
+            labeled_steps.append(step_idx)
+            labeled_values.append(float(prog[j]))
+
+    if not labeled_steps:
+        return per_step_reward, per_step_has_reward
+
+    unique_steps: list[int] = []
+    unique_values: list[float] = []
+    for step_idx, value in zip(labeled_steps, labeled_values, strict=True):
+        if unique_steps and step_idx == unique_steps[-1]:
+            unique_values[-1] = value
+            continue
+        unique_steps.append(step_idx)
+        unique_values.append(value)
+
+    if len(unique_steps) == 1:
+        per_step_reward[:] = unique_values[0]
+        per_step_has_reward[:] = True
+        return per_step_reward, per_step_has_reward
+
+    for seg_idx in range(len(unique_steps) - 1):
+        start_step = unique_steps[seg_idx]
+        end_step = unique_steps[seg_idx + 1]
+        start_value = unique_values[seg_idx]
+        end_value = unique_values[seg_idx + 1]
+        if end_step <= start_step:
+            per_step_reward[start_step] = end_value
+            continue
+        steps = np.arange(start_step, end_step + 1, dtype=np.float32)
+        alpha = (steps - float(start_step)) / float(end_step - start_step)
+        per_step_reward[start_step : end_step + 1] = (
+            (1.0 - alpha) * start_value + alpha * end_value
+        )
+
+    first_step = unique_steps[0]
+    last_step = unique_steps[-1]
+    per_step_reward[:first_step] = unique_values[0]
+    per_step_reward[last_step + 1 :] = unique_values[-1]
+    per_step_has_reward[:] = True
+    return per_step_reward, per_step_has_reward
+
+
+def _apply_stepwise_success_shift(
+    per_step_progress: np.ndarray,
+    per_step_success: np.ndarray,
+    fail_shift: float = 1.0,
+) -> np.ndarray:
+    """Convert interpolated progress into reward using per-step success labels."""
+    progress = np.asarray(per_step_progress, dtype=np.float32)
+    success = np.asarray(per_step_success, dtype=bool)
+    if progress.shape != success.shape:
+        raise ValueError(
+            "per_step_progress and per_step_success must have identical shape: "
+            f"{progress.shape=} vs {success.shape=}."
+        )
+    reward = progress.copy()
+    reward[~success] -= float(fail_shift)
+    return reward
 
 
 def _smoke_acquire_slot(smoke_dir, cap):
@@ -259,11 +364,13 @@ def _post_evaluate_batch_npy(
 
 
 class RobometerHistoryRewardModel(BaseRewardModel):
-    """Per-chunk progress reward from a robometer eval server.
+    """Per-frame progress from a robometer eval server.
 
     Config (under ``reward.model``): ``server_url``, ``task`` (the robometer
-    task string), ``timeout_s``, ``use_frame_steps``, ``success_threshold``,
-    ``fail_shift`` (default 1.0), ``min_history_size`` (return None below this).
+    task string), ``timeout_s``, ``use_frame_steps``, ``fail_shift`` (default
+    1.0), ``min_history_size`` (return None below this), and
+    ``max_robometer_frames``. ``success_threshold`` is still parsed for backward
+    compatibility but peg-insertion RL success now comes only from env infos.
     """
 
     def __init__(self, cfg: DictConfig):
@@ -295,25 +402,6 @@ class RobometerHistoryRewardModel(BaseRewardModel):
             "RobometerHistoryRewardModel is an inference-only HTTP reward client."
         )
 
-    def _env_success(
-        self,
-        env_id: int,
-        success: Any,
-        succ_probs_lists: list,
-    ) -> Optional[bool]:
-        """Test-time success (env_infos['success']) with robometer fallback."""
-        if success is not None:
-            try:
-                s = success[env_id]
-                return bool(s.item()) if hasattr(s, "item") else bool(s)
-            except Exception:
-                pass
-        if env_id < len(succ_probs_lists) and succ_probs_lists[env_id]:
-            sp = np.asarray(succ_probs_lists[env_id], dtype=np.float32)
-            if sp.size:
-                return float(sp[-1]) > self.success_threshold
-        return None
-
     @torch.no_grad()
     def compute_reward(self, observations: Any) -> Optional[torch.Tensor]:
         history_input = observations.get("history_input", {}) or {}
@@ -323,10 +411,7 @@ class RobometerHistoryRewardModel(BaseRewardModel):
         if n_envs == 0:
             return None
 
-        success = None
         env_infos = observations.get("env_infos")
-        if env_infos is not None:
-            success = env_infos.get("success", None)
 
         ready: list[tuple[int, np.ndarray, int]] = []  # (env_id, real arr, real_t)
         for env_id, frames in enumerate(frame_lists):
@@ -383,8 +468,6 @@ class RobometerHistoryRewardModel(BaseRewardModel):
             self.server_url, samples, self.timeout_s, self.use_frame_steps
         )
         prog_lists = outputs.get("outputs_progress", {}).get("progress_pred", [])
-        succ_section = outputs.get("outputs_success") or {}
-        succ_probs_lists = succ_section.get("success_probs", []) if succ_section else []
 
         out = torch.zeros((n_envs, max_t), dtype=torch.float32)
         for idx, (env_id, arr, real_t) in enumerate(ready):
@@ -395,9 +478,9 @@ class RobometerHistoryRewardModel(BaseRewardModel):
                 prog = prog[:t]
             else:
                 prog = np.zeros(t, dtype=np.float32)
-            env_success = self._env_success(env_id, success, succ_probs_lists)
+            env_success = _resolve_env_success_from_infos(env_infos, env_id)
             shift = 0.0 if env_success else self.fail_shift
-            out[env_id, :t] = torch.from_numpy(prog - shift)
+            out[env_id, :t] = torch.from_numpy(prog)
             if _SMOKE_DIR:
                 try:
                     _prev = _SMOKE_PREV.get(env_id)

@@ -75,3 +75,36 @@ def test_build_history_input_emits_on_interval_tick():
         torch.tensor([12]),
         torch.tensor([13]),
     ]
+
+
+def test_append_history_sequence_appends_each_low_level_step():
+    manager = HistoryManager(_history_cfg(), num_envs=2)
+
+    manager.append_history_sequence(
+        [
+            {"main_images": torch.tensor([[1], [11]])},
+            {"main_images": torch.tensor([[2], [12]])},
+            {"main_images": torch.tensor([[3], [13]])},
+        ],
+        success_list=[
+            [False, False],
+            [False, True],
+            [True, True],
+        ],
+    )
+
+    assert manager.history_counts == [3, 3]
+    assert manager.history_entries[0] == [
+        {"main_images": torch.tensor([1])},
+        {"main_images": torch.tensor([2])},
+        {"main_images": torch.tensor([3])},
+    ]
+    assert manager.history_entries[1] == [
+        {"main_images": torch.tensor([11])},
+        {"main_images": torch.tensor([12])},
+        {"main_images": torch.tensor([13])},
+    ]
+    assert manager.success_history_entries == [
+        [False, False, True],
+        [False, True, True],
+    ]

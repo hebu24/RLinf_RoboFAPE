@@ -1243,6 +1243,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
             "group_size": self.cfg.algorithm.get("group_size", 8),
             "reward_type": self.cfg.algorithm.reward_type,
+            "chunk_reward_aggregation": self.cfg.algorithm.get(
+                "chunk_reward_aggregation", "sum"
+            ),
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
         }

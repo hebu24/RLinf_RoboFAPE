@@ -1,13 +1,19 @@
 # Async PPO (decoupled_actor_critic) on the peg-insertion pi0.5 wrist SFT ckpt,
-# with dense per-chunk progress reward from a robometer eval server.
+# with Robometer progress first reconstructed on low-level env steps and then
+# aggregated back into chunk rewards for PPO.
 #
-# Reward: history_buffer mode accumulates the scene's render_camera frames (one
-# per chunk) and, at trajectory done, the reward worker (RobometerHistoryRewardModel,
-# registered as model_type "robometer") POSTs them to the robometer server
-# (http://127.0.0.1:8000), parses the per-frame progress curve p[t] in [0,1], and
-# returns reward[chunk_i] = p[i] (success) / p[i]-1 (fail). env_reward_weight=0
-# drops the ManiSkill reward; reward_weight=1 uses robometer. The actor LR (1e-6)
-# is below the SFT peak (3e-6); value_lr is the separate random-init critic head.
+# Reward: history_buffer mode accumulates the scene's render_camera frames at
+# every low-level env step. At trajectory done, the reward worker
+# (RobometerHistoryRewardModel, registered as model_type "robometer") POSTs a
+# uniformly downsampled pick-up+insertion video to the robometer server
+# (http://127.0.0.1:8000), parses the per-frame progress curve p[t] in [0,1],
+# resolves success strictly from env-side success_once/success fields, converts
+# it to low-level reward (`p[t]` on success, `p[t]-1` on failure), linearly
+# interpolates that curve over insertion env steps, and chunk-level PPO later
+# aggregates each 10-step chunk with discounted_sum using algorithm.gamma.
+# env_reward_weight=0 drops the ManiSkill reward; reward_weight=1 uses
+# Robometer. The actor LR (1e-6) is below the SFT peak (3e-6); value_lr is the
+# separate random-init critic head.
 #
 # Launch (see run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh):
 # pick the 3 least-full GPUs for the Ray cluster + 1 dedicated GPU for the
@@ -50,12 +56,14 @@ runner:
 
 algorithm:
   normalize_advantages: True
+  normalize_returns: True     # wire to GAE (advantages.py:83) via async_ppo_fsdp_worker kwargs; returns -> O(1), value_loss O(1), un-dominate clip_grad_norm so actor policy grad isn't starved
   kl_penalty: kl
   group_size: 1
   reward_coef: 1.0
   staleness_threshold: 1
   behave_weight_threshold: 2
   reward_type: chunk_level
+  chunk_reward_aggregation: discounted_sum
   logprob_type: chunk_level
   entropy_type: chunk_level
   update_epoch: 2
@@ -118,7 +126,7 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 8
-  global_batch_size: 160         # 160%(8x4=32)=0 AND flattened 240%(160/4=40)=0 (4 GPU, 16 envs)
+  global_batch_size: 960         # 960%(8x4=32)=0 AND flattened 240%(960/4=240)=0 (4 GPU, 16 envs); 6x old 160 for stabler PPO batch
   seed: 0
   enable_offload: False
   model:
@@ -143,7 +151,7 @@ actor:
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 30       # actor loss zeroed during warmup (losses.py); value learns first (official range 10-30)
+    critic_warmup_steps: 10       # warmup value head 10 steps (cold-start, no SFT value) so EV turns positive before actor learns from it; normalize_returns keeps value_loss O(1)
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"   # shard the ~4B model+optim across the RL GPUs (shared xulab GPUs have limited free mem)
@@ -167,7 +175,7 @@ reward:
     timeout_s: 120.0
     use_frame_steps: False        # full sequence per POST (no 4-frame prefix expansion);
     max_robometer_frames: 60      # uniform down-sample the full pick-up+insert buffer to <= this many frames per POST
-    success_threshold: 0.5
+    success_threshold: 0.5      # legacy/ignored for peg-insertion RL; success must come from env infos
     fail_shift: 1.0
     min_history_size: 2
     render_buffer_name: "render_buffer"

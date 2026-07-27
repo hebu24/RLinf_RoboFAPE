@@ -171,7 +171,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                 # the parent run() and inlines check_progress/_save_checkpoint
                 # below (L275-280), so the parent's accumulate (in EmbodiedRunner.run)
                 # never executes -> must accumulate here, before the save.
-                self.total_train_env_steps += self._sum_rollout_key(
+                self.total_train_env_steps += self._reduced_rollout_key(
                     rollout_metrics_list, "train_env_steps"
                 )
 

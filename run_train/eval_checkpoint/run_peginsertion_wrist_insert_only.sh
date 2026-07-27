@@ -7,7 +7,7 @@
 # then evaluated only on transport + align + descend + insert.
 set -euo pipefail
 
-export CONFIG_NAME="maniskill_peg_insertion_vertical_wrist_sft_eval_openpi_pi05_insert_only"
+export CONFIG_NAME="maniskill_async_ppo_peg_insertion_pi05"
 # 600-step rollout horizon: gives the policy enough time to transport + align +
 # insert (200 steps cut off ~half the successes -> 1/8 vs 4/8 at 600). Divisible by
 # num_action_chunks (10) and execute_action_chunks (10).
