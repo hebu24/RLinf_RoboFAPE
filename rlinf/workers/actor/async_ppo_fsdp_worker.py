@@ -426,20 +426,22 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         adv_and_ret = calculate_adv_and_returns(**kwargs)
         self.rollout_batch.update(adv_and_ret)
 
-        # Keep the effective LOW-LEVEL mask + count for the value/policy/entropy
-        # loss (same path as trajectory mode; preprocess_loss_inputs flattens it
-        # to the chunk-level logprob shape). compute_staleness_mask already wrote
-        # the effective low-level mask/count into rollout_batch and kwargs.
-        # Do NOT swap to staleness_chunk_loss_mask (chunk-level) here: aggregating
-        # the loss with a chunk-level mask + chunk count inflated value_loss by
-        # ~na (the per-chunk action factor) vs trajectory mode, and made EV go NaN
-        # when a rank's effective chunks dropped to <=1 (var() dof 0 on
-        # returns[chunk_mask]). The low-level mask naturally has >=na positions per
-        # effective chunk, so var() never hits dof 0.
-        if kwargs["loss_mask"] is not None:
-            self.rollout_batch["loss_mask"] = kwargs["loss_mask"]
-        if kwargs["loss_mask_sum"] is not None:
-            self.rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
+        if self.cfg.algorithm.get("staleness_filter_mode", "trajectory") == "chunk_mask":
+            # GAE consumed the effective low-level mask for reward aggregation;
+            # expose the chunk-level effective mask to policy/value/entropy loss
+            # (preprocess_loss_inputs flattens the mask, so a low-level mask would
+            # mismatch the logprob target_shape).
+            self.rollout_batch["loss_mask"] = self.rollout_batch[
+                "staleness_chunk_loss_mask"
+            ]
+            self.rollout_batch["loss_mask_sum"] = self.rollout_batch[
+                "staleness_chunk_loss_mask_sum"
+            ]
+        else:
+            if kwargs["loss_mask"] is not None:
+                self.rollout_batch["loss_mask"] = kwargs["loss_mask"]
+            if kwargs["loss_mask_sum"] is not None:
+                self.rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         rollout_metrics.update(reward_metrics)
