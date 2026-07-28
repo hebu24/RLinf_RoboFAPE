@@ -41,6 +41,7 @@ cluster:
 
 runner:
   task_type: embodied
+  stop_on_first_ev_nan: false
   logger:
     log_path: "../results"
     project_name: rlinf
@@ -166,7 +167,7 @@ actor:
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 50        # warmup value head 50 steps before joint actor/critic updates
+    critic_warmup_steps: 100       # warmup value head 100 steps before joint actor/critic updates
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"   # shard the ~4B model+optim across the RL GPUs (shared xulab GPUs have limited free mem)
@@ -178,6 +179,8 @@ actor:
 
 reward:
   use_reward_model: True
+  debug_chunk_funnel: false
+  fail_fast_on_unexpected_chunk_filter: false
   reward_mode: history_buffer
   history_train_mode: rollout_window  # keep full Robometer history for reward reconstruction, but train on the current rollout window
   history_reward_assign: True

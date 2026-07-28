@@ -590,9 +590,15 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         proximal_values = self.rollout_batch.get("proximal_values", None)
         prev_values = self.rollout_batch.get("prev_values", None)
+        initial_loss_mask = self.rollout_batch.get("loss_mask", None)
+        masked_in_before_staleness = float("nan")
+        if initial_loss_mask is not None:
+            masked_in_before_staleness = float(
+                initial_loss_mask.to(dtype=torch.bool).all(dim=-1).sum().item()
+            )
         reward_metrics = compute_embodied_reward_metrics(
             self.rollout_batch["rewards"],
-            self.rollout_batch.get("loss_mask", None),
+            initial_loss_mask,
             reward_type=self.cfg.algorithm.reward_type,
             chunk_reward_aggregation=self.cfg.algorithm.get(
                 "chunk_reward_aggregation", "sum"
@@ -644,6 +650,29 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         rollout_metrics.update(reward_metrics)
+        final_loss_mask = self.rollout_batch.get("loss_mask", None)
+        masked_in_after_staleness = float("nan")
+        if final_loss_mask is not None:
+            masked_in_after_staleness = float(
+                final_loss_mask.to(dtype=torch.bool).all(dim=-1).sum().item()
+            )
+        rollout_metrics.update(
+            {
+                "chunk_funnel/actor_critic_shared_loss_mask": 1.0,
+                "chunk_funnel/masked_in_chunks_before_staleness": (
+                    masked_in_before_staleness
+                ),
+                "chunk_funnel/masked_in_chunks_after_staleness": (
+                    masked_in_after_staleness
+                ),
+                "chunk_funnel/masked_out_chunks_reason_staleness_filtered": (
+                    masked_in_before_staleness - masked_in_after_staleness
+                    if not math.isnan(masked_in_before_staleness)
+                    and not math.isnan(masked_in_after_staleness)
+                    else float("nan")
+                ),
+            }
+        )
         return rollout_metrics
 
     @torch.inference_mode()

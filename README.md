@@ -155,7 +155,8 @@ Use a dedicated GPU that is not part of the Ray RL cluster:
 
 ```bash
 cd ~/RoboFAC/robometer
-CUDA_VISIBLE_DEVICES=4 uv run python robometer/evals/eval_server.py \
+mkdir -p /data/yingxi/tmp
+TMPDIR=/data/yingxi/tmp CUDA_VISIBLE_DEVICES=4 uv run python robometer/evals/eval_server.py \
   model_path=/data/yingxi/robometer/logs/checkpoint-400 \
   server_url=0.0.0.0 \
   server_port=8000 \
@@ -449,7 +450,8 @@ you pass `reward.shaping=delta`, so the delta run uses its own placement config.
 # Step 0 — shared Robometer server (GPU 4; outside both RL clusters)
 tmux new-session -d -s robometer_server \
   "cd /home/yingxi/RoboFAC/robometer && \
-   CUDA_VISIBLE_DEVICES=4 uv run python robometer/evals/eval_server.py \
+   mkdir -p /data/yingxi/tmp && \
+   TMPDIR=/data/yingxi/tmp CUDA_VISIBLE_DEVICES=4 uv run python robometer/evals/eval_server.py \
      model_path=/data/yingxi/robometer/logs/checkpoint-400 \
      server_url=0.0.0.0 server_port=8000 num_gpus=1 batch_size=4 \
    2>&1 | tee /data/yingxi/RLinf_RoboFAPE/logs/robometer_server.log"
@@ -534,6 +536,9 @@ sleep 2
 - `env_success_rate=0` in strict replay: do not train — the dataset is not
   replayable at `action_scale=1.0`.
 - `Errno 28` / disk full: move Ray tmp, `HF_HOME`, `TMPDIR` onto `/data`.
+  For Robometer server 500s during `/evaluate_batch_npy`, restart the server with
+  `TMPDIR=/data/yingxi/tmp`; FastAPI may otherwise spool uploaded `.npy` payloads
+  into root-backed `/tmp`.
 - insert-only eval crash `No module named 'solutions'` / `PegInsertionLiftPlanner worker exited unexpectedly`: set `RLINF_ROBOFPE_PATH` (Setup). The eval launcher runs Ray with `--include-dashboard=false`, so a lift-planner-worker death cascades into a dashboard-API error — fixing the solver path resolves it.
 - RL crashes with a reward-side `ValueError` about missing success fields: this is
   expected under the new strict contract. The peg-insertion RL path now requires

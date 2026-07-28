@@ -17,7 +17,8 @@
 #
 # Launch (see run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh):
 # use 2 RL GPUs per run and keep the Robometer server outside the Ray cluster.
-# This delta config pins the run to host GPUs 2-3 directly.
+# component_placement below assumes 2 logical GPUs (0-1);
+# CUDA_VISIBLE_DEVICES remaps the chosen physical GPUs to 0,1.
 
 defaults:
   - env/maniskill_peg_insertion_vertical_rl@env.train
@@ -36,10 +37,11 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout,reward: 2-3     # delta run uses host GPUs 2-3
+    actor,env,rollout,reward: 0-1     # 2 logical GPUs (CUDA_VISIBLE_DEVICES remap)
 
 runner:
   task_type: embodied
+  stop_on_first_ev_nan: false
   logger:
     log_path: "../results"
     project_name: rlinf
@@ -165,7 +167,7 @@ actor:
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 50        # warmup value head 50 steps before joint actor/critic updates
+    critic_warmup_steps: 100       # warmup value head 100 steps before joint actor/critic updates
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"   # shard the ~4B model+optim across the RL GPUs (shared xulab GPUs have limited free mem)
@@ -177,6 +179,8 @@ actor:
 
 reward:
   use_reward_model: True
+  debug_chunk_funnel: false
+  fail_fast_on_unexpected_chunk_filter: false
   reward_mode: history_buffer
   history_train_mode: rollout_window  # keep full Robometer history for reward reconstruction, but train on the current rollout window
   history_reward_assign: True

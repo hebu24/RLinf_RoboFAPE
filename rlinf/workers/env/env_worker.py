@@ -17,6 +17,7 @@ import gc
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -118,6 +119,14 @@ class EnvWorker(Worker):
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
             "history_reward_assign", False
+        )
+        self.debug_chunk_funnel = bool(
+            self.cfg.get("reward", {}).get("debug_chunk_funnel", False)
+        )
+        self.fail_fast_on_unexpected_chunk_filter = bool(
+            self.cfg.get("reward", {}).get(
+                "fail_fast_on_unexpected_chunk_filter", False
+            )
         )
         self.use_reward_model = self.cfg.get("reward", {}).get(
             "use_reward_model", False
@@ -319,6 +328,9 @@ class EnvWorker(Worker):
                     for _ in range(self.stage_num)
                 ]
                 self._window_chunk_refs = [[] for _ in range(self.stage_num)]
+                self._window_chunk_funnel = [
+                    self._new_chunk_funnel_state() for _ in range(self.stage_num)
+                ]
                 if self.use_completed_episode_buffer:
                     max_chunks = math.ceil(
                         self.cfg.env.train.max_episode_steps
@@ -339,6 +351,129 @@ class EnvWorker(Worker):
         if self.reward_mode != "history_buffer" or not self.enable_train:
             return
         self._window_chunk_refs = [[] for _ in range(self.stage_num)]
+        self._window_chunk_funnel = [
+            self._new_chunk_funnel_state() for _ in range(self.stage_num)
+        ]
+
+    @staticmethod
+    def _new_chunk_funnel_state() -> dict[str, Any]:
+        return {
+            "raw_window_chunks": 0,
+            "query_units": 0,
+            "queried_chunks": 0,
+            "assigned_chunks": 0,
+            "masked_in_chunks": 0,
+            "query_units_by_env_episode": set(),
+            "queried_chunk_refs": set(),
+            "assigned_chunk_refs": set(),
+            "drop_reasons": defaultdict(int),
+        }
+
+    def _chunk_debug_active(self) -> bool:
+        return bool(getattr(self, "debug_chunk_funnel", False))
+
+    def _chunk_fail_fast_active(self) -> bool:
+        return bool(getattr(self, "fail_fast_on_unexpected_chunk_filter", False))
+
+    def _log_chunk_debug(self, prefix: str, **fields: Any) -> None:
+        parts = [f"{key}={fields[key]}" for key in sorted(fields)]
+        msg = f"{prefix} {' '.join(parts)}".strip()
+        self.log_info(msg)
+        try:
+            log_path = Path(_rdebug_log_path())
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+    def _record_chunk_drop(
+        self, stage_id: int, reason: str, count: int = 1, **ctx: Any
+    ) -> None:
+        state = self._window_chunk_funnel[stage_id]
+        state["drop_reasons"][reason] += int(count)
+        if self._chunk_debug_active():
+            self._log_chunk_debug(
+                "CHUNK_DROP_REASON",
+                count=int(count),
+                reason=reason,
+                stage_id=stage_id,
+                **ctx,
+            )
+
+    def _fail_unexpected_chunk(self, reason: str, **ctx: Any) -> None:
+        if self._chunk_debug_active() or self._chunk_fail_fast_active():
+            self._log_chunk_debug("CHUNK_FAIL_FAST", reason=reason, **ctx)
+        raise RuntimeError(f"{reason}: {ctx}")
+
+    def _ensure_expected_chunk(
+        self,
+        *,
+        allowed: bool,
+        stage_id: int,
+        reason: str,
+        count: int = 1,
+        **ctx: Any,
+    ) -> None:
+        if allowed:
+            return
+        self._record_chunk_drop(stage_id, reason, count=count, **ctx)
+        if self._chunk_fail_fast_active():
+            self._fail_unexpected_chunk(reason, **ctx)
+
+    def _window_chunk_count_for_episode(
+        self, stage_id: int, env_id: int, episode_id: int
+    ) -> int:
+        return len(self._window_chunk_slices_for_episode(stage_id, env_id, episode_id))
+
+    def _emit_chunk_funnel_metrics(
+        self, stage_id: int, env_metrics: dict[str, list]
+    ) -> None:
+        state = self._window_chunk_funnel[stage_id]
+        drop_reasons = dict(state["drop_reasons"])
+        masked_in_chunks = int(state["masked_in_chunks"])
+        filtered = int(
+            state["raw_window_chunks"]
+            - masked_in_chunks
+            - drop_reasons.get("pickup_prefix_excluded", 0)
+            - drop_reasons.get("outside_current_window", 0)
+        )
+        summary = {
+            "raw_window_chunks": int(state["raw_window_chunks"]),
+            "query_units": int(state["query_units"]),
+            "queried_chunks": int(state["queried_chunks"]),
+            "assigned_chunks": int(state["assigned_chunks"]),
+            "masked_in_chunks": masked_in_chunks,
+            "filtered_chunks": max(filtered, 0),
+            "drop_reasons": drop_reasons,
+        }
+        if self._chunk_debug_active():
+            self._log_chunk_debug("CHUNK_FUNNEL", stage_id=stage_id, **summary)
+        metric_values = {
+            "chunk_funnel/raw_window_chunks": float(summary["raw_window_chunks"]),
+            "chunk_funnel/query_units": float(summary["query_units"]),
+            "chunk_funnel/queried_chunks": float(summary["queried_chunks"]),
+            "chunk_funnel/assigned_chunks": float(summary["assigned_chunks"]),
+            "chunk_funnel/masked_in_chunks": float(summary["masked_in_chunks"]),
+        }
+        for reason, value in sorted(drop_reasons.items()):
+            metric_values[f"chunk_funnel/masked_out_chunks_reason_{reason}"] = float(
+                value
+            )
+        for key, value in metric_values.items():
+            env_metrics[key].append(torch.tensor([value], dtype=torch.float32))
+
+    @staticmethod
+    def _count_masked_in_chunks(loss_mask: Any) -> int:
+        if loss_mask is None:
+            return 0
+        if isinstance(loss_mask, list):
+            if not loss_mask:
+                return 0
+            loss_mask = torch.stack(loss_mask, dim=0)
+        if not isinstance(loss_mask, torch.Tensor):
+            return 0
+        return int(loss_mask.to(dtype=torch.bool).all(dim=-1).sum())
 
     def _sync_window_chunk_refs(self, stage_id: int) -> None:
         refs = self._window_chunk_refs[stage_id]
@@ -355,6 +490,9 @@ class EnvWorker(Worker):
         if has_rewards:
             episode_ids = self._episode_chunk_ids[stage_id].clone()
             chunk_indices = self._episode_chunk_counts[stage_id].clone()
+            self._window_chunk_funnel[stage_id]["raw_window_chunks"] += int(
+                self.train_num_envs_per_stage
+            )
             self._window_chunk_refs[stage_id].append(
                 [
                     WindowChunkRef(
@@ -984,6 +1122,30 @@ class EnvWorker(Worker):
         adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
         return adjusted_rewards
 
+    def _history_reward_placeholder(
+        self,
+        rewards: torch.Tensor | None,
+        rollout_result: RolloutResult,
+    ) -> torch.Tensor | None:
+        if rewards is not None:
+            return rewards
+        if self.reward_mode != "history_buffer" or not getattr(
+            self, "history_reward_assign", False
+        ):
+            return None
+
+        action = None
+        if rollout_result.forward_inputs:
+            action = rollout_result.forward_inputs.get("action")
+        if action is None:
+            action = rollout_result.actions
+        if action is None:
+            return None
+
+        batch_size = int(action.shape[0])
+        chunk_size = int(self.model_cfg.num_action_chunks)
+        return torch.zeros((batch_size, chunk_size), dtype=torch.float32)
+
     def finish_rollout(self, mode="train"):
         # reset
         if mode == "train":
@@ -1050,7 +1212,7 @@ class EnvWorker(Worker):
                 if self.use_completed_episode_buffer and dones is not None
                 else torch.ones(self.train_num_envs_per_stage, dtype=torch.bool)
             )
-            query_info = {
+            query_info_all = {
                 env_id: (
                     int(self._episode_chunk_ids[stage_id][env_id]),
                     int(len(history_manager.history_entries[env_id])),
@@ -1060,22 +1222,126 @@ class EnvWorker(Worker):
                 for env_id in range(self.train_num_envs_per_stage)
                 if bool(emit_mask[env_id])
             }
+            for env_id, (episode_id, *_rest) in query_info_all.items():
+                if episode_id < 0:
+                    self._ensure_expected_chunk(
+                        allowed=False,
+                        stage_id=stage_id,
+                        reason="query_input_missing",
+                        env_id=env_id,
+                        episode_id=episode_id,
+                    )
+            query_emit_mask = emit_mask.clone().to(dtype=torch.bool)
+            if not self.use_completed_episode_buffer:
+                for env_id, (
+                    episode_id,
+                    history_len,
+                    pickup_count,
+                    _success_trace,
+                ) in query_info_all.items():
+                    window_chunk_count = self._window_chunk_count_for_episode(
+                        stage_id, env_id, episode_id
+                    )
+                    if window_chunk_count > 0:
+                        continue
+                    query_emit_mask[env_id] = False
+                    reason = (
+                        "pickup_prefix_excluded"
+                        if history_len <= pickup_count
+                        else "outside_current_window"
+                    )
+                    self._record_chunk_drop(
+                        stage_id,
+                        reason,
+                        count=0,
+                        env_id=env_id,
+                        episode_id=episode_id,
+                        history_len=history_len,
+                        pickup_count=pickup_count,
+                        window_chunk_count=window_chunk_count,
+                    )
+            query_info = {
+                env_id: info
+                for env_id, info in query_info_all.items()
+                if bool(query_emit_mask[env_id])
+            }
             # Capture pickup_counts BEFORE build_history_input clears done envs
             # (delta mode needs the per-env pickup offset to select chunk-boundary
             # frames in RobometerHistoryRewardModel.compute_reward).
             _delta_pickup_counts = list(history_manager.pickup_counts)
             history_input, history_lengths = history_manager.build_history_input(
-                dones=dones, emit_mask=emit_mask
+                dones=dones, emit_mask=query_emit_mask
             )
             reward_input["history_input"] = history_input
             self.history_lengths[stage_id] = dict(history_lengths)
             emitted_env_ids = self._history_input_emitted_env_ids(history_input)
             if not hasattr(self, "_last_history_query_info"):
                 self._last_history_query_info = {}
-            self._last_history_query_info[stage_id] = {
-                env_id: query_info[env_id]
-                for env_id in emitted_env_ids
-            }
+            query_info_with_refs = {}
+            funnel_state = self._window_chunk_funnel[stage_id]
+            for env_id in sorted(emitted_env_ids):
+                if env_id not in query_info:
+                    self._ensure_expected_chunk(
+                        allowed=False,
+                        stage_id=stage_id,
+                        reason="query_input_missing",
+                        env_id=env_id,
+                    )
+                    continue
+                episode_id, history_len, pickup_count, success_trace = query_info[env_id]
+                if history_len != len(success_trace):
+                    self._ensure_expected_chunk(
+                        allowed=False,
+                        stage_id=stage_id,
+                        reason="query_input_missing",
+                        env_id=env_id,
+                        episode_id=episode_id,
+                        history_len=history_len,
+                        success_trace_len=len(success_trace),
+                    )
+                chunk_refs = tuple(
+                    self._window_chunk_slices_for_episode(stage_id, env_id, episode_id)
+                )
+                window_chunk_count = len(chunk_refs)
+                funnel_state["query_units"] += 1
+                funnel_state["query_units_by_env_episode"].add((env_id, episode_id))
+                funnel_state["queried_chunks"] += int(window_chunk_count)
+                query_info_with_refs[env_id] = (
+                    episode_id,
+                    history_len,
+                    pickup_count,
+                    success_trace,
+                    chunk_refs,
+                )
+                if window_chunk_count <= 0:
+                    self._ensure_expected_chunk(
+                        allowed=False,
+                        stage_id=stage_id,
+                        reason="query_input_missing",
+                        env_id=env_id,
+                        episode_id=episode_id,
+                        history_len=history_len,
+                        pickup_count=pickup_count,
+                        window_chunk_count=window_chunk_count,
+                    )
+                if self._chunk_debug_active():
+                    self._log_chunk_debug(
+                        "CHUNK_QUERY_UNIT",
+                        stage_id=stage_id,
+                        env_id=env_id,
+                        episode_id=episode_id,
+                        is_done=bool(dones[env_id]) if dones is not None else False,
+                        history_len=history_len,
+                        pickup_count=pickup_count,
+                        window_chunk_count=window_chunk_count,
+                    )
+                for local_chunk_idx, episode_chunk_idx in self._window_chunk_slices_for_episode(
+                    stage_id, env_id, episode_id
+                ):
+                    funnel_state["queried_chunk_refs"].add(
+                        (env_id, episode_id, local_chunk_idx, episode_chunk_idx)
+                    )
+            self._last_history_query_info[stage_id] = query_info_with_refs
             if self.reward_shaping == "delta":
                 reward_input["shaping"] = "delta"
                 reward_input["pickup_counts"] = _delta_pickup_counts
@@ -1112,10 +1378,12 @@ class EnvWorker(Worker):
             if self.use_completed_episode_buffer:
                 if dones is None or not bool(dones.any()):
                     return None
-            elif not last_run:
-                return None
-            elif not self._last_history_query_info.get(stage_id):
-                return None
+            else:
+                has_done = dones is not None and bool(dones.any())
+                if not last_run and not has_done:
+                    return None
+                if not self._last_history_query_info.get(stage_id):
+                    return None
         elif not (last_run or (dones is not None and bool(dones.any()))):
             return None
         self.send_to(
@@ -1133,6 +1401,17 @@ class EnvWorker(Worker):
             batch_size=self.train_batch_size,
             decoupled_mode=self.env_decoupled_mode,
         )
+        if self.reward_mode == "history_buffer":
+            expected_queries = getattr(self, "_last_history_query_info", {}).get(
+                stage_id, {}
+            )
+            if expected_queries and reward_output is None:
+                self._ensure_expected_chunk(
+                    allowed=False,
+                    stage_id=stage_id,
+                    reason="query_output_missing",
+                    query_units=len(expected_queries),
+                )
         if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
             try:
                 with open(_rdebug_log_path(), "a") as _f:
@@ -1206,12 +1485,21 @@ class EnvWorker(Worker):
         chunk_size = int(rollout_rewards[-1].shape[-1])
         delta_mode = self.reward_shaping == "delta"
         assignments: dict[int, RobometerEpisodeReward] = {}
-        for env_id, (
-            episode_id,
-            history_len,
-            pickup_count,
-            success_trace,
-        ) in stash.items():
+        funnel_state = self._window_chunk_funnel[stage_id]
+        for env_id, entry in stash.items():
+            if len(entry) == 4:
+                episode_id, history_len, pickup_count, success_trace = entry
+                chunk_refs_snapshot = tuple(
+                    self._window_chunk_slices_for_episode(stage_id, env_id, episode_id)
+                )
+            else:
+                (
+                    episode_id,
+                    history_len,
+                    pickup_count,
+                    success_trace,
+                    chunk_refs_snapshot,
+                ) = entry
             insert_steps = history_len - pickup_count
             total_chunks = math.ceil(insert_steps / chunk_size)
             env_progress = reward[env_id].detach().cpu().numpy().astype(np.float32)
@@ -1286,13 +1574,65 @@ class EnvWorker(Worker):
             assignments[env_id] = assignment
 
             if not self.use_completed_episode_buffer:
-                chunk_refs = self._window_chunk_slices_for_episode(
-                    stage_id, env_id, episode_id
-                )
+                chunk_refs = list(chunk_refs_snapshot)
+                if not chunk_refs:
+                    self._ensure_expected_chunk(
+                        allowed=False,
+                        stage_id=stage_id,
+                        reason="assignment_uncovered_window_chunk",
+                        env_id=env_id,
+                        episode_id=episode_id,
+                        history_len=history_len,
+                        pickup_count=pickup_count,
+                        window_chunk_count=0,
+                    )
+                assigned_chunk_refs: set[tuple[int, int]] = set()
                 for local_chunk_idx, episode_chunk_idx in chunk_refs:
                     if episode_chunk_idx >= assignment.chunk_reward.shape[0]:
-                        continue
+                        self._ensure_expected_chunk(
+                            allowed=False,
+                            stage_id=stage_id,
+                            reason="assignment_oob",
+                            env_id=env_id,
+                            episode_id=episode_id,
+                            local_chunk_idx=local_chunk_idx,
+                            episode_chunk_idx=episode_chunk_idx,
+                            history_len=history_len,
+                            pickup_count=pickup_count,
+                            window_chunk_count=len(chunk_refs),
+                        )
+                    ref_key = (local_chunk_idx, episode_chunk_idx)
+                    if ref_key in assigned_chunk_refs:
+                        self._ensure_expected_chunk(
+                            allowed=False,
+                            stage_id=stage_id,
+                            reason="assignment_ref_mismatch",
+                            env_id=env_id,
+                            episode_id=episode_id,
+                            local_chunk_idx=local_chunk_idx,
+                            episode_chunk_idx=episode_chunk_idx,
+                            history_len=history_len,
+                            pickup_count=pickup_count,
+                            window_chunk_count=len(chunk_refs),
+                        )
+                    assigned_chunk_refs.add(ref_key)
                     target = rollout_rewards[local_chunk_idx]
+                    chunk_mask = np.asarray(
+                        assignment.chunk_loss_mask[episode_chunk_idx], dtype=bool
+                    )
+                    if not bool(chunk_mask.all()):
+                        self._ensure_expected_chunk(
+                            allowed=False,
+                            stage_id=stage_id,
+                            reason="loss_mask_false_after_assignment",
+                            env_id=env_id,
+                            episode_id=episode_id,
+                            local_chunk_idx=local_chunk_idx,
+                            episode_chunk_idx=episode_chunk_idx,
+                            history_len=history_len,
+                            pickup_count=pickup_count,
+                            window_chunk_count=len(chunk_refs),
+                        )
                     target[env_id] = torch.as_tensor(
                         assignment.chunk_reward[episode_chunk_idx],
                         dtype=target.dtype,
@@ -1305,6 +1645,43 @@ class EnvWorker(Worker):
                         dtype=torch.bool,
                         device=target.device,
                     )
+                    funnel_state["assigned_chunks"] += 1
+                    funnel_state["assigned_chunk_refs"].add(
+                        (env_id, episode_id, local_chunk_idx, episode_chunk_idx)
+                    )
+                missing_refs = {
+                    (env_id, episode_id, local_chunk_idx, episode_chunk_idx)
+                    for local_chunk_idx, episode_chunk_idx in chunk_refs
+                } - {
+                    (env_id, episode_id, local_chunk_idx, episode_chunk_idx)
+                    for local_chunk_idx, episode_chunk_idx in assigned_chunk_refs
+                }
+                if missing_refs:
+                    self._ensure_expected_chunk(
+                        allowed=False,
+                        stage_id=stage_id,
+                        reason="assignment_uncovered_window_chunk",
+                        env_id=env_id,
+                        episode_id=episode_id,
+                        history_len=history_len,
+                        pickup_count=pickup_count,
+                        window_chunk_count=len(chunk_refs),
+                    )
+
+        expected_refs = funnel_state["queried_chunk_refs"]
+        if expected_refs:
+            missing_assignment_refs = expected_refs - funnel_state["assigned_chunk_refs"]
+            if missing_assignment_refs:
+                sample = sorted(missing_assignment_refs)[0]
+                self._ensure_expected_chunk(
+                    allowed=False,
+                    stage_id=stage_id,
+                    reason="assignment_uncovered_window_chunk",
+                    env_id=sample[0],
+                    episode_id=sample[1],
+                    local_chunk_idx=sample[2],
+                    episode_chunk_idx=sample[3],
+                )
 
         if self.use_completed_episode_buffer:
             self.completed_episode_buffers[stage_id].add_rewards(assignments)
@@ -1564,6 +1941,9 @@ class EnvWorker(Worker):
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
+                    rewards = self._history_reward_placeholder(
+                        rewards, rollout_result
+                    )
                     chunk_step_result = ChunkStepResult(
                         actions=rollout_result.forward_inputs.get("action", None),
                         prev_logprobs=(
@@ -1671,6 +2051,26 @@ class EnvWorker(Worker):
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
+                if (
+                    self.reward_mode == "history_buffer"
+                    and self.history_reward_assign
+                ):
+                    # The post-loop recv is the bootstrap value for the next state,
+                    # not an additional trainable action chunk. Robometer rewards
+                    # queried here must be scattered onto the already-retained
+                    # rollout window; adding a placeholder reward here would make
+                    # loss_mask/rewards one step longer than versions/actions.
+                    rewards = None
+                    if reward_model_output is not None:
+                        assignments = self.assign_history_reward(
+                            stage_id, reward_model_output
+                        )
+                        for key, values in robometer_assignment_metric_values(
+                            assignments
+                        ).items():
+                            env_metrics[key].append(values)
+                else:
+                    rewards = self._history_reward_placeholder(rewards, rollout_result)
                 chunk_step_result = ChunkStepResult(
                     prev_values=(
                         rollout_result.prev_values if self.collect_prev_infos else None
@@ -1684,21 +2084,16 @@ class EnvWorker(Worker):
                 self._record_window_chunk_ref(
                     stage_id, env_output, has_rewards=rewards is not None
                 )
-                if (
-                    self.reward_mode == "history_buffer"
-                    and self.history_reward_assign
-                    and reward_model_output is not None
-                ):
-                    assignments = self.assign_history_reward(
-                        stage_id, reward_model_output
-                    )
-                    for key, values in robometer_assignment_metric_values(
-                        assignments
-                    ).items():
-                        env_metrics[key].append(values)
 
             if self.use_training_pipeline and actor_channel is not None:
                 send_results: list[EmbodiedRolloutResult | Trajectory]
+                for stage_id in range(self.stage_num):
+                    rollout_result = self.rollout_results[stage_id]
+                    if getattr(rollout_result, "loss_mask", None) is not None:
+                        self._window_chunk_funnel[stage_id]["masked_in_chunks"] = int(
+                            self._count_masked_in_chunks(rollout_result.loss_mask)
+                        )
+                    self._emit_chunk_funnel_metrics(stage_id, env_metrics)
                 if self.use_completed_episode_buffer:
                     send_results = [
                         self._completed_episode_batch(stage_id, rollout_result)
@@ -1725,6 +2120,12 @@ class EnvWorker(Worker):
         if not self.use_training_pipeline and actor_channel is not None:
             for stage_id in range(self.stage_num):
                 send_result: EmbodiedRolloutResult | Trajectory
+                rollout_result = self.rollout_results[stage_id]
+                if getattr(rollout_result, "loss_mask", None) is not None:
+                    self._window_chunk_funnel[stage_id]["masked_in_chunks"] = int(
+                        self._count_masked_in_chunks(rollout_result.loss_mask)
+                    )
+                self._emit_chunk_funnel_metrics(stage_id, env_metrics)
                 if self.use_completed_episode_buffer:
                     send_result = self._completed_episode_batch(
                         stage_id, self.rollout_results[stage_id]

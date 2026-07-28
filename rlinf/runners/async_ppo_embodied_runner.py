@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import math
 import time
 from typing import TYPE_CHECKING
 
@@ -63,6 +64,10 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             self.logger.warning(
                 "Validation check interval is set to a positive value, but validation is not implemented for AsyncPPOEmbodiedRunner, so validation will be skipped."
             )
+        self.stop_on_first_ev_nan = bool(
+            self.cfg.runner.get("stop_on_first_ev_nan", False)
+        )
+        self.stop_reason: str | None = None
 
     def get_rollout_metrics(self) -> tuple[dict, list[dict]]:
         results: list[dict] = []
@@ -277,6 +282,26 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             if env_metrics:
                 logging_metrics.update(env_metrics)
 
+            if self.stop_on_first_ev_nan:
+                ev_value = train_metrics.get("train/critic/explained_variance", None)
+                if ev_value is not None and math.isnan(float(ev_value)):
+                    self.stop_reason = "STOP_ON_FIRST_EV_NAN"
+                    self.logger.warning(
+                        "STOP_ON_FIRST_EV_NAN global_step=%s explained_variance=%s",
+                        self.global_step,
+                        ev_value,
+                    )
+                    if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
+                        try:
+                            with open(_rdebug_log_path(), "a") as _f:
+                                _f.write(
+                                    f"RUNNER stop_reason={self.stop_reason} "
+                                    f"global_step={self.global_step} "
+                                    f"explained_variance={ev_value}\n"
+                                )
+                        except Exception:
+                            pass
+
             self.print_metrics_table_async(
                 self.global_step - 1,
                 self.max_steps,
@@ -298,6 +323,9 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
 
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
+
+            if self.stop_reason is not None:
+                break
 
         self.metric_logger.finish()
 
