@@ -587,6 +587,10 @@ def split_batch(data: Any, split_sizes: Sequence[int]) -> list[Any]:
             for idx, split_value in enumerate(split_values):
                 shards[idx][key] = split_value
         return shards
+    if isinstance(data, (str, int, float, bool)):
+        # Scalar metadata (e.g. reward.shaping, chunk_size) is per-batch, not
+        # per-env; broadcast the same value to every shard instead of failing.
+        return [data for _ in split_sizes]
     raise ValueError(f"Unsupported payload type for batch split: {type(data)}")
 
 
