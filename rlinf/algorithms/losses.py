@@ -21,6 +21,12 @@ from rlinf.algorithms.utils import huber_loss
 from rlinf.utils.utils import masked_mean, masked_mean_ratio
 
 
+_EXPLAINED_VARIANCE_REASON_VALID = 0
+_EXPLAINED_VARIANCE_REASON_TOO_FEW_SAMPLES = 1
+_EXPLAINED_VARIANCE_REASON_ZERO_RETURN_VARIANCE = 2
+_EXPLAINED_VARIANCE_REASON_NON_FINITE_VARIANCE = 3
+
+
 def compute_decoupled_ppo_actor_loss(
     logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
@@ -368,19 +374,46 @@ def compute_ppo_critic_loss(
         masked_returns = returns
         masked_values = values
 
+    explained_variance_valid = torch.tensor(1.0, device=returns.device)
+    explained_variance_numel = torch.tensor(
+        float(masked_returns.numel()), device=returns.device
+    )
+    explained_variance_invalid_reason = torch.tensor(
+        float(_EXPLAINED_VARIANCE_REASON_VALID), device=returns.device
+    )
+    explained_variance = torch.tensor(float("nan"), device=returns.device)
+    var_returns = torch.tensor(float("nan"), device=returns.device)
+
     # Guard <=1 element: var() on <=1 point has dof 0 -> NaN + a PyTorch warning.
     # This happens in chunk_mask mode when a rank's batch has only 1 effective
     # (fresh) chunk. EV is undefined there; return NaN cleanly without the warning.
     if masked_returns.numel() <= 1:
-        explained_variance = torch.tensor(float("nan"), device=returns.device)
+        explained_variance_valid = torch.tensor(0.0, device=returns.device)
+        explained_variance_invalid_reason = torch.tensor(
+            float(_EXPLAINED_VARIANCE_REASON_TOO_FEW_SAMPLES), device=returns.device
+        )
     else:
         var_returns = torch.var(masked_returns)
-        if torch.isnan(var_returns) or var_returns == 0:
-            explained_variance = torch.tensor(float("nan"), device=returns.device)
+        if torch.isnan(var_returns) or torch.isinf(var_returns):
+            explained_variance_valid = torch.tensor(0.0, device=returns.device)
+            explained_variance_invalid_reason = torch.tensor(
+                float(_EXPLAINED_VARIANCE_REASON_NON_FINITE_VARIANCE),
+                device=returns.device,
+            )
+        elif var_returns == 0:
+            explained_variance_valid = torch.tensor(0.0, device=returns.device)
+            explained_variance_invalid_reason = torch.tensor(
+                float(_EXPLAINED_VARIANCE_REASON_ZERO_RETURN_VARIANCE),
+                device=returns.device,
+            )
         else:
             var_diff = torch.var(masked_returns - masked_values)
-            if torch.isnan(var_diff):
-                explained_variance = torch.tensor(float("nan"), device=returns.device)
+            if torch.isnan(var_diff) or torch.isinf(var_diff):
+                explained_variance_valid = torch.tensor(0.0, device=returns.device)
+                explained_variance_invalid_reason = torch.tensor(
+                    float(_EXPLAINED_VARIANCE_REASON_NON_FINITE_VARIANCE),
+                    device=returns.device,
+                )
             else:
                 explained_variance = 1 - var_diff / var_returns
 
@@ -389,6 +422,12 @@ def compute_ppo_critic_loss(
         "critic/value_loss": value_loss.detach(),
         "critic/value_clip_ratio": value_clip_ratio.detach(),
         "critic/explained_variance": explained_variance.detach(),
+        "critic/explained_variance_valid": explained_variance_valid.detach(),
+        "critic/explained_variance_numel": explained_variance_numel.detach(),
+        "critic/explained_variance_var_returns": var_returns.detach(),
+        "critic/explained_variance_invalid_reason": (
+            explained_variance_invalid_reason.detach()
+        ),
     }
     return value_loss, metrics_data
 

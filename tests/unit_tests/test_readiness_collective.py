@@ -88,3 +88,15 @@ def test_collective_peek_discard_take_sequence_on_store():
     assert len(store) == 0
     # taken items are marked used -> not double-counted as discarded-unused
     assert store.get_metric()["discarded_unused"] == 3
+
+
+def test_readiness_min_fresh_chunks_threshold_logic():
+    traj = _traj([8, 9, 10], [True, True, True])
+    stats = count_fresh_chunks([traj], cutoff=10)
+    assert stats["fresh"] == 1
+    assert stats["fresh"] < 2
+
+    traj2 = _traj([9, 10, 10], [True, True, True])
+    stats2 = count_fresh_chunks([traj2], cutoff=9)
+    assert stats2["fresh"] == 3
+    assert stats2["fresh"] >= 2

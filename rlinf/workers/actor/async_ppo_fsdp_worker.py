@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import math
 import os
 import queue
 import threading
@@ -37,6 +38,13 @@ from rlinf.utils.metric_utils import (
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+
+_ADV_LOGPROB_METRIC_REASON_VALID = 0
+_ADV_LOGPROB_METRIC_REASON_TOO_FEW_SAMPLES = 1
+_ADV_LOGPROB_METRIC_REASON_ZERO_ADVANTAGE_VARIANCE = 2
+_ADV_LOGPROB_METRIC_REASON_ZERO_LOGPROB_DELTA_VARIANCE = 3
+_ADV_LOGPROB_METRIC_REASON_NON_FINITE_INPUTS = 4
 
 
 def flatten_rollout_batch_for_train(
@@ -67,6 +75,176 @@ def flatten_rollout_batch_for_train(
             )
 
     return ret_dict
+
+
+def _reduce_to_item_level(
+    tensor: torch.Tensor,
+    logprob_type: str,
+    single_action_dim: int,
+    *,
+    reduction: str,
+) -> torch.Tensor:
+    """Reduce flattened training tensors to actor item granularity."""
+    if logprob_type == "chunk_level":
+        if tensor.dim() == 1:
+            base = tensor
+        else:
+            base = tensor.reshape(tensor.shape[0], -1).sum(dim=1)
+    elif logprob_type == "action_level":
+        if tensor.dim() == 1:
+            base = tensor
+        else:
+            base = tensor.reshape(tensor.shape[0], -1, single_action_dim).sum(dim=-1)
+    elif logprob_type == "token_level":
+        if tensor.dim() == 1:
+            base = tensor
+        else:
+            base = tensor.reshape(tensor.shape[0], -1, single_action_dim)
+    else:
+        raise ValueError(f"Unsupported logprob_type={logprob_type!r}.")
+
+    if reduction == "sum":
+        return base if base.dim() == 1 else base.sum(dim=tuple(range(1, base.dim())))
+    if reduction == "mean":
+        return base if base.dim() == 1 else base.float().mean(dim=tuple(range(1, base.dim())))
+    if reduction == "any":
+        return base if base.dim() == 1 else base.any(dim=tuple(range(1, base.dim())))
+    raise ValueError(f"Unsupported reduction={reduction!r}.")
+
+
+def compute_adv_logprob_diagnostics(
+    *,
+    advantages: torch.Tensor,
+    prev_logprobs: torch.Tensor,
+    post_update_logprobs: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    logprob_type: str,
+    single_action_dim: int,
+) -> dict[str, torch.Tensor]:
+    """Measure whether higher-advantage items received larger logprob increases."""
+    device = advantages.device
+    prev_logprobs = prev_logprobs.to(device=device)
+    post_update_logprobs = post_update_logprobs.to(device=device)
+    if loss_mask is not None:
+        loss_mask = loss_mask.to(device=device)
+    def _scalar(value: float | torch.Tensor) -> float:
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().cpu().item())
+        return float(value)
+    metrics = {
+        "actor/adv_logprob_delta_corr": float("nan"),
+        "actor/adv_logprob_delta_cov": float("nan"),
+        "actor/mean_logprob_delta_pos_adv": float("nan"),
+        "actor/mean_logprob_delta_neg_adv": float("nan"),
+        "actor/adv_logprob_direction_match_rate": float("nan"),
+        "actor/adv_top_quartile_logprob_delta_mean": float("nan"),
+        "actor/adv_logprob_metric_valid": 0.0,
+        "actor/adv_logprob_metric_numel": 0.0,
+        "actor/adv_logprob_metric_invalid_reason": float(
+            _ADV_LOGPROB_METRIC_REASON_VALID
+        ),
+    }
+
+    item_advantages = _reduce_to_item_level(
+        advantages.float(),
+        logprob_type,
+        single_action_dim,
+        reduction="mean",
+    )
+    item_delta_logprob = _reduce_to_item_level(
+        (post_update_logprobs.float() - prev_logprobs.float()),
+        logprob_type,
+        single_action_dim,
+        reduction="sum",
+    )
+    if loss_mask is None:
+        item_mask = torch.ones_like(item_advantages, dtype=torch.bool)
+    else:
+        item_mask = _reduce_to_item_level(
+            loss_mask.bool(),
+            logprob_type,
+            single_action_dim,
+            reduction="any",
+        ).bool()
+
+    finite_mask = torch.isfinite(item_advantages) & torch.isfinite(item_delta_logprob)
+    valid_mask = item_mask & finite_mask
+    metrics["actor/adv_logprob_metric_numel"] = float(valid_mask.count_nonzero().item())
+
+    if bool((item_mask & ~finite_mask).any()):
+        metrics["actor/adv_logprob_metric_invalid_reason"] = float(
+            _ADV_LOGPROB_METRIC_REASON_NON_FINITE_INPUTS
+        )
+        return metrics
+
+    if valid_mask.count_nonzero() <= 1:
+        metrics["actor/adv_logprob_metric_invalid_reason"] = float(
+            _ADV_LOGPROB_METRIC_REASON_TOO_FEW_SAMPLES
+        )
+        return metrics
+
+    masked_advantages = item_advantages[valid_mask]
+    masked_delta_logprob = item_delta_logprob[valid_mask]
+
+    adv_mean = masked_advantages.mean()
+    delta_mean = masked_delta_logprob.mean()
+    centered_adv = masked_advantages - adv_mean
+    centered_delta = masked_delta_logprob - delta_mean
+    adv_var = torch.mean(centered_adv.square())
+    delta_var = torch.mean(centered_delta.square())
+
+    if not torch.isfinite(adv_var) or not torch.isfinite(delta_var):
+        metrics["actor/adv_logprob_metric_invalid_reason"] = float(
+            _ADV_LOGPROB_METRIC_REASON_NON_FINITE_INPUTS
+        )
+        return metrics
+    if adv_var <= 0:
+        metrics["actor/adv_logprob_metric_invalid_reason"] = float(
+            _ADV_LOGPROB_METRIC_REASON_ZERO_ADVANTAGE_VARIANCE
+        )
+        return metrics
+    if delta_var <= 0:
+        metrics["actor/adv_logprob_metric_invalid_reason"] = float(
+            _ADV_LOGPROB_METRIC_REASON_ZERO_LOGPROB_DELTA_VARIANCE
+        )
+        return metrics
+
+    covariance = torch.mean(centered_adv * centered_delta)
+    correlation = covariance / torch.sqrt(adv_var * delta_var)
+
+    pos_mask = masked_advantages > 0
+    neg_mask = masked_advantages < 0
+    nonzero_mask = pos_mask | neg_mask
+
+    if bool(pos_mask.any()):
+        metrics["actor/mean_logprob_delta_pos_adv"] = _scalar(
+            masked_delta_logprob[pos_mask].mean()
+        )
+    if bool(neg_mask.any()):
+        metrics["actor/mean_logprob_delta_neg_adv"] = _scalar(
+            masked_delta_logprob[neg_mask].mean()
+        )
+    if bool(nonzero_mask.any()):
+        sign_match = torch.sign(masked_advantages[nonzero_mask]) == torch.sign(
+            masked_delta_logprob[nonzero_mask]
+        )
+        metrics["actor/adv_logprob_direction_match_rate"] = _scalar(
+            sign_match.float().mean()
+        )
+
+    top_count = max(1, math.ceil(masked_advantages.numel() * 0.25))
+    top_values = torch.topk(masked_advantages, k=top_count).values
+    top_threshold = top_values.min()
+    top_mask = masked_advantages >= top_threshold
+    if bool(top_mask.any()):
+        metrics["actor/adv_top_quartile_logprob_delta_mean"] = _scalar(
+            masked_delta_logprob[top_mask].mean()
+        )
+
+    metrics["actor/adv_logprob_delta_corr"] = _scalar(correlation)
+    metrics["actor/adv_logprob_delta_cov"] = _scalar(covariance)
+    metrics["actor/adv_logprob_metric_valid"] = 1.0
+    return metrics
 
 
 class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
@@ -229,6 +407,12 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         # ---- chunk_mask: two-phase all-reduce readiness collective ----
         timeout = float(self.cfg.algorithm.get("rollout_store_wait_timeout_s", 600))
+        initial_timeout = float(
+            self.cfg.algorithm.get(
+                "rollout_store_initial_wait_timeout_s",
+                max(timeout, 1800.0),
+            )
+        )
         status_interval = float(
             self.cfg.algorithm.get("rollout_store_status_interval_s", 30)
         )
@@ -241,6 +425,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             int(self.version) - int(staleness_threshold)
             if staleness_threshold is not None
             else -(10**9)
+        )
+        min_fresh_chunks = int(
+            self.cfg.algorithm.get("readiness_min_fresh_chunks", 1)
         )
         start = time.time()
         global_retry = 0
@@ -255,9 +442,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             # Per-iteration abort sync (all_reduce is the sync point): any rank
             # timed out OR its recv thread crashed -> every rank raises together.
             now = time.time()
+            wait_deadline = timeout if received > 0 else initial_timeout
             local_abort = 1.0 if (
-                (now - start) >= timeout
-                or self._recv_thread_exc is not None
+                (now - start) >= wait_deadline or self._recv_thread_exc is not None
             ) else 0.0
             abort = torch.tensor([local_abort], device=device)
             torch.distributed.all_reduce(abort, op=torch.distributed.ReduceOp.MAX)
@@ -265,7 +452,11 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 reason = (
                     f"recv thread crash: {self._recv_thread_exc!r}"
                     if self._recv_thread_exc is not None
-                    else f"timeout after {now - start:.1f}s"
+                    else (
+                        f"initial-timeout after {now - start:.1f}s"
+                        if received == 0
+                        else f"timeout after {now - start:.1f}s"
+                    )
                 )
                 self._staleness_readiness = {
                     "staleness_received_trajectories": received,
@@ -289,19 +480,26 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 await asyncio.sleep(1)
                 continue
 
-            # Phase 2: every rank has >= 1 fresh chunk?
+            # Phase 2: every rank has >= min_fresh_chunks fresh chunks?
             fresh = torch.tensor(
                 [float(self._count_fresh_chunks(candidates, cutoff))],
                 device=device,
             )
             torch.distributed.all_reduce(fresh, op=torch.distributed.ReduceOp.MIN)
-            if fresh.item() < 1.0:
-                # All ranks have candidates but some rank has zero fresh chunks:
-                # discard in lockstep and wait for fresh data to refill.
+            if fresh.item() < float(min_fresh_chunks):
+                # All ranks have candidates but some rank lacks the minimum
+                # fresh chunk budget: discard in lockstep and wait for fresher
+                # data so critic statistics are defined on >1 sample.
                 self.rollout_store.discard_topn(n)
                 global_retry += 1
                 if now - last_status >= status_interval:
-                    self._log_wait_status(start, global_retry, candidates, cutoff, "phase2 all-stale discard")
+                    self._log_wait_status(
+                        start,
+                        global_retry,
+                        candidates,
+                        cutoff,
+                        f"phase2 insufficient-fresh<{min_fresh_chunks} discard",
+                    )
                     last_status = now
                 await asyncio.sleep(1)
                 continue
@@ -315,7 +513,8 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             self.log_info(
                 f"readiness ready rank={self._rank} version={self.version} "
                 f"took={len(batch)} global_retry={global_retry} "
-                f"wait_s={time.time()-start:.1f}"
+                f"wait_s={time.time()-start:.1f} "
+                f"min_fresh_chunks={min_fresh_chunks}"
             )
             return batch
 
@@ -506,6 +705,58 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             *self.rollout_batch["prev_logprobs"].shape[2:],
         )
         self.rollout_batch["proximal_logprobs"] = proximal_logprobs
+
+    @torch.inference_mode()
+    def compute_post_update_logprobs(self) -> torch.Tensor:
+        """Recompute logprobs under the final post-update actor for diagnostics."""
+        assert not self.is_weight_offloaded, (
+            "Weight offloading is not supported when recomputing post-update logprobs."
+        )
+
+        flat = self.rollout_batch
+        total = flat["prev_logprobs"].shape[0]
+        micro_batch_size = self.cfg.actor.micro_batch_size
+        num_splits = (total + micro_batch_size - 1) // micro_batch_size
+        iterator = split_dict_to_chunk(flat, num_splits)
+
+        self.model.eval()
+        post_update_logprobs_list = []
+
+        for micro_batch in iterator:
+            micro_batch = put_tensor_device(micro_batch, self.device)
+            forward_inputs = micro_batch.get("forward_inputs", None)
+            if forward_inputs is None:
+                raise ValueError(
+                    "Missing forward_inputs in compute_post_update_logprobs. "
+                    "This usually means batch splitting dropped nested dict fields."
+                )
+
+            model_kwargs = {}
+            if SupportedModel(self.cfg.actor.model.model_type) in [
+                SupportedModel.OPENVLA,
+                SupportedModel.OPENVLA_OFT,
+            ]:
+                model_kwargs["temperature"] = (
+                    self.cfg.rollout.sampling_params.temperature_train
+                )
+                model_kwargs["top_k"] = self.cfg.rollout.sampling_params.top_k
+            elif SupportedModel(self.cfg.actor.model.model_type) in [
+                SupportedModel.GR00T,
+                SupportedModel.ABOT_M0,
+            ]:
+                model_kwargs["prev_logprobs"] = micro_batch["prev_logprobs"]
+
+            out = self.model(
+                forward_inputs=forward_inputs,
+                compute_logprobs=True,
+                compute_entropy=False,
+                compute_values=False,
+                use_cache=False,
+                **model_kwargs,
+            )
+            post_update_logprobs_list.append(out["logprobs"].cpu())
+
+        return torch.cat(post_update_logprobs_list, dim=0)
 
     def run_training(self) -> dict[str, Any]:
         if self.is_weight_offloaded:
@@ -714,6 +965,17 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
+
+        post_update_metrics = compute_adv_logprob_diagnostics(
+            advantages=self.rollout_batch["advantages"],
+            prev_logprobs=self.rollout_batch["prev_logprobs"],
+            post_update_logprobs=self.compute_post_update_logprobs(),
+            loss_mask=self.rollout_batch.get("loss_mask", None),
+            logprob_type=self.cfg.algorithm.logprob_type,
+            single_action_dim=self.cfg.actor.model.get("action_dim", 7),
+        )
+        append_to_dict(metrics, post_update_metrics)
+
         clear_memory()
 
         mean_metric_dict = {k: float(np.mean(v)) for k, v in metrics.items()}

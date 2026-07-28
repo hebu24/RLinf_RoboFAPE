@@ -176,14 +176,14 @@ def _robometer_cfg():
     )
 
 
-def test_compute_reward_queries_only_done_envs(monkeypatch):
+def test_compute_reward_queries_all_emitted_prefixes(monkeypatch):
     from rlinf.models.embodiment.reward import robometer_reward_model as module
 
     captured = {}
 
     def fake_post(server_url, samples, timeout_s, use_frame_steps):
         captured["samples"] = samples
-        return {"outputs_progress": {"progress_pred": [[0.2, 0.8]]}}
+        return {"outputs_progress": {"progress_pred": [[0.2, 0.8], [0.1, 0.3]]}}
 
     monkeypatch.setattr(module, "_post_evaluate_batch_npy", fake_post)
     model = module.RobometerHistoryRewardModel(_robometer_cfg())
@@ -194,14 +194,14 @@ def test_compute_reward_queries_only_done_envs(monkeypatch):
                 "render_buffer": {"render_images": [[frame, frame], [frame, frame]]}
             },
             "env_infos": {"success": np.array([True, False])},
-            "dones": np.array([True, False]),
         }
     )
 
-    assert len(captured["samples"]) == 1
+    assert len(captured["samples"]) == 2
     assert captured["samples"][0]["trajectory"]["id"] == "0"
+    assert captured["samples"][1]["trajectory"]["id"] == "1"
     np.testing.assert_allclose(output[0].numpy(), np.array([0.2, 0.8]))
-    np.testing.assert_allclose(output[1].numpy(), np.array([0.0, 0.0]))
+    np.testing.assert_allclose(output[1].numpy(), np.array([0.1, 0.3]))
 
 
 def test_compute_reward_rejects_missing_progress(monkeypatch):
@@ -224,33 +224,56 @@ def test_compute_reward_rejects_missing_progress(monkeypatch):
         )
 
 
-def test_compute_reward_rejects_empty_completed_history():
+def test_compute_reward_skips_empty_prefix_history(monkeypatch):
     from rlinf.models.embodiment.reward import robometer_reward_model as module
 
-    model = module.RobometerHistoryRewardModel(_robometer_cfg())
-    with pytest.raises(ValueError, match="no emitted Robometer history"):
-        model.compute_reward(
-            {
-                "history_input": {"render_buffer": {"render_images": [[]]}},
-                "env_infos": {"success": np.array([False])},
-                "dones": np.array([True]),
-            }
-        )
+    captured = {}
 
+    def fake_post(server_url, samples, timeout_s, use_frame_steps):
+        captured["samples"] = samples
+        return {"outputs_progress": {"progress_pred": [[0.4, 0.6]]}}
 
-def test_compute_reward_rejects_completed_history_below_minimum():
-    from rlinf.models.embodiment.reward import robometer_reward_model as module
-
+    monkeypatch.setattr(module, "_post_evaluate_batch_npy", fake_post)
     model = module.RobometerHistoryRewardModel(_robometer_cfg())
     frame = np.zeros((4, 4, 3), dtype=np.uint8)
-    with pytest.raises(ValueError, match="shorter than min_history_size"):
-        model.compute_reward(
-            {
-                "history_input": {"render_buffer": {"render_images": [[frame]]}},
-                "env_infos": {"success": np.array([False])},
-                "dones": np.array([True]),
-            }
-        )
+    output = model.compute_reward(
+        {
+            "history_input": {"render_buffer": {"render_images": [[], [frame, frame]]}},
+            "env_infos": {"success": np.array([False, False])},
+        }
+    )
+
+    assert len(captured["samples"]) == 1
+    assert captured["samples"][0]["trajectory"]["id"] == "1"
+    np.testing.assert_allclose(output[0].numpy(), np.array([0.0, 0.0]))
+    np.testing.assert_allclose(output[1].numpy(), np.array([0.4, 0.6]))
+
+
+def test_compute_reward_skips_prefix_history_below_minimum(monkeypatch):
+    from rlinf.models.embodiment.reward import robometer_reward_model as module
+
+    captured = {}
+
+    def fake_post(server_url, samples, timeout_s, use_frame_steps):
+        captured["samples"] = samples
+        return {"outputs_progress": {"progress_pred": [[0.4, 0.6]]}}
+
+    monkeypatch.setattr(module, "_post_evaluate_batch_npy", fake_post)
+    model = module.RobometerHistoryRewardModel(_robometer_cfg())
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    output = model.compute_reward(
+        {
+            "history_input": {
+                "render_buffer": {"render_images": [[frame], [frame, frame]]}
+            },
+            "env_infos": {"success": np.array([False, False])},
+        }
+    )
+
+    assert len(captured["samples"]) == 1
+    assert captured["samples"][0]["trajectory"]["id"] == "1"
+    np.testing.assert_allclose(output[0].numpy(), np.array([0.0, 0.0]))
+    np.testing.assert_allclose(output[1].numpy(), np.array([0.4, 0.6]))
 
 
 # ---------------------------------------------------------------------------

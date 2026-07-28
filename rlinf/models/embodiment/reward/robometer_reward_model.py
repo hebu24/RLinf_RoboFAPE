@@ -34,8 +34,10 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -52,6 +54,7 @@ _SMOKE_LOCAL_LOCK = threading.Lock()
 _SMOKE_PREV = {}  # per-process: env_id -> {arr,prog,success,shift,len} for reset-detection
 
 ROBOMETER_REWARD_PIPELINE_VERSION = "episode-v1"
+_LOGGER = logging.getLogger(__name__)
 
 
 def _robometer_downsample_indices(total: int, cap: int = 60):
@@ -660,6 +663,7 @@ class RobometerHistoryRewardModel(BaseRewardModel):
             "render_buffer_name",
             next(iter(buffers)) if buffers else None,
         )
+        self.debug_memory_profile = bool(cfg.get("debug_memory_profile", False))
 
     def forward(self, input_data, labels=None):
         raise NotImplementedError(
@@ -668,6 +672,7 @@ class RobometerHistoryRewardModel(BaseRewardModel):
 
     @torch.no_grad()
     def compute_reward(self, observations: Any) -> Optional[torch.Tensor]:
+        profile_start = time.perf_counter()
         history_input = observations.get("history_input", {}) or {}
         buf = history_input.get(self.render_buffer_name, {})
         frame_lists = buf.get("render_images", [])  # list[env] of list[frame]
@@ -676,15 +681,6 @@ class RobometerHistoryRewardModel(BaseRewardModel):
             return None
 
         env_infos = observations.get("env_infos")
-        dones = observations.get("dones")
-        if dones is None:
-            raise ValueError("Robometer reward requires a done mask.")
-        dones = np.asarray(dones, dtype=bool).reshape(-1)
-        if dones.shape[0] != n_envs:
-            raise ValueError(
-                "Robometer done mask must contain one value per env: "
-                f"{dones.shape[0]=} vs {n_envs=}."
-            )
 
         # Delta shaping: env_worker passes per-env pickup_counts + chunk_size so we
         # select chunk-boundary frames (n_chunks+1) instead of uniformly
@@ -705,20 +701,15 @@ class RobometerHistoryRewardModel(BaseRewardModel):
                 )
 
         ready: list[tuple[int, np.ndarray, int]] = []  # (env_id, real arr, real_t)
+        selected_frames = 0
+        padded_frames = 0
+        payload_bytes = 0
         for env_id, frames in enumerate(frame_lists):
-            if not dones[env_id]:
-                continue
             if not frames:
-                raise ValueError(
-                    f"Completed env {env_id} has no emitted Robometer history frames."
-                )
+                continue
             arr = np.stack([np.asarray(f, dtype=np.uint8) for f in frames])
             if arr.shape[0] < self.min_history_size:
-                raise ValueError(
-                    "Completed Robometer history is shorter than min_history_size: "
-                    f"env_id={env_id}, frames={arr.shape[0]}, "
-                    f"min_history_size={self.min_history_size}."
-                )
+                continue
             if delta_mode:
                 # Select chunk-boundary frames (start of insertion + after each
                 # chunk). env_worker recomputes the SAME indices' count to map
@@ -734,6 +725,8 @@ class RobometerHistoryRewardModel(BaseRewardModel):
                 ds = _robometer_downsample_indices(arr.shape[0], self.max_robometer_frames)
                 if len(ds) < arr.shape[0]:
                     arr = arr[ds]
+            selected_frames += int(arr.shape[0])
+            payload_bytes += int(arr.nbytes)
             ready.append((env_id, arr, arr.shape[0]))
         if not ready:
             return None
@@ -753,6 +746,7 @@ class RobometerHistoryRewardModel(BaseRewardModel):
                 )
             else:
                 arr_pad = arr
+            padded_frames += int(arr_pad.shape[0] - real_t)
             samples.append(
                 {
                     "sample_type": "progress",
@@ -765,6 +759,14 @@ class RobometerHistoryRewardModel(BaseRewardModel):
                         "video_embeddings": None,
                     },
                 }
+            )
+        if self.debug_memory_profile:
+            _LOGGER.info(
+                "robometer payload profile "
+                f"envs={len(ready)} selected_frames={selected_frames} "
+                f"padded_frames={padded_frames} payload_bytes={payload_bytes} "
+                f"max_t={max_t} shaping={shaping} "
+                f"elapsed_s={time.perf_counter() - profile_start:.3f}"
             )
         outputs = _post_evaluate_batch_npy(
             self.server_url, samples, self.timeout_s, self.use_frame_steps

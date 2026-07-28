@@ -16,6 +16,7 @@ import asyncio
 import gc
 import math
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -72,6 +73,12 @@ from rlinf.workers.env.history_manager import (
 )
 
 
+@dataclass
+class WindowChunkRef:
+    episode_id: int
+    chunk_index: int
+
+
 def _rdebug_log_path() -> str:
     """Resolve the Robometer reward debug log path per-run.
 
@@ -122,11 +129,25 @@ class EnvWorker(Worker):
             self.use_reward_model and not self.use_realworld_reward
         )
         self.env_infos_reward_keys = ("success", "episode", "final_info")
+        self.history_train_mode = self.cfg.get("reward", {}).get(
+            "history_train_mode", "rollout_window"
+        )
         self.use_completed_episode_buffer = (
-            self.reward_mode == "history_buffer"
+            self.history_train_mode == "complete_episode"
+            and self.reward_mode == "history_buffer"
             and self.cfg.get("reward", {}).get("model", {}).get("model_type")
             == "robometer"
         )
+        if (
+            self.reward_mode == "history_buffer"
+            and self.cfg.get("reward", {}).get("model", {}).get("model_type")
+            == "robometer"
+            and self.history_train_mode not in {"rollout_window", "complete_episode"}
+        ):
+            raise ValueError(
+                "reward.history_train_mode must be 'rollout_window' or "
+                f"'complete_episode', got {self.history_train_mode!r}."
+            )
         if self.use_external_reward_model:
             self.reward_weight = self.cfg.reward.get("reward_weight", 1.0)
             self.env_reward_weight = self.cfg.reward.get("env_reward_weight", 0.0)
@@ -289,6 +310,15 @@ class EnvWorker(Worker):
                     for _ in range(self.stage_num)
                 ]
                 self.history_lengths = [{} for _ in range(self.stage_num)]
+                self._episode_chunk_ids = [
+                    torch.zeros(self.train_num_envs_per_stage, dtype=torch.long)
+                    for _ in range(self.stage_num)
+                ]
+                self._episode_chunk_counts = [
+                    torch.zeros(self.train_num_envs_per_stage, dtype=torch.long)
+                    for _ in range(self.stage_num)
+                ]
+                self._window_chunk_refs = [[] for _ in range(self.stage_num)]
                 if self.use_completed_episode_buffer:
                     max_chunks = math.ceil(
                         self.cfg.env.train.max_episode_steps
@@ -304,6 +334,77 @@ class EnvWorker(Worker):
                     ]
 
         self._init_env()
+
+    def _reset_window_chunk_refs(self) -> None:
+        if self.reward_mode != "history_buffer" or not self.enable_train:
+            return
+        self._window_chunk_refs = [[] for _ in range(self.stage_num)]
+
+    def _sync_window_chunk_refs(self, stage_id: int) -> None:
+        refs = self._window_chunk_refs[stage_id]
+        reward_steps = len(self.rollout_results[stage_id].rewards)
+        if len(refs) > reward_steps:
+            del refs[reward_steps:]
+
+    def _record_window_chunk_ref(
+        self, stage_id: int, env_output: EnvOutput, has_rewards: bool
+    ) -> None:
+        if self.reward_mode != "history_buffer":
+            return
+
+        if has_rewards:
+            episode_ids = self._episode_chunk_ids[stage_id].clone()
+            chunk_indices = self._episode_chunk_counts[stage_id].clone()
+            self._window_chunk_refs[stage_id].append(
+                [
+                    WindowChunkRef(
+                        episode_id=int(episode_ids[env_id]),
+                        chunk_index=int(chunk_indices[env_id]),
+                    )
+                    for env_id in range(self.train_num_envs_per_stage)
+                ]
+            )
+            self._episode_chunk_counts[stage_id] = chunk_indices + 1
+            self._sync_window_chunk_refs(stage_id)
+
+        if env_output.dones is None:
+            return
+        done_envs = env_output.dones.any(dim=1).to(dtype=torch.bool)
+        if not bool(done_envs.any()):
+            return
+        self._episode_chunk_ids[stage_id][done_envs] += 1
+        self._episode_chunk_counts[stage_id][done_envs] = 0
+
+    def _window_chunk_slices_for_episode(
+        self, stage_id: int, env_id: int, episode_id: int
+    ) -> list[tuple[int, int]]:
+        self._sync_window_chunk_refs(stage_id)
+        refs = self._window_chunk_refs[stage_id]
+        reward_steps = len(self.rollout_results[stage_id].rewards)
+        slices: list[tuple[int, int]] = []
+        for local_chunk_idx, per_env_refs in enumerate(refs):
+            if local_chunk_idx >= reward_steps:
+                break
+            ref = per_env_refs[env_id]
+            if ref.episode_id != episode_id:
+                continue
+            slices.append((local_chunk_idx, ref.chunk_index))
+        return slices
+
+    @staticmethod
+    def _history_input_emitted_env_ids(history_input: dict[str, Any]) -> set[int]:
+        """Return env ids that emitted at least one history item this query."""
+        emitted_env_ids: set[int] = set()
+        for buffer_data in (history_input or {}).values():
+            if not isinstance(buffer_data, dict):
+                continue
+            for per_env_values in buffer_data.values():
+                if not isinstance(per_env_values, list):
+                    continue
+                for env_id, values in enumerate(per_env_values):
+                    if values:
+                        emitted_env_ids.add(env_id)
+        return emitted_env_ids
 
     def update_env_cfg(self):
         if self.enable_train:
@@ -944,26 +1045,21 @@ class EnvWorker(Worker):
             if stage_id is None:
                 raise ValueError("stage_id is required for history-buffer reward.")
             history_manager = self.train_history_managers[stage_id]
-            # Stash done envs' (history_counts, pickup_counts) BEFORE
-            # build_history_input clears them, so assign_history_reward can map
-            # the down-sampled progress with the correct pickup offset + history
-            # length for the JUST-FINISHED episode (not the new one).
-            if dones is not None and bool(dones.any()):
-                if not hasattr(self, "_last_done_buffer_info"):
-                    self._last_done_buffer_info = {}
-                _stash = {}
-                for _e in dones.nonzero(as_tuple=False).reshape(-1).tolist():
-                    _stash[int(_e)] = (
-                        int(len(history_manager.history_entries[int(_e)])),
-                        int(history_manager.pickup_counts[int(_e)]),
-                        list(history_manager.success_history_entries[int(_e)]),
-                    )
-                self._last_done_buffer_info[stage_id] = _stash
             emit_mask = (
                 dones.to(dtype=torch.bool)
-                if dones is not None
-                else torch.zeros(self.train_num_envs_per_stage, dtype=torch.bool)
+                if self.use_completed_episode_buffer and dones is not None
+                else torch.ones(self.train_num_envs_per_stage, dtype=torch.bool)
             )
+            query_info = {
+                env_id: (
+                    int(self._episode_chunk_ids[stage_id][env_id]),
+                    int(len(history_manager.history_entries[env_id])),
+                    int(history_manager.pickup_counts[env_id]),
+                    list(history_manager.success_history_entries[env_id]),
+                )
+                for env_id in range(self.train_num_envs_per_stage)
+                if bool(emit_mask[env_id])
+            }
             # Capture pickup_counts BEFORE build_history_input clears done envs
             # (delta mode needs the per-env pickup offset to select chunk-boundary
             # frames in RobometerHistoryRewardModel.compute_reward).
@@ -973,6 +1069,13 @@ class EnvWorker(Worker):
             )
             reward_input["history_input"] = history_input
             self.history_lengths[stage_id] = dict(history_lengths)
+            emitted_env_ids = self._history_input_emitted_env_ids(history_input)
+            if not hasattr(self, "_last_history_query_info"):
+                self._last_history_query_info = {}
+            self._last_history_query_info[stage_id] = {
+                env_id: query_info[env_id]
+                for env_id in emitted_env_ids
+            }
             if self.reward_shaping == "delta":
                 reward_input["shaping"] = "delta"
                 reward_input["pickup_counts"] = _delta_pickup_counts
@@ -1005,15 +1108,13 @@ class EnvWorker(Worker):
                     )
                 }
             )
-        # Gate: query robometer ONLY at trajectory done (or last_run flush). The
-        # per-chunk append + build_history_input above MUST keep running every
-        # chunk so the buffer accumulates the whole trajectory + clears at done.
-        # Skipping send+recv on non-done chunks: the reward worker
-        # (_compute_rewards `while True: await recv`) idle-waits -> no deadlock;
-        # assign_history_reward auto-skips (gated on reward_model_output is not
-        # None). Returns None so send+recv stay a matched pair (no orphan recv).
         if self.reward_mode == "history_buffer":
-            if dones is None or not bool(dones.any()):
+            if self.use_completed_episode_buffer:
+                if dones is None or not bool(dones.any()):
+                    return None
+            elif not last_run:
+                return None
+            elif not self._last_history_query_info.get(stage_id):
                 return None
         elif not (last_run or (dones is not None and bool(dones.any()))):
             return None
@@ -1097,17 +1198,20 @@ class EnvWorker(Worker):
                     rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
             return {}
 
-        stash = getattr(self, "_last_done_buffer_info", {}).pop(stage_id, {})
+        stash = getattr(self, "_last_history_query_info", {}).pop(stage_id, {})
         if not stash:
-            raise ValueError(
-                "Received per-frame history reward without a completed env stash."
-            )
+            return {}
         max_frames = int(self.cfg.reward.model.get("max_robometer_frames", 60))
         fail_shift = float(self.cfg.reward.model.get("fail_shift", 1.0))
         chunk_size = int(rollout_rewards[-1].shape[-1])
         delta_mode = self.reward_shaping == "delta"
         assignments: dict[int, RobometerEpisodeReward] = {}
-        for env_id, (history_len, pickup_count, success_trace) in stash.items():
+        for env_id, (
+            episode_id,
+            history_len,
+            pickup_count,
+            success_trace,
+        ) in stash.items():
             insert_steps = history_len - pickup_count
             total_chunks = math.ceil(insert_steps / chunk_size)
             env_progress = reward[env_id].detach().cpu().numpy().astype(np.float32)
@@ -1182,24 +1286,22 @@ class EnvWorker(Worker):
             assignments[env_id] = assignment
 
             if not self.use_completed_episode_buffer:
-                episode_chunks = assignment.chunk_reward.shape[0]
-                if episode_chunks > len(rollout_rewards):
-                    raise ValueError(
-                        "Completed episode crosses the retained rollout boundary; "
-                        "enable the completed episode buffer for terminal history rewards."
-                    )
-                start_chunk = len(rollout_rewards) - episode_chunks
-                for chunk_offset in range(episode_chunks):
-                    target = rollout_rewards[start_chunk + chunk_offset]
+                chunk_refs = self._window_chunk_slices_for_episode(
+                    stage_id, env_id, episode_id
+                )
+                for local_chunk_idx, episode_chunk_idx in chunk_refs:
+                    if episode_chunk_idx >= assignment.chunk_reward.shape[0]:
+                        continue
+                    target = rollout_rewards[local_chunk_idx]
                     target[env_id] = torch.as_tensor(
-                        assignment.chunk_reward[chunk_offset],
+                        assignment.chunk_reward[episode_chunk_idx],
                         dtype=target.dtype,
                         device=target.device,
                     )
-                    self.rollout_results[stage_id].loss_mask[
-                        start_chunk + chunk_offset
-                    ][env_id] = torch.as_tensor(
-                        assignment.chunk_loss_mask[chunk_offset],
+                    self.rollout_results[stage_id].loss_mask[local_chunk_idx][
+                        env_id
+                    ] = torch.as_tensor(
+                        assignment.chunk_loss_mask[episode_chunk_idx],
                         dtype=torch.bool,
                         device=target.device,
                     )
@@ -1412,6 +1514,7 @@ class EnvWorker(Worker):
             )
             for _ in range(self.stage_num)
         ]
+        self._reset_window_chunk_refs()
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
@@ -1481,6 +1584,9 @@ class EnvWorker(Worker):
                         rewards=rewards,
                     )
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                    self._record_window_chunk_ref(
+                        stage_id, env_output, has_rewards=rewards is not None
+                    )
                     if (
                         self.reward_mode == "history_buffer"
                         and self.history_reward_assign
@@ -1575,6 +1681,9 @@ class EnvWorker(Worker):
                     rewards=rewards,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                self._record_window_chunk_ref(
+                    stage_id, env_output, has_rewards=rewards is not None
+                )
                 if (
                     self.reward_mode == "history_buffer"
                     and self.history_reward_assign
@@ -1608,6 +1717,7 @@ class EnvWorker(Worker):
                     )
                     for _ in range(self.stage_num)
                 ]
+                self._reset_window_chunk_refs()
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
@@ -1631,6 +1741,7 @@ class EnvWorker(Worker):
                 )
             # reduce memory peak
             self.rollout_results = []
+            self._reset_window_chunk_refs()
             gc.collect()
 
         for key, value in env_metrics.items():

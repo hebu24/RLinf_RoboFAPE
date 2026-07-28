@@ -155,7 +155,7 @@ Use a dedicated GPU that is not part of the Ray RL cluster:
 
 ```bash
 cd ~/RoboFAC/robometer
-CUDA_VISIBLE_DEVICES=0 uv run python robometer/evals/eval_server.py \
+CUDA_VISIBLE_DEVICES=4 uv run python robometer/evals/eval_server.py \
   model_path=/data/yingxi/robometer/logs/checkpoint-400 \
   server_url=0.0.0.0 \
   server_port=8000 \
@@ -178,7 +178,7 @@ cd /data/yingxi/RLinf_RoboFAPE
 export TMPDIR=/data/yingxi/tmp
 export HF_HOME=/data/yingxi/.cache/huggingface
 export RLINF_ROBOFPE_PATH=/home/yingxi/RoboFAC/mani_envs
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1
 export RL_RAY_PORT=6381
 export RAY_DASHBOARD_AGENT_PORT=52367
 bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh
@@ -211,6 +211,11 @@ Logs and checkpoints (the launcher appends the reward shaping tag — `_<absolut
 - Training log: `logs/<timestamp>-peg_insertion_rl_async_<shaping>/run.log`
 - TensorBoard + metrics: under the same `logs/<timestamp>-peg_insertion_rl_async_<shaping>/`
 - Checkpoints: `logs/<timestamp>-peg_insertion_rl_async_<shaping>/<experiment_name>/checkpoints/global_step_<N>/`
+
+For the peg-insertion Robometer async PPO configs, reward reconstruction still
+keeps the full pick-up+insert history across rollout windows, but actor
+training consumes the current rollout window directly (`reward.history_train_mode:
+rollout_window`). Complete episodes are no longer required as the training unit.
 
 ### 3.3 Ray isolation and shared-host rules
 
@@ -336,7 +341,7 @@ rm -f /tmp/robometer_rdebug.log
 export TMPDIR=/data/yingxi/tmp
 export HF_HOME=/data/yingxi/.cache/huggingface
 export RLINF_ROBOFPE_PATH=/home/yingxi/RoboFAC/mani_envs
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1
 export RL_RAY_PORT=6381
 export RAY_DASHBOARD_AGENT_PORT=52367
 export RLINF_REWARD_DEBUG=1
@@ -423,35 +428,37 @@ logic is wrong.
 
 ### 3.5 Dual concurrent RL runs (absolute vs delta)
 
-Two async-PPO runs with different reward shaping can train at once on the 8-GPU
-box: Run A with `reward.shaping=absolute` on GPUs 0-3 (port `6381`), Run B with
-`reward.shaping=delta` on GPUs 4-7 (port `6382`). They share one Robometer
+Two async-PPO runs with different reward shaping can train at once on the same
+host: Run A with `reward.shaping=absolute` on GPUs 0-1 (port `6381`), Run B with
+`reward.shaping=delta` on GPUs 2-3 (port `6382`). They share one Robometer
 server (`:8000`) and use disjoint GPU sets + distinct Ray ports/dashboard-agent
 ports/temp-dirs, so each run's scoped teardown touches only its own head.
 
 | run | shaping | GPUs | GCS port | dashboard | experiment_name override |
 |---|---|---|---|---|---|
-| A | `absolute` | 0,1,2,3 | `6381` | `52367` | `..._robometer_absolute` |
-| B | `delta` | 4,5,6,7 | `6382` | `52368` | `..._robometer_delta` |
+| A | `absolute` | 0,1 | `6381` | `52367` | `..._robometer_absolute` |
+| B | `delta` | 2,3 | `6382` | `52368` | `..._robometer_delta` |
 
 Launch order: Robometer → wait for `/health` → Run A → Run B (A/B order does not
 matter — ports are distinct). Each `tmux new-session -d` survives SSH disconnect;
 attach with `tmux attach -t rl_absolute` / `rl_delta` (detach: `Ctrl-b d`).
+The launcher auto-selects `maniskill_async_ppo_peg_insertion_pi05_delta` when
+you pass `reward.shaping=delta`, so the delta run uses its own placement config.
 
 ```bash
-# Step 0 — shared Robometer server (GPU 0; overlaps Run A, HBM contention accepted)
+# Step 0 — shared Robometer server (GPU 4; outside both RL clusters)
 tmux new-session -d -s robometer_server \
   "cd /home/yingxi/RoboFAC/robometer && \
-   CUDA_VISIBLE_DEVICES=0 uv run python robometer/evals/eval_server.py \
+   CUDA_VISIBLE_DEVICES=4 uv run python robometer/evals/eval_server.py \
      model_path=/data/yingxi/robometer/logs/checkpoint-400 \
      server_url=0.0.0.0 server_port=8000 num_gpus=1 batch_size=4 \
    2>&1 | tee /data/yingxi/RLinf_RoboFAPE/logs/robometer_server.log"
 until curl -sS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1; do sleep 2; done && echo "Robometer healthy"
 
-# Step 1 — Run A: absolute reward, GPUs 0-3, port 6381
+# Step 1 — Run A: absolute reward, GPUs 0-1, port 6381
 tmux new-session -d -s rl_absolute \
   "cd /data/yingxi/RLinf_RoboFAPE && \
-   CUDA_VISIBLE_DEVICES=0,1,2,3 \
+   CUDA_VISIBLE_DEVICES=0,1 \
    RL_RAY_PORT=6381 RAY_DASHBOARD_AGENT_PORT=52367 \
    RLINF_REWARD_DEBUG_LOG=/tmp/robometer_rdebug_absolute.log \
    bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
@@ -459,10 +466,10 @@ tmux new-session -d -s rl_absolute \
      runner.logger.experiment_name=peg_insertion_async_ppo_pi05_robometer_absolute \
    ; echo ===EXIT=\$?=== ; exec bash"
 
-# Step 2 — Run B: delta reward, GPUs 4-7, port 6382
+# Step 2 — Run B: delta reward, GPUs 2-3, port 6382
 tmux new-session -d -s rl_delta \
   "cd /data/yingxi/RLinf_RoboFAPE && \
-   CUDA_VISIBLE_DEVICES=4,5,6,7 \
+   CUDA_VISIBLE_DEVICES=2,3 \
    RL_RAY_PORT=6382 RAY_DASHBOARD_AGENT_PORT=52368 \
    RLINF_REWARD_DEBUG_LOG=/tmp/robometer_rdebug_delta.log \
    bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
@@ -484,7 +491,7 @@ override makes the dirs self-documenting). Confirm both clusters coexist:
 ```bash
 pgrep -fa gcs_server | grep -oE 'gcs_server_port=[0-9]+' | sort -u   # both 6381 and 6382
 ss -tlnp | grep -E '6381|6382|52367|52368'
-nvidia-smi --query-gpu=index,memory.used --format=csv,noheader         # 0-3 vs 4-7 disjoint
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader         # RL uses 0-1 and 2-3; Robometer uses 4
 ```
 
 Scoped teardown of one run leaves the other alive — replace `P` with the run's

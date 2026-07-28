@@ -37,6 +37,52 @@ from .worker import Worker, WorkerAddress, WorkerClsType
 ClsType = TypeVar("ClsType")
 
 
+def _resolve_worker_visible_accelerators(
+    accelerator_type,
+    visible_accelerators: list[str],
+) -> list[str]:
+    """Translate placement-local accelerator ids back to the driver's physical view.
+
+    Placements are expressed in the current Ray process's local accelerator
+    numbering. If the launcher already narrowed visibility with an outer
+    ``CUDA_VISIBLE_DEVICES`` (for example ``4,5,6,7``), placement ids like
+    ``0,1`` must be translated back to ``4,5`` before exporting worker env vars.
+    Otherwise workers get rebound to host GPUs ``0,1`` and break GPU isolation.
+    """
+    current_visible = AcceleratorUtil.get_visible_devices(accelerator_type)
+    if not current_visible:
+        return visible_accelerators
+
+    parsed_ids: list[int] = []
+    for accel_id in visible_accelerators:
+        try:
+            parsed_ids.append(int(accel_id))
+        except (TypeError, ValueError):
+            return visible_accelerators
+
+    # Placement ids are usually local indices (0..N-1) relative to the driver's
+    # current CUDA_VISIBLE_DEVICES mask. In that case, translate them back to the
+    # physical ids seen by the launcher so worker runtime_envs keep the intended
+    # host-level isolation (e.g. outer mask "2,3" + placement ids "0,1" -> "2,3").
+    if all(0 <= accel_id < len(current_visible) for accel_id in parsed_ids):
+        return [str(current_visible[accel_id]) for accel_id in parsed_ids]
+
+    current_visible_set = {int(device_id) for device_id in current_visible}
+    # Some placements are node-scoped helper workers (e.g. ChannelWorker) that
+    # request "all visible accelerators" from the current Ray job. If the outer
+    # launcher already narrowed visibility, keep those helpers inside that outer
+    # mask instead of re-expanding to the host's full GPU set.
+    if len(parsed_ids) > len(current_visible):
+        return [str(device_id) for device_id in current_visible]
+
+    # If the placement already uses physical ids within the outer mask, preserve
+    # them as-is.
+    if set(parsed_ids).issubset(current_visible_set):
+        return [str(accel_id) for accel_id in parsed_ids]
+
+    return visible_accelerators
+
+
 class WorkerGroup(Generic[WorkerClsType]):
     """The class that enables a worker to become a group of workers that can be executed collectively."""
 
@@ -245,6 +291,9 @@ class WorkerGroup(Generic[WorkerClsType]):
             accelerator_model = self._cluster.get_node_info(
                 placement.cluster_node_rank
             ).accelerator_model
+            resolved_visible_accelerators = _resolve_worker_visible_accelerators(
+                accelerator_type, placement.visible_accelerators
+            )
             env_vars = {
                 "GROUP_NAME": self._worker_group_name,
                 "WORKER_NAME": worker_name,
@@ -261,7 +310,7 @@ class WorkerGroup(Generic[WorkerClsType]):
                 "CATCH_SYSTEM_FAILURE": "1"
                 if self._catch_system_failure
                 else "0",  # Inform the Worker process to catch signals
-                "VISIBLE_DEVICES": ",".join(placement.visible_accelerators),
+                "VISIBLE_DEVICES": ",".join(resolved_visible_accelerators),
                 "ACCELERATOR_TYPE": str(accelerator_type),
                 "ACCELERATOR_MODEL": accelerator_model,
                 "ISOLATE_ACCELERATOR": "1" if placement.isolate_accelerator else "0",
@@ -272,7 +321,7 @@ class WorkerGroup(Generic[WorkerClsType]):
             }
             env_vars.update(
                 AcceleratorUtil.get_accelerator_env_var(
-                    accelerator_type, placement.visible_accelerators
+                    accelerator_type, resolved_visible_accelerators
                 )
             )
 

@@ -16,9 +16,9 @@
 # separate random-init critic head.
 #
 # Launch (see run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh):
-# pick the 3 least-full GPUs for the Ray cluster + 1 dedicated GPU for the
-# robometer server (outside Ray). component_placement below assumes 3 logical
-# GPUs (0-2); CUDA_VISIBLE_DEVICES remaps the chosen physical GPUs to 0,1,2.
+# use 2 RL GPUs per run and keep the Robometer server outside the Ray cluster.
+# component_placement below assumes 2 logical GPUs (0-1);
+# CUDA_VISIBLE_DEVICES remaps the chosen physical GPUs to 0,1.
 
 defaults:
   - env/maniskill_peg_insertion_vertical_rl@env.train
@@ -37,7 +37,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout,reward: 0-3     # 4 logical GPUs (CUDA_VISIBLE_DEVICES remap)
+    actor,env,rollout,reward: 0-1     # 2 logical GPUs (CUDA_VISIBLE_DEVICES remap)
 
 runner:
   task_type: embodied
@@ -61,6 +61,7 @@ algorithm:
   group_size: 1
   reward_coef: 1.0
   staleness_threshold: 1
+  readiness_min_fresh_chunks: 1
   # --- async-PPO completed-episode staleness fix (ASYNC_STALENESS_FIX_PLAN.md) ---
   # chunk_mask: keep the WHOLE completed episode for GAE + Robometer reward
   # reconstruction, only mask stale CHUNKS out of loss/reward aggregation (do
@@ -102,7 +103,7 @@ env:
   enable_offload: False
   train:
     rollout_epoch: 1
-    total_num_envs: 16            # divisible by env_world_size (4 GPUs x stage 1 = 4)
+    total_num_envs: 8             # divisible by env_world_size (2 GPUs x stage 1 = 2)
     auto_reset: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 600
@@ -111,7 +112,7 @@ env:
     temporal_ensemble_weight: 0.01
   eval:
     rollout_epoch: 1
-    total_num_envs: 4
+    total_num_envs: 2
     auto_reset: True
     ignore_terminations: False
     max_episode_steps: 600
@@ -140,7 +141,7 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 8
-  global_batch_size: 960         # 960%(8x4=32)=0 AND flattened 240%(960/4=240)=0 (4 GPU, 16 envs); 6x old 160 for stabler PPO batch
+  global_batch_size: 240         # 240%(8x2=16)=0 and matches the prior 2-GPU regime
   seed: 0
   enable_offload: False
   model:
@@ -165,7 +166,7 @@ actor:
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 100       # warmup value head 100 steps (cold-start, no SFT value) so EV turns positive before actor learns from it; normalize_returns keeps value_loss O(1)
+    critic_warmup_steps: 50        # warmup value head 50 steps before joint actor/critic updates
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"   # shard the ~4B model+optim across the RL GPUs (shared xulab GPUs have limited free mem)
@@ -178,6 +179,7 @@ actor:
 reward:
   use_reward_model: True
   reward_mode: history_buffer
+  history_train_mode: rollout_window  # keep full Robometer history for reward reconstruction, but train on the current rollout window
   history_reward_assign: True
   env_reward_weight: 0.0          # drop ManiSkill reward; robometer progress only
   reward_weight: 1.0

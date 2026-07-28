@@ -14,6 +14,7 @@
 
 import asyncio
 import os
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -49,6 +50,46 @@ def _rdebug_log_path() -> str:
     import os
 
     return os.environ.get("RLINF_REWARD_DEBUG_LOG", "/tmp/robometer_rdebug.log")
+
+
+def _rss_gb() -> float:
+    """Best-effort resident-set size in GiB for profiling logs."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return float(parts[1]) / (1024.0 * 1024.0)
+    except OSError:
+        pass
+    return float("nan")
+
+
+def _reward_input_frame_stats(observations: dict[str, Any]) -> dict[str, float]:
+    """Estimate reward input frame payload size from history_input."""
+    history_input = observations.get("history_input", {}) or {}
+    total_envs = 0
+    total_frames = 0
+    total_bytes = 0
+    max_frames_per_env = 0
+    for buffer in history_input.values():
+        render_images = buffer.get("render_images")
+        if render_images is None:
+            continue
+        total_envs = max(total_envs, len(render_images))
+        for frames in render_images:
+            frame_count = len(frames)
+            total_frames += frame_count
+            max_frames_per_env = max(max_frames_per_env, frame_count)
+            for frame in frames:
+                total_bytes += int(np.asarray(frame).nbytes)
+    return {
+        "envs": float(total_envs),
+        "frames": float(total_frames),
+        "frame_bytes": float(total_bytes),
+        "max_frames_per_env": float(max_frames_per_env),
+    }
 
 
 class RewardWorker(Worker):
@@ -248,6 +289,9 @@ class EmbodiedRewardWorker(Worker):
 
         self.reward_threshold = self.cfg.reward.get("reward_threshold", 0.6)
         self._use_reward_prob = self.cfg.reward.get("use_reward_prob", False)
+        self.debug_memory_profile = bool(
+            self.cfg.reward.get("debug_memory_profile", False)
+        )
 
         self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
 
@@ -391,6 +435,13 @@ class EmbodiedRewardWorker(Worker):
                         _f.write(f"RW _compute_rewards received merged_data type={type(merged_data)} keys={list(merged_data.keys()) if isinstance(merged_data, dict) else None}\n")
                 except Exception:
                     pass
+            profile_start = time.perf_counter()
+            profile_before_rss = _rss_gb() if self.debug_memory_profile else float("nan")
+            profile_input = (
+                _reward_input_frame_stats(merged_data)
+                if self.debug_memory_profile
+                else None
+            )
             rewards = self.compute_image_rewards(observations=merged_data)
             if isinstance(rewards, torch.Tensor):
                 rewards = rewards.contiguous()
@@ -402,6 +453,34 @@ class EmbodiedRewardWorker(Worker):
                 async_op=True,
                 decoupled_mode=self.env_decoupled_mode,
             )
+            if self.debug_memory_profile:
+                profile_after_rss = _rss_gb()
+                reward_shape = (
+                    list(rewards.shape)
+                    if isinstance(rewards, (torch.Tensor, np.ndarray))
+                    else None
+                )
+                reward_bytes = (
+                    float(rewards.numpy().nbytes)
+                    if isinstance(rewards, torch.Tensor)
+                    else float(rewards.nbytes)
+                    if isinstance(rewards, np.ndarray)
+                    else 0.0
+                )
+                self.log_info(
+                    "reward memory profile "
+                    f"rank={self._rank} rss_before_gb={profile_before_rss:.3f} "
+                    f"rss_after_gb={profile_after_rss:.3f} "
+                    f"rss_delta_gb={profile_after_rss - profile_before_rss:.3f} "
+                    f"input_envs={profile_input['envs']:.0f} "
+                    f"input_frames={profile_input['frames']:.0f} "
+                    f"input_frame_bytes={profile_input['frame_bytes']:.0f} "
+                    f"max_frames_per_env={profile_input['max_frames_per_env']:.0f} "
+                    f"reward_shape={reward_shape} reward_bytes={reward_bytes:.0f} "
+                    f"elapsed_s={time.perf_counter() - profile_start:.3f}"
+                )
+            del merged_data
+            del rewards
 
     async def stop(self):
         if self._interact_task is not None and not self._interact_task.done():
