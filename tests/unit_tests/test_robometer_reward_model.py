@@ -132,6 +132,18 @@ def test_failed_episode_diagnostics_use_reconstruction_success_trace():
         metrics["reward/failed_episode_reward_sum"].numpy(), [-1.4]
     )
     np.testing.assert_allclose(
+        metrics["reward/successful_episode_reward_sum"].numpy(), [0.0], atol=1e-6
+    )
+    np.testing.assert_allclose(
+        metrics["reward/success_minus_failure_reward_margin"].numpy(), [1.4]
+    )
+    np.testing.assert_allclose(
+        metrics["reward/robometer_initial_progress"].numpy(), [0.2, 0.2]
+    )
+    np.testing.assert_allclose(
+        metrics["reward/robometer_final_progress"].numpy(), [0.4, 0.8]
+    )
+    np.testing.assert_allclose(
         metrics["reward/failed_episode_positive_violation_rate"].numpy(), [0.0]
     )
     np.testing.assert_allclose(
@@ -326,6 +338,9 @@ def test_delta_reward_boundary_diff_plus_success_bonus():
     # loss_mask True for ALL sub-steps of every insertion chunk (matches absolute).
     np.testing.assert_array_equal(r.chunk_loss_mask, np.ones((4, 10), dtype=bool))
     assert r.episode_success is True
+    assert r.initial_progress == pytest.approx(0.0)
+    assert r.final_progress == pytest.approx(1.0)
+    assert r.success_bonus_sum == pytest.approx(0.3)
 
 
 def test_delta_reward_failure_chunk_has_no_bonus():

@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -157,6 +158,13 @@ MAX_RETRIES = 4
 # history buffer while still spanning the whole pick-up (state-set replay, so
 # no dynamics continuity is needed). Override via the env var below.
 N_PICKUP_FRAMES = int(os.environ.get("RLINF_PICKUP_N_FRAMES", "30"))
+
+# A motion-planner solve normally takes seconds, but third-party solver calls can
+# occasionally hang indefinitely. Bound the parent-side IPC wait so the existing
+# respawn-and-retry path can recover instead of stalling the whole async pipeline.
+PLANNER_REQUEST_TIMEOUT_S = float(
+    os.environ.get("RLINF_PLANNER_REQUEST_TIMEOUT_S", "60")
+)
 
 
 def _subsample_pickup(records, cap: int = N_PICKUP_FRAMES):
@@ -341,6 +349,8 @@ class PegInsertionLiftPlanner:
         # would deadlock the stdout JSON protocol).
         self._stderr_lines: deque[str] = deque(maxlen=200)
         self._stderr_thread: threading.Thread | None = None
+        self._stdout_queue: queue.Queue[str | None] = queue.Queue()
+        self._stdout_thread: threading.Thread | None = None
 
     def _ensure_proc(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
@@ -363,6 +373,21 @@ class PegInsertionLiftPlanner:
             env=env,
         )
         self._req_id = 0
+        stdout_queue: queue.Queue[str | None] = queue.Queue()
+        self._stdout_queue = stdout_queue
+        stdout_io = self._proc.stdout
+
+        def _drain_stdout():
+            try:
+                for line in iter(stdout_io.readline, ""):
+                    stdout_queue.put(line)
+            finally:
+                stdout_queue.put(None)
+
+        self._stdout_thread = threading.Thread(
+            target=_drain_stdout, name="lift-planner-stdout", daemon=True
+        )
+        self._stdout_thread.start()
         # Drain stderr continuously into a bounded buffer so the worker cannot
         # block on a full stderr pipe (which would deadlock stdout reads).
         stderr_io = self._proc.stderr
@@ -393,8 +418,16 @@ class PegInsertionLiftPlanner:
         # stdout pollution the solver/libs print (e.g. "screw plan failed").
         resp = None
         while True:
-            line = proc.stdout.readline()
-            if not line:
+            try:
+                line = self._stdout_queue.get(timeout=PLANNER_REQUEST_TIMEOUT_S)
+            except queue.Empty as exc:
+                err = "".join(self._stderr_lines)
+                raise RuntimeError(
+                    f"PegInsertionLiftPlanner worker timed out after "
+                    f"{PLANNER_REQUEST_TIMEOUT_S:g}s (seed={seed}). "
+                    f"Recent stderr:\n{err}"
+                ) from exc
+            if line is None:
                 err = "".join(self._stderr_lines)
                 raise RuntimeError(
                     f"PegInsertionLiftPlanner worker exited unexpectedly "

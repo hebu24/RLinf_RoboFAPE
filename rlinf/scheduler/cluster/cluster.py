@@ -419,16 +419,32 @@ class Cluster:
             if self._distributed_log_collector is not None:
                 self._distributed_log_collector.stop()
 
-            with without_http_proxies():
-                alive_actors = list_actors(
-                    filters=[
-                        ("STATE", "=", "ALIVE"),
-                        ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
-                    ]
+            alive_actors = []
+            try:
+                with without_http_proxies():
+                    alive_actors = list_actors(
+                        filters=[
+                            ("STATE", "=", "ALIVE"),
+                            ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
+                        ]
+                    )
+            except Exception as exc:
+                logging.warning(
+                    "Failed to query alive actors during cluster shutdown; "
+                    "continuing without explicit ray.kill cleanup. Original "
+                    f"signal={sig}, error={exc}"
                 )
+
             for actor_state in alive_actors:
-                actor = ray.get_actor(actor_state.name)
-                ray.kill(actor, no_restart=True)
+                try:
+                    actor = ray.get_actor(actor_state.name)
+                    ray.kill(actor, no_restart=True)
+                except Exception as exc:
+                    logging.warning(
+                        "Failed to kill actor %s during shutdown cleanup: %s",
+                        getattr(actor_state, "name", "<unknown>"),
+                        exc,
+                    )
 
             if ray.is_initialized():
                 # Mimic ray's sleep before shutdown to ensure log messages are flushed

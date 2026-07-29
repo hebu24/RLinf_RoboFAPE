@@ -16,6 +16,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 from collections import defaultdict
@@ -33,6 +34,37 @@ from rlinf.utils.runner_utils import check_progress
 from rlinf.utils.timers import Timer
 
 logger = logging.getLogger(__name__)
+
+_CHECKPOINT_DIR_RE = re.compile(r"global_step_(\d+)_trainenvstep_\d+")
+
+
+def prune_rolling_checkpoints(
+    checkpoints_dir: str,
+    current_step: int,
+    permanent_interval: int,
+) -> list[str]:
+    """Remove superseded rolling checkpoints after a successful save.
+
+    Checkpoints at multiples of ``permanent_interval`` are retained forever.
+    Among other checkpoints, only ``current_step`` is retained. Directory names
+    that do not match RLinf's checkpoint naming scheme are left untouched.
+    """
+    if permanent_interval <= 0 or not os.path.isdir(checkpoints_dir):
+        return []
+
+    removed = []
+    for entry in os.scandir(checkpoints_dir):
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        match = _CHECKPOINT_DIR_RE.fullmatch(entry.name)
+        if match is None:
+            continue
+        step = int(match.group(1))
+        if step == current_step or step % permanent_interval == 0:
+            continue
+        shutil.rmtree(entry.path)
+        removed.append(entry.path)
+    return removed
 
 if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
@@ -721,6 +753,18 @@ class EmbodiedRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+
+        permanent_interval = int(
+            self.cfg.runner.get("checkpoint_permanent_interval", 0)
+        )
+        checkpoints_dir = os.path.dirname(base_output_dir)
+        removed = prune_rolling_checkpoints(
+            checkpoints_dir=checkpoints_dir,
+            current_step=self.global_step,
+            permanent_interval=permanent_interval,
+        )
+        for checkpoint_path in removed:
+            self.logger.info("Removed superseded checkpoint %s", checkpoint_path)
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

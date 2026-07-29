@@ -1,13 +1,59 @@
 import math
 
+import pytest
 import torch
 
+from rlinf.algorithms.losses import compute_decoupled_ppo_actor_loss
 from rlinf.workers.actor.async_ppo_fsdp_worker import (
     _ADV_LOGPROB_METRIC_REASON_TOO_FEW_SAMPLES,
     _ADV_LOGPROB_METRIC_REASON_ZERO_ADVANTAGE_VARIANCE,
     _ADV_LOGPROB_METRIC_REASON_ZERO_LOGPROB_DELTA_VARIANCE,
     compute_adv_logprob_diagnostics,
+    compute_preupdate_logprob_mismatch_metrics,
 )
+
+
+def test_preupdate_proximal_anchor_is_identity_but_behavior_mismatch_is_visible():
+    behavior = torch.tensor([-0.3, -0.1, -0.2], dtype=torch.float32)
+    proximal = behavior + torch.tensor([0.2, 0.0, -0.2])
+    metrics = compute_preupdate_logprob_mismatch_metrics(
+        proximal_logprobs=proximal,
+        behavior_logprobs=behavior,
+        loss_mask=torch.ones(3, dtype=torch.bool),
+        logprob_type="chunk_level",
+        single_action_dim=7,
+        clip_ratio_low=0.1,
+        clip_ratio_high=0.1,
+    )
+
+    assert metrics["actor/preupdate_behavior_approx_kl"] == pytest.approx(0.0)
+    assert metrics["actor/preupdate_behavior_ratio"] != pytest.approx(1.0)
+    assert metrics["actor/preupdate_behavior_clip_fraction"] == pytest.approx(2 / 3)
+    assert metrics["actor/preupdate_behavior_logprob_delta_abs_max"] == pytest.approx(
+        0.2
+    )
+
+
+def test_frozen_proximal_anchor_gives_unit_ratio_before_parameter_update():
+    proximal = torch.tensor([-0.2, -0.4], dtype=torch.float32)
+    current = proximal.clone()
+    ratio = torch.exp(current - proximal)
+
+    torch.testing.assert_close(ratio, torch.ones_like(ratio))
+
+    _, metrics = compute_decoupled_ppo_actor_loss(
+        logprobs=current,
+        old_logprobs=proximal - 0.2,
+        proximal_logprobs=proximal,
+        advantages=torch.tensor([1.0, -1.0], dtype=torch.float32),
+        clip_ratio_low=0.1,
+        clip_ratio_high=0.1,
+        loss_mask=torch.ones(2, dtype=torch.bool),
+        behave_weight_threshold=2.0,
+    )
+    assert metrics["actor/proximal_ratio"].item() == pytest.approx(1.0)
+    assert metrics["actor/proximal_approx_kl"].item() == pytest.approx(0.0)
+    assert metrics["actor/behav_approx_kl"].item() == pytest.approx(-0.2)
 
 
 def test_adv_logprob_diagnostics_chunk_level_positive_alignment():
@@ -20,11 +66,11 @@ def test_adv_logprob_diagnostics_chunk_level_positive_alignment():
         single_action_dim=2,
     )
 
-    assert metrics["actor/adv_logprob_metric_valid"].item() == 1.0
-    assert metrics["actor/adv_logprob_delta_corr"].item() > 0.99
-    assert metrics["actor/adv_logprob_direction_match_rate"].item() == 1.0
-    assert metrics["actor/mean_logprob_delta_pos_adv"].item() > 0
-    assert metrics["actor/mean_logprob_delta_neg_adv"].item() < 0
+    assert metrics["actor/adv_logprob_metric_valid"] == 1.0
+    assert metrics["actor/adv_logprob_delta_corr"] > 0.99
+    assert metrics["actor/adv_logprob_direction_match_rate"] == 1.0
+    assert metrics["actor/mean_logprob_delta_pos_adv"] > 0
+    assert metrics["actor/mean_logprob_delta_neg_adv"] < 0
 
 
 def test_adv_logprob_diagnostics_chunk_level_negative_alignment():
@@ -37,8 +83,8 @@ def test_adv_logprob_diagnostics_chunk_level_negative_alignment():
         single_action_dim=2,
     )
 
-    assert metrics["actor/adv_logprob_delta_corr"].item() < -0.99
-    assert metrics["actor/adv_logprob_direction_match_rate"].item() == 0.0
+    assert metrics["actor/adv_logprob_delta_corr"] < -0.99
+    assert metrics["actor/adv_logprob_direction_match_rate"] == 0.0
 
 
 def test_adv_logprob_diagnostics_action_level_reduces_per_item():
@@ -53,9 +99,9 @@ def test_adv_logprob_diagnostics_action_level_reduces_per_item():
         single_action_dim=2,
     )
 
-    assert metrics["actor/adv_logprob_metric_valid"].item() == 1.0
-    assert metrics["actor/adv_logprob_direction_match_rate"].item() == 1.0
-    assert metrics["actor/adv_logprob_metric_numel"].item() == 2.0
+    assert metrics["actor/adv_logprob_metric_valid"] == 1.0
+    assert metrics["actor/adv_logprob_direction_match_rate"] == 1.0
+    assert metrics["actor/adv_logprob_metric_numel"] == 2.0
 
 
 def test_adv_logprob_diagnostics_token_level_uses_any_mask_per_item():
@@ -70,9 +116,9 @@ def test_adv_logprob_diagnostics_token_level_uses_any_mask_per_item():
         single_action_dim=2,
     )
 
-    assert metrics["actor/adv_logprob_metric_valid"].item() == 1.0
-    assert metrics["actor/adv_logprob_metric_numel"].item() == 2.0
-    assert metrics["actor/adv_logprob_direction_match_rate"].item() == 1.0
+    assert metrics["actor/adv_logprob_metric_valid"] == 1.0
+    assert metrics["actor/adv_logprob_metric_numel"] == 2.0
+    assert metrics["actor/adv_logprob_direction_match_rate"] == 1.0
 
 
 def test_adv_logprob_diagnostics_too_few_samples_is_invalid():
@@ -85,12 +131,12 @@ def test_adv_logprob_diagnostics_too_few_samples_is_invalid():
         single_action_dim=2,
     )
 
-    assert metrics["actor/adv_logprob_metric_valid"].item() == 0.0
+    assert metrics["actor/adv_logprob_metric_valid"] == 0.0
     assert (
-        metrics["actor/adv_logprob_metric_invalid_reason"].item()
+        metrics["actor/adv_logprob_metric_invalid_reason"]
         == _ADV_LOGPROB_METRIC_REASON_TOO_FEW_SAMPLES
     )
-    assert math.isnan(metrics["actor/adv_logprob_delta_corr"].item())
+    assert math.isnan(metrics["actor/adv_logprob_delta_corr"])
 
 
 def test_adv_logprob_diagnostics_zero_advantage_variance_is_invalid():
@@ -103,9 +149,9 @@ def test_adv_logprob_diagnostics_zero_advantage_variance_is_invalid():
         single_action_dim=2,
     )
 
-    assert metrics["actor/adv_logprob_metric_valid"].item() == 0.0
+    assert metrics["actor/adv_logprob_metric_valid"] == 0.0
     assert (
-        metrics["actor/adv_logprob_metric_invalid_reason"].item()
+        metrics["actor/adv_logprob_metric_invalid_reason"]
         == _ADV_LOGPROB_METRIC_REASON_ZERO_ADVANTAGE_VARIANCE
     )
 
@@ -120,8 +166,8 @@ def test_adv_logprob_diagnostics_zero_delta_variance_is_invalid():
         single_action_dim=2,
     )
 
-    assert metrics["actor/adv_logprob_metric_valid"].item() == 0.0
+    assert metrics["actor/adv_logprob_metric_valid"] == 0.0
     assert (
-        metrics["actor/adv_logprob_metric_invalid_reason"].item()
+        metrics["actor/adv_logprob_metric_invalid_reason"]
         == _ADV_LOGPROB_METRIC_REASON_ZERO_LOGPROB_DELTA_VARIANCE
     )

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import warnings
 from typing import ContextManager, Union
@@ -341,6 +342,17 @@ class FSDPModelManager:
             self.load_optimizer(self.device)
             self.is_optimizer_offloaded = False
 
+        trainer_state_path = os.path.join(load_path, "trainer_state.json")
+        if os.path.isfile(trainer_state_path):
+            with open(trainer_state_path) as trainer_state_file:
+                trainer_state = json.load(trainer_state_file)
+            saved_warmup_steps = int(trainer_state.get("critic_warmup_steps", 0))
+            if self.critic_warmup_steps > 0 and saved_warmup_steps == 0:
+                self._finish_critic_warmup()
+            self.optimizer_steps = int(
+                trainer_state.get("optimizer_steps", self.optimizer_steps)
+            )
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
@@ -370,6 +382,17 @@ class FSDPModelManager:
                 "save_full_model_weights", True
             ),
         )
+        if torch.distributed.get_rank() == 0:
+            trainer_state_path = os.path.join(save_path, "trainer_state.json")
+            with open(trainer_state_path, "w") as trainer_state_file:
+                json.dump(
+                    {
+                        "optimizer_steps": self.optimizer_steps,
+                        "critic_warmup_steps": self.critic_warmup_steps,
+                    },
+                    trainer_state_file,
+                )
+        torch.distributed.barrier()
 
         if restore_weight_offload:
             self.offload_param_and_grad()
@@ -439,20 +462,24 @@ class FSDPModelManager:
         if self.critic_warmup_steps > 0:
             lr_list = [0.0 for _ in self.optimizer.param_groups]
             if self.optimizer_steps >= self.critic_warmup_steps:
-                self.optimizer = self.build_optimizer(model=self.model)
-                # Re-attach lr_scheduler to the new optimizer so its param_groups
-                # get `initial_lr` (LambdaLR sets it on construction). Without
-                # this the scheduler still points at the OLD (dead) optimizer,
-                # future saves miss `initial_lr` -> resume fails (bug#5), and the
-                # LR schedule silently breaks after the warmup boundary.
-                self.lr_scheduler = self.build_lr_scheduler(
-                    optimizer=self.optimizer, optim_config=self._cfg.optim
-                )
-                self.critic_warmup_steps = 0
+                self._finish_critic_warmup()
         else:
             lr_list = [group["lr"] for group in self.optimizer.param_groups]
 
         return grad_norm, lr_list
+
+    def _finish_critic_warmup(self) -> None:
+        """Restore actor parameters and build the joint actor-critic optimizer."""
+        for name, param in self.model.named_parameters():
+            if name in self.store_requires_grad_param_name:
+                param.requires_grad = True
+        self.optimizer = self.build_optimizer(model=self.model)
+        # The scheduler must target the new optimizer and initialize fields such
+        # as `initial_lr` before a checkpoint state can be loaded.
+        self.lr_scheduler = self.build_lr_scheduler(
+            optimizer=self.optimizer, optim_config=self._cfg.optim
+        )
+        self.critic_warmup_steps = 0
 
     def build_lr_scheduler(
         self, optimizer: Optimizer, optim_config: DictConfig

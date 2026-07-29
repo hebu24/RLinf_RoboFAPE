@@ -277,6 +277,9 @@ class RobometerEpisodeReward:
     chunk_reward: np.ndarray
     chunk_loss_mask: np.ndarray
     episode_success: bool = False
+    initial_progress: float = float("nan")
+    final_progress: float = float("nan")
+    success_bonus_sum: float = 0.0
 
 
 def robometer_assignment_metric_values(
@@ -294,20 +297,58 @@ def robometer_assignment_metric_values(
             dtype=torch.float32,
         )
     }
+    successful_assignments = [
+        assignment for assignment in assignment_values if assignment.episode_success
+    ]
     failed_assignments = [
         assignment for assignment in assignment_values if not assignment.episode_success
     ]
+
+    def _episode_sum(assignment: RobometerEpisodeReward) -> float:
+        valid_rewards = np.asarray(assignment.per_step_reward, dtype=np.float32)[
+            np.asarray(assignment.per_step_loss_mask, dtype=bool)
+        ]
+        return float(valid_rewards.sum())
+
+    successful_episode_sums = [
+        _episode_sum(assignment) for assignment in successful_assignments
+    ]
+    failed_episode_sums = [_episode_sum(assignment) for assignment in failed_assignments]
+    if successful_episode_sums:
+        metrics["reward/successful_episode_reward_sum"] = torch.tensor(
+            successful_episode_sums, dtype=torch.float32
+        )
+    if successful_episode_sums and failed_episode_sums:
+        metrics["reward/success_minus_failure_reward_margin"] = torch.tensor(
+            [np.mean(successful_episode_sums) - np.mean(failed_episode_sums)],
+            dtype=torch.float32,
+        )
+
+    metrics["reward/robometer_initial_progress"] = torch.tensor(
+        [assignment.initial_progress for assignment in assignment_values],
+        dtype=torch.float32,
+    )
+    metrics["reward/robometer_final_progress"] = torch.tensor(
+        [assignment.final_progress for assignment in assignment_values],
+        dtype=torch.float32,
+    )
+    metrics["reward/success_bonus_fraction"] = torch.tensor(
+        [
+            assignment.success_bonus_sum
+            / max(abs(_episode_sum(assignment)), positive_tolerance)
+            for assignment in assignment_values
+        ],
+        dtype=torch.float32,
+    )
     if not failed_assignments:
         return metrics
 
-    failed_episode_sums = []
     failed_episode_violations = []
     failed_positive_steps = []
     for assignment in failed_assignments:
         valid_rewards = np.asarray(assignment.per_step_reward, dtype=np.float32)[
             np.asarray(assignment.per_step_loss_mask, dtype=bool)
         ]
-        failed_episode_sums.append(float(valid_rewards.sum()))
         failed_episode_violations.append(
             float(np.any(valid_rewards > positive_tolerance))
         )
@@ -384,6 +425,8 @@ def reconstruct_robometer_episode_reward(
         chunk_reward=chunk_reward,
         chunk_loss_mask=chunk_loss_mask,
         episode_success=bool(insert_success.any()),
+        initial_progress=float(per_step_progress[0]),
+        final_progress=float(per_step_progress[-1]),
     )
 
 
@@ -485,6 +528,17 @@ def reconstruct_robometer_delta_reward(
         chunk_reward=chunk_reward,
         chunk_loss_mask=chunk_loss_mask,
         episode_success=episode_success,
+        initial_progress=float(prog[0]),
+        final_progress=float(prog[-1]),
+        success_bonus_sum=float(
+            sum(
+                float(success_bonus)
+                for i in range(total_chunks)
+                if success[
+                    min(pickup_count + (i + 1) * chunk_size - 1, history_len - 1)
+                ]
+            )
+        ),
     )
 
 

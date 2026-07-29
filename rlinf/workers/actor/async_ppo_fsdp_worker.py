@@ -247,6 +247,59 @@ def compute_adv_logprob_diagnostics(
     return metrics
 
 
+def compute_preupdate_logprob_mismatch_metrics(
+    *,
+    proximal_logprobs: torch.Tensor,
+    behavior_logprobs: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    logprob_type: str,
+    single_action_dim: int,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+) -> dict[str, float]:
+    """Measure rollout-versus-actor logprob mismatch before optimization."""
+    proximal = _reduce_to_item_level(
+        proximal_logprobs.float(), logprob_type, single_action_dim, reduction="sum"
+    )
+    behavior = _reduce_to_item_level(
+        behavior_logprobs.float(), logprob_type, single_action_dim, reduction="sum"
+    )
+    if loss_mask is None:
+        mask = torch.ones_like(proximal, dtype=torch.bool)
+    else:
+        mask = _reduce_to_item_level(
+            loss_mask.bool(), logprob_type, single_action_dim, reduction="any"
+        ).bool()
+    mask &= torch.isfinite(proximal) & torch.isfinite(behavior)
+    if not bool(mask.any()):
+        return {
+            "actor/preupdate_behavior_approx_kl": float("nan"),
+            "actor/preupdate_behavior_ratio": float("nan"),
+            "actor/preupdate_behavior_clip_fraction": float("nan"),
+            "actor/preupdate_behavior_logprob_delta_abs_mean": float("nan"),
+            "actor/preupdate_behavior_logprob_delta_abs_max": float("nan"),
+        }
+
+    delta = proximal[mask] - behavior[mask]
+    ratio = torch.exp(delta)
+    return {
+        "actor/preupdate_behavior_approx_kl": float((-delta.mean()).item()),
+        "actor/preupdate_behavior_ratio": float(ratio.mean().item()),
+        "actor/preupdate_behavior_clip_fraction": float(
+            ((ratio < 1.0 - clip_ratio_low) | (ratio > 1.0 + clip_ratio_high))
+            .float()
+            .mean()
+            .item()
+        ),
+        "actor/preupdate_behavior_logprob_delta_abs_mean": float(
+            delta.abs().mean().item()
+        ),
+        "actor/preupdate_behavior_logprob_delta_abs_max": float(
+            delta.abs().max().item()
+        ),
+    }
+
+
 class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
     """Embodied FSDP actor worker for async PPO / decoupled actor-critic training."""
 
@@ -728,12 +781,22 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             )
             proximal_logprobs_list.append(out["logprobs"].cpu())
 
-        proximal_logprobs = torch.cat(proximal_logprobs_list, dim=0).view(
+        flat_proximal_logprobs = torch.cat(proximal_logprobs_list, dim=0)
+        proximal_logprobs = flat_proximal_logprobs.view(
             t_dim,
             b_dim,
             *self.rollout_batch["prev_logprobs"].shape[2:],
         )
         self.rollout_batch["proximal_logprobs"] = proximal_logprobs
+        self._preupdate_logprob_metrics = compute_preupdate_logprob_mismatch_metrics(
+            proximal_logprobs=flat_proximal_logprobs,
+            behavior_logprobs=flat["prev_logprobs"],
+            loss_mask=flat.get("loss_mask", None),
+            logprob_type=self.cfg.algorithm.logprob_type,
+            single_action_dim=self.cfg.actor.model.get("action_dim", 7),
+            clip_ratio_low=float(self.cfg.algorithm.clip_ratio_low),
+            clip_ratio_high=float(self.cfg.algorithm.clip_ratio_high),
+        )
 
     @torch.inference_mode()
     def compute_post_update_logprobs(self) -> torch.Tensor:
@@ -835,6 +898,8 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         num_global_batches = flattened_rollout_size // per_rank_batch_size
 
         metrics: dict[str, list] = {}
+        for key, value in getattr(self, "_preupdate_logprob_metrics", {}).items():
+            append_to_dict(metrics, {key: value})
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
 
         for _ in range(update_epoch):

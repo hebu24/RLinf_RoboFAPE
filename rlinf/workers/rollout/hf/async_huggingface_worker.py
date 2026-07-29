@@ -24,11 +24,33 @@ from rlinf.scheduler import Channel, Worker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
+def rollout_episode_capacity(
+    *,
+    staleness_threshold: int,
+    version: int,
+    rollout_store_size_per_rank: int,
+    total_num_train_envs: int,
+    rollout_epoch: int,
+) -> int:
+    """Return the episode production limit for an async rollout worker."""
+    if rollout_store_size_per_rank <= 0:
+        raise ValueError("rollout_store_size_per_rank must be positive")
+    return (
+        (staleness_threshold + version + 1)
+        * rollout_store_size_per_rank
+        * total_num_train_envs
+        * rollout_epoch
+    )
+
+
 class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self._generate_task: asyncio.Task = None
         self.staleness_threshold = cfg.algorithm.get("staleness_threshold", None)
+        self.rollout_store_size_per_rank = int(
+            cfg.algorithm.get("rollout_store_size_per_rank", 1)
+        )
         # set the decoupled rollout worker sync weight time
         self.sync_rollout_weight_time = (
             self.num_pipeline_stages * self.n_train_chunk_steps * self.rollout_epoch
@@ -46,6 +68,24 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._weight_sync_apply_total = 0
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
+        self.log_info(
+            "async rollout capacity configured: "
+            f"store_size_per_rank={self.rollout_store_size_per_rank} "
+            f"staleness_threshold={self.staleness_threshold} version={self.version} "
+            f"finished_episodes={self.finished_episodes} "
+            f"capacity={self._episode_capacity()}"
+        )
+
+    def _episode_capacity(self) -> int | None:
+        if self.staleness_threshold is None:
+            return None
+        return rollout_episode_capacity(
+            staleness_threshold=int(self.staleness_threshold),
+            version=int(self.version),
+            rollout_store_size_per_rank=self.rollout_store_size_per_rank,
+            total_num_train_envs=int(self.total_num_train_envs),
+            rollout_epoch=int(self.rollout_epoch),
+        )
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -100,11 +140,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             "finished_episodes should be initialized."
         )
         while True:
-            capacity = (
-                (self.staleness_threshold + self.version + 1)
-                * self.total_num_train_envs
-                * self.rollout_epoch
-            )
+            capacity = self._episode_capacity()
+            assert capacity is not None
             if (
                 self.finished_episodes + self.total_num_train_envs * self.rollout_epoch
                 <= capacity

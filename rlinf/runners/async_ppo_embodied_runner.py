@@ -187,6 +187,9 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                     rollout_metrics_list, "train_env_steps"
                 )
 
+                with self.timer("compute_proximal_logprobs"):
+                    self.actor.compute_proximal_logprobs().wait()
+
                 with self.timer("actor_training"):
                     actor_training_handle = self.actor.run_training()
                     training_metrics = actor_training_handle.wait()
