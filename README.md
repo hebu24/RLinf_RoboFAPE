@@ -527,6 +527,84 @@ sleep 2
   verify `df -h /data` has ≥ ~500 GB free before launching.
 
 
+### 3.6 Evaluate an RL checkpoint
+
+The wrist insert-only eval launcher evaluates an RL actor checkpoint exactly
+the way it evaluates an SFT one: same config
+(`maniskill_async_ppo_peg_insertion_pi05`), same observations (base + single
+wrist, `wrap_obs_mode=simple`, `num_images_in_input=2`), same 10-step action
+chunks (`execute_action_chunks=10`, `action_horizon=10`), same 600-step
+insert-only rollout, same controller (`pd_ee_target_delta_pose`,
+`action_scale=1.0`), and the same base+wrist concatenated video. The only
+differences from the SFT eval (Section 2) are the checkpoint path, the GPU, and
+the Ray port. The eval runs `EmbodiedEvalRunner` (no reward worker), so it does
+not touch the Robometer server.
+
+RL checkpoints land in
+`logs/<timestamp>-peg_insertion_rl_async_<shaping>/<experiment_name>/checkpoints/global_step_<N>_trainenvstep_<M>/actor`
+and contain `model_state_dict/full_weights.pt` + `dcp_checkpoint/` (model
+weights load fine for inference; only the RL optimizer state is incomplete, which
+does not matter for eval). The RL `save_checkpoint` does NOT write
+`norm_stats.json`, so before the first eval of a fresh RL checkpoint, copy the
+norm-stats dir from the SFT checkpoint it was initialized from (they are
+identical fixed input constants, not learned during RL):
+
+```bash
+SFT=logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/checkpoints/global_step_40000/actor
+RL=/data/yingxi/RLinf_RoboFAPE/logs/20260728-22:58:14-peg_insertion_rl_async_delta_smoke/peg_insertion_async_ppo_pi05_robometer_delta_smoke/checkpoints/global_step_100_trainenvstep_47225/actor
+cp -r "$SFT/physical-intelligence" "$RL/"
+```
+
+Then run the eval on one relatively-idle GPU from 0-3 (so the co-located
+training run never OOMs) and an isolated Ray port (the training/eval port
+ranges are in `RAY_ISOLATION.md`):
+
+```bash
+cd /data/yingxi/RLinf_RoboFAPE
+export TMPDIR=/data/yingxi/tmp HF_HOME=/data/yingxi/.cache/huggingface \
+       RAY_TMP_DIR=/data/yingxi/ray_tmp_eval_6500 \
+       RLINF_ROBOFPE_PATH=/home/yingxi/RoboFAC/mani_envs
+VENV_DIR=/data/yingxi/kairan/envs/rlinf \
+CHECKPOINT_PATH=/data/yingxi/RLinf_RoboFAPE/logs/20260728-22:58:14-peg_insertion_rl_async_delta_smoke/peg_insertion_async_ppo_pi05_robometer_delta_smoke/checkpoints/global_step_100_trainenvstep_47225/actor \
+GPU_IDS=0 \
+NUM_EVAL_EPISODES=8 NUM_ENVS=2 \
+EVAL_ACTION_SCALE=1.0 SAVE_VIDEO=true \
+MANAGE_RAY=true EVAL_RAY_PORT=6500 \
+LOG_DIR=logs/20260728-22:58:14-peg_insertion_rl_async_delta_smoke/peg_insertion_async_ppo_pi05_robometer_delta_smoke/checkpoints/global_step_100_trainenvstep_47225/actor/eval \
+bash run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh --save-episode-metrics
+```
+
+Run it in a persistent tmux so it survives SSH disconnect:
+
+```bash
+tmux new-session -d -s rl_eval "cd /data/yingxi/RLinf_RoboFAPE && \
+  TMPDIR=/data/yingxi/tmp HF_HOME=/data/yingxi/.cache/huggingface \
+  RAY_TMP_DIR=/data/yingxi/ray_tmp_eval_6500 RLINF_ROBOFPE_PATH=/home/yingxi/RoboFAC/mani_envs \
+  VENV_DIR=/data/yingxi/kairan/envs/rlinf CHECKPOINT_PATH=<...>/actor \
+  GPU_IDS=0 NUM_EVAL_EPISODES=8 NUM_ENVS=2 EVAL_ACTION_SCALE=1.0 SAVE_VIDEO=true \
+  MANAGE_RAY=true EVAL_RAY_PORT=6500 LOG_DIR=logs/<eval-run> \
+  bash run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh --save-episode-metrics \
+  ; echo ===EXIT=\$?=== ; exec bash"
+```
+
+Outputs (under `LOG_DIR`):
+
+- `evaluation_summary.json` -- aggregate metrics (`success_once`, `reward`,
+  `max_reward`, `return`, `episode_len`, `num_trajectories`).
+- `trajectory_metrics.json` -- per-episode `success_once` (needs
+  `--save-episode-metrics`).
+- `eval.log`.
+- `video/eval/seed_0/<epoch>.mp4` -- base+wrist concatenated video, same format
+  as the SFT eval (Section 2). With `NUM_ENVS=2` each frame tiles 2 envs x
+  (base+wrist) = 896x224; use `NUM_ENVS=1` for single-env 448x224 videos.
+
+Verified on the delta-smoke `global_step_50` checkpoint (delta reward,
+`staleness_filter_mode=chunk_mask`): `success_once=0.125` (1/8), `max_reward`
+`0.885`, `reward=0.699`, `return=419`, `episode_len=600`, `num_trajectories=8`,
+exit 0, both eval processes pinned to the chosen GPU (no spill to the training
+GPUs).
+
+
 ## Troubleshooting
 
 - `failed to find device "cuda:0"`: run on a node with Vulkan render devices, or
