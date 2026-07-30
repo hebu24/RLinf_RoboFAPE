@@ -39,7 +39,6 @@ from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chu
 from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
-
 _ADV_LOGPROB_METRIC_REASON_VALID = 0
 _ADV_LOGPROB_METRIC_REASON_TOO_FEW_SAMPLES = 1
 _ADV_LOGPROB_METRIC_REASON_ZERO_ADVANTAGE_VARIANCE = 2
@@ -245,6 +244,105 @@ def compute_adv_logprob_diagnostics(
     metrics["actor/adv_logprob_delta_cov"] = _scalar(covariance)
     metrics["actor/adv_logprob_metric_valid"] = 1.0
     return metrics
+
+
+def compute_policy_adv_logprob_diagnostics(
+    *,
+    advantages: torch.Tensor,
+    proximal_logprobs: torch.Tensor,
+    post_update_logprobs: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    logprob_type: str,
+    single_action_dim: int,
+) -> dict[str, float]:
+    """Measure advantage alignment against the frozen actor-side policy."""
+    base = compute_adv_logprob_diagnostics(
+        advantages=advantages,
+        prev_logprobs=proximal_logprobs,
+        post_update_logprobs=post_update_logprobs,
+        loss_mask=loss_mask,
+        logprob_type=logprob_type,
+        single_action_dim=single_action_dim,
+    )
+    renamed = {
+        "actor/adv_logprob_delta_corr": "actor/policy_adv_logprob_corr",
+        "actor/adv_logprob_delta_cov": "actor/policy_adv_logprob_cov",
+        "actor/mean_logprob_delta_pos_adv": (
+            "actor/policy_positive_adv_logprob_delta"
+        ),
+        "actor/mean_logprob_delta_neg_adv": (
+            "actor/policy_negative_adv_logprob_delta"
+        ),
+        "actor/adv_logprob_direction_match_rate": (
+            "actor/policy_adv_direction_match_rate"
+        ),
+        "actor/adv_top_quartile_logprob_delta_mean": (
+            "actor/policy_top_quartile_logprob_delta"
+        ),
+        "actor/adv_logprob_metric_valid": "actor/policy_adv_metric_valid",
+        "actor/adv_logprob_metric_numel": "actor/policy_adv_metric_numel",
+        "actor/adv_logprob_metric_invalid_reason": (
+            "actor/policy_adv_metric_invalid_reason"
+        ),
+    }
+    metrics = {renamed[key]: value for key, value in base.items()}
+
+    item_advantages = _reduce_to_item_level(
+        advantages.float(), logprob_type, single_action_dim, reduction="mean"
+    )
+    item_delta = _reduce_to_item_level(
+        post_update_logprobs.float() - proximal_logprobs.float(),
+        logprob_type,
+        single_action_dim,
+        reduction="sum",
+    )
+    if loss_mask is None:
+        item_mask = torch.ones_like(item_advantages, dtype=torch.bool)
+    else:
+        item_mask = _reduce_to_item_level(
+            loss_mask.bool(), logprob_type, single_action_dim, reduction="any"
+        ).bool()
+    valid = item_mask & torch.isfinite(item_advantages) & torch.isfinite(item_delta)
+    metrics["actor/adv_weighted_policy_logprob_delta"] = (
+        float((item_advantages[valid] * item_delta[valid]).mean().item())
+        if bool(valid.any())
+        else float("nan")
+    )
+    return metrics
+
+
+def compute_gradient_conflict_metrics(
+    policy_grad_norm: float,
+    scaled_critic_grad_norm: float,
+    combined_grad_norm: float,
+    *,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    """Derive policy/critic gradient alignment from three global norms."""
+    policy_sq = policy_grad_norm**2
+    critic_sq = scaled_critic_grad_norm**2
+    denominator = 2.0 * policy_grad_norm * scaled_critic_grad_norm
+    valid = denominator > eps and all(
+        math.isfinite(value)
+        for value in (policy_grad_norm, scaled_critic_grad_norm, combined_grad_norm)
+    )
+    cosine = (
+        (combined_grad_norm**2 - policy_sq - critic_sq) / denominator
+        if valid
+        else float("nan")
+    )
+    if valid:
+        cosine = min(1.0, max(-1.0, cosine))
+    return {
+        "actor/grad_diagnostics_valid": float(valid),
+        "actor/policy_grad_norm_sampled": policy_grad_norm,
+        "critic/scaled_grad_norm_sampled": scaled_critic_grad_norm,
+        "actor/combined_grad_norm_sampled": combined_grad_norm,
+        "critic/policy_grad_norm_ratio_sampled": (
+            scaled_critic_grad_norm / max(policy_grad_norm, eps)
+        ),
+        "actor_critic/shared_grad_cosine_sampled": cosine,
+    }
 
 
 def compute_preupdate_logprob_mismatch_metrics(
@@ -850,6 +948,23 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         return torch.cat(post_update_logprobs_list, dim=0)
 
+    def _measure_global_grad_norm(self, loss: torch.Tensor) -> float:
+        """Backward one sampled loss and return its unclipped global grad norm."""
+        self.optimizer.zero_grad()
+        self.grad_scaler.scale(loss).backward(retain_graph=True)
+        scale = float(self.grad_scaler.get_scale())
+        squared_norm = torch.zeros((), device=self.device, dtype=torch.float64)
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                squared_norm += parameter.grad.detach().double().square().sum()
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                squared_norm, op=torch.distributed.ReduceOp.SUM
+            )
+        grad_norm = float(torch.sqrt(squared_norm).item()) / scale
+        self.optimizer.zero_grad()
+        return grad_norm
+
     def run_training(self) -> dict[str, Any]:
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
@@ -908,7 +1023,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 num_global_batches,
             )
 
-            for train_global_batch in global_batch_iter:
+            for global_batch_idx, train_global_batch in enumerate(global_batch_iter):
                 train_global_batch_size = int(
                     train_global_batch["prev_logprobs"].shape[0]
                 )
@@ -1019,6 +1134,11 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         < self.critic_warmup_steps,
                     }
 
+                    loss_components: dict[str, torch.Tensor] = {}
+                    loss_kwargs["value_loss_coef"] = self.cfg.algorithm.get(
+                        "value_loss_coef", 1.0
+                    )
+                    loss_kwargs["loss_components"] = loss_components
                     loss, metrics_data = policy_loss(**loss_kwargs)
 
                     entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
@@ -1037,6 +1157,39 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
 
                     loss = loss / self.gradient_accumulation
+                    grad_diagnostics_interval = int(
+                        self.cfg.actor.get("grad_diagnostics_interval", 0)
+                    )
+                    run_grad_diagnostics = (
+                        grad_diagnostics_interval > 0
+                        and not loss_kwargs["critic_warmup"]
+                        and current_version % grad_diagnostics_interval == 0
+                        and global_batch_idx == 0
+                        and mb_idx == 0
+                    )
+                    if run_grad_diagnostics:
+                        policy_grad_norm = self._measure_global_grad_norm(
+                            loss_components["actor_loss"]
+                            / self.gradient_accumulation
+                        )
+                        raw_critic_grad_norm = self._measure_global_grad_norm(
+                            loss_components["critic_loss"]
+                            / self.gradient_accumulation
+                        )
+                        scaled_critic_grad_norm = self._measure_global_grad_norm(
+                            loss_components["scaled_critic_loss"]
+                            / self.gradient_accumulation
+                        )
+                        combined_grad_norm = self._measure_global_grad_norm(loss)
+                        grad_metrics = compute_gradient_conflict_metrics(
+                            policy_grad_norm,
+                            scaled_critic_grad_norm,
+                            combined_grad_norm,
+                        )
+                        grad_metrics["critic/raw_grad_norm_sampled"] = (
+                            raw_critic_grad_norm
+                        )
+                        append_to_dict(metrics, grad_metrics)
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
 
@@ -1060,9 +1213,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
 
-        post_update_metrics = compute_adv_logprob_diagnostics(
+        post_update_metrics = compute_policy_adv_logprob_diagnostics(
             advantages=self.rollout_batch["advantages"],
-            prev_logprobs=self.rollout_batch["prev_logprobs"],
+            proximal_logprobs=self.rollout_batch["proximal_logprobs"],
             post_update_logprobs=self.compute_post_update_logprobs(),
             loss_mask=self.rollout_batch.get("loss_mask", None),
             logprob_type=self.cfg.algorithm.logprob_type,

@@ -1,9 +1,12 @@
-# Fixed 16-Episode Delta Training
+# 16-Episode Single-Step Delta Training
 
 This command starts a fresh run from the configured SFT checkpoint. It does not
 resume an RL checkpoint. The async rollout capacity now accounts for two stored
 trajectories per actor rank; the planner timeout remains defensive subprocess
 recovery and is not the fix for the previous `candidates=1/2` deadlock.
+The global batch covers all 16 episodes in one optimizer step, uses
+`value_loss_coef=0.1` after a 50-step critic warmup, and emits sampled gradient
+conflict diagnostics every 10 actor versions.
 
 ```bash
 cd /data/yingxi/RLinf_RoboFAPE
@@ -29,7 +32,9 @@ tmux attach -t rl_delta_16ep_lr3e7_fixed
 ```
 
 For the first three actor versions, verify both ranks repeatedly reach
-`candidates=2`, each version performs two optimizer steps, and the pre-update
+`candidates=2`, each version performs one optimizer step, and the pre-update
 proximal KL is approximately zero. During critic warmup `actor/lr` is zero; after
-warmup it must be `3e-7`. Checkpoints are complete every 10 steps, with multiples
+warmup it must be `3e-7`. After actor updates begin, monitor
+`actor/adv_weighted_policy_logprob_delta` and the sampled policy/critic gradient
+norm and cosine metrics. Checkpoints are complete every 10 steps, with multiples
 of 50 retained permanently.
