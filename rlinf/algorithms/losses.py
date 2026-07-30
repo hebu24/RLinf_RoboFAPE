@@ -438,24 +438,15 @@ def compute_decoupled_ppo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dic
     actor_loss, actor_metrics_data = compute_decoupled_ppo_actor_loss(**kwargs)
     critic_loss, critic_metrics_data = compute_ppo_critic_loss(**kwargs)
 
-    critic_warmup = bool(kwargs.get("critic_warmup", False))
-    value_loss_coef = float(kwargs.get("value_loss_coef", 1.0))
-    effective_coef = 1.0 if critic_warmup else value_loss_coef
-    scaled_critic_loss = effective_coef * critic_loss
-    loss = actor_loss + scaled_critic_loss
+    loss = actor_loss + critic_loss
     loss_components = kwargs.get("loss_components")
     if loss_components is not None:
         loss_components.update(
             actor_loss=actor_loss,
             critic_loss=critic_loss,
-            scaled_critic_loss=scaled_critic_loss,
         )
     metrics_data.update(actor_metrics_data)
     metrics_data.update(critic_metrics_data)
-    metrics_data["critic/scaled_value_loss"] = scaled_critic_loss.detach()
-    metrics_data["critic/value_loss_coef"] = torch.tensor(
-        effective_coef, device=critic_loss.device
-    )
     return loss, metrics_data
 
 
@@ -483,24 +474,15 @@ def compute_ppo_actor_critic_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     actor_loss, actor_metrics_data = compute_ppo_actor_loss(**kwargs)
     critic_loss, critic_metrics_data = compute_ppo_critic_loss(**kwargs)
 
-    critic_warmup = bool(kwargs.get("critic_warmup", False))
-    value_loss_coef = float(kwargs.get("value_loss_coef", 1.0))
-    effective_coef = 1.0 if critic_warmup else value_loss_coef
-    scaled_critic_loss = effective_coef * critic_loss
-    loss = actor_loss + scaled_critic_loss
+    loss = actor_loss + critic_loss
     loss_components = kwargs.get("loss_components")
     if loss_components is not None:
         loss_components.update(
             actor_loss=actor_loss,
             critic_loss=critic_loss,
-            scaled_critic_loss=scaled_critic_loss,
         )
     metrics_data.update(actor_metrics_data)
     metrics_data.update(critic_metrics_data)
-    metrics_data["critic/scaled_value_loss"] = scaled_critic_loss.detach()
-    metrics_data["critic/value_loss_coef"] = torch.tensor(
-        effective_coef, device=critic_loss.device
-    )
 
     return loss, metrics_data
 

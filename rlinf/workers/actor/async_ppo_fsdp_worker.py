@@ -23,7 +23,9 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
+from rlinf.algorithms.losses import compute_decoupled_ppo_actor_loss
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
+from rlinf.algorithms.utils import preprocess_loss_inputs
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.priority_store import PriorityStore
@@ -36,7 +38,12 @@ from rlinf.utils.metric_utils import (
     compute_rollout_metrics,
 )
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
-from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
+from rlinf.utils.utils import (
+    clear_memory,
+    masked_mean,
+    masked_mean_ratio,
+    reshape_entropy,
+)
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 _ADV_LOGPROB_METRIC_REASON_VALID = 0
@@ -105,7 +112,11 @@ def _reduce_to_item_level(
     if reduction == "sum":
         return base if base.dim() == 1 else base.sum(dim=tuple(range(1, base.dim())))
     if reduction == "mean":
-        return base if base.dim() == 1 else base.float().mean(dim=tuple(range(1, base.dim())))
+        return (
+            base
+            if base.dim() == 1
+            else base.float().mean(dim=tuple(range(1, base.dim())))
+        )
     if reduction == "any":
         return base if base.dim() == 1 else base.any(dim=tuple(range(1, base.dim())))
     raise ValueError(f"Unsupported reduction={reduction!r}.")
@@ -126,10 +137,12 @@ def compute_adv_logprob_diagnostics(
     post_update_logprobs = post_update_logprobs.to(device=device)
     if loss_mask is not None:
         loss_mask = loss_mask.to(device=device)
+
     def _scalar(value: float | torch.Tensor) -> float:
         if isinstance(value, torch.Tensor):
             return float(value.detach().cpu().item())
         return float(value)
+
     metrics = {
         "actor/adv_logprob_delta_corr": float("nan"),
         "actor/adv_logprob_delta_cov": float("nan"),
@@ -273,12 +286,8 @@ def compute_policy_adv_logprob_diagnostics(
     renamed = {
         "actor/adv_logprob_delta_corr": "actor/policy_adv_logprob_corr",
         "actor/adv_logprob_delta_cov": "actor/policy_adv_logprob_cov",
-        "actor/mean_logprob_delta_pos_adv": (
-            "actor/policy_positive_adv_logprob_delta"
-        ),
-        "actor/mean_logprob_delta_neg_adv": (
-            "actor/policy_negative_adv_logprob_delta"
-        ),
+        "actor/mean_logprob_delta_pos_adv": ("actor/policy_positive_adv_logprob_delta"),
+        "actor/mean_logprob_delta_neg_adv": ("actor/policy_negative_adv_logprob_delta"),
         "actor/adv_logprob_direction_match_rate": (
             "actor/policy_adv_direction_match_rate"
         ),
@@ -319,18 +328,18 @@ def compute_policy_adv_logprob_diagnostics(
 
 def compute_gradient_conflict_metrics(
     policy_grad_norm: float,
-    scaled_critic_grad_norm: float,
+    critic_grad_norm: float,
     combined_grad_norm: float,
     *,
     eps: float = 1e-12,
 ) -> dict[str, float]:
     """Derive policy/critic gradient alignment from three global norms."""
     policy_sq = policy_grad_norm**2
-    critic_sq = scaled_critic_grad_norm**2
-    denominator = 2.0 * policy_grad_norm * scaled_critic_grad_norm
+    critic_sq = critic_grad_norm**2
+    denominator = 2.0 * policy_grad_norm * critic_grad_norm
     valid = denominator > eps and all(
         math.isfinite(value)
-        for value in (policy_grad_norm, scaled_critic_grad_norm, combined_grad_norm)
+        for value in (policy_grad_norm, critic_grad_norm, combined_grad_norm)
     )
     cosine = (
         (combined_grad_norm**2 - policy_sq - critic_sq) / denominator
@@ -342,10 +351,10 @@ def compute_gradient_conflict_metrics(
     return {
         "actor/grad_diagnostics_valid": float(valid),
         "actor/policy_grad_norm_sampled": policy_grad_norm,
-        "critic/scaled_grad_norm_sampled": scaled_critic_grad_norm,
+        "critic/grad_norm_sampled": critic_grad_norm,
         "actor/combined_grad_norm_sampled": combined_grad_norm,
         "critic/policy_grad_norm_ratio_sampled": (
-            scaled_critic_grad_norm / max(policy_grad_norm, eps)
+            critic_grad_norm / max(policy_grad_norm, eps)
         ),
         "actor_critic/shared_grad_cosine_sampled": cosine,
     }
@@ -402,6 +411,232 @@ def compute_preupdate_logprob_mismatch_metrics(
             delta.abs().max().item()
         ),
     }
+
+
+def compute_post_update_proximal_metrics(
+    *,
+    proximal_logprobs: torch.Tensor,
+    post_update_logprobs: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    logprob_type: str,
+    single_action_dim: int,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+) -> dict[str, float]:
+    """Measure the optimizer update against the frozen proximal policy."""
+    device = proximal_logprobs.device
+    post_update_logprobs = post_update_logprobs.to(device=device)
+    if loss_mask is not None:
+        loss_mask = loss_mask.to(device=device)
+    proximal = _reduce_to_item_level(
+        proximal_logprobs.float(), logprob_type, single_action_dim, reduction="sum"
+    )
+    post_update = _reduce_to_item_level(
+        post_update_logprobs.float(), logprob_type, single_action_dim, reduction="sum"
+    )
+    if loss_mask is None:
+        mask = torch.ones_like(proximal, dtype=torch.bool)
+    else:
+        mask = _reduce_to_item_level(
+            loss_mask.bool(), logprob_type, single_action_dim, reduction="any"
+        ).bool()
+    mask &= torch.isfinite(proximal) & torch.isfinite(post_update)
+    names = (
+        "actor/post_update_proximal_approx_kl",
+        "actor/post_update_proximal_ratio",
+        "actor/post_update_proximal_clip_fraction",
+        "actor/post_update_logprob_delta_mean",
+        "actor/post_update_logprob_delta_abs_mean",
+        "actor/post_update_logprob_delta_abs_max",
+    )
+    if not bool(mask.any()):
+        return dict.fromkeys(names, float("nan"))
+
+    delta = post_update[mask] - proximal[mask]
+    ratio = torch.exp(delta)
+    return {
+        "actor/post_update_proximal_approx_kl": float((-delta.mean()).item()),
+        "actor/post_update_proximal_ratio": float(ratio.mean().item()),
+        "actor/post_update_proximal_clip_fraction": float(
+            ((ratio < 1.0 - clip_ratio_low) | (ratio > 1.0 + clip_ratio_high))
+            .float()
+            .mean()
+            .item()
+        ),
+        "actor/post_update_logprob_delta_mean": float(delta.mean().item()),
+        "actor/post_update_logprob_delta_abs_mean": float(delta.abs().mean().item()),
+        "actor/post_update_logprob_delta_abs_max": float(delta.abs().max().item()),
+    }
+
+
+def compute_post_update_ppo_surrogate_metrics(
+    *,
+    advantages: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    proximal_logprobs: torch.Tensor,
+    post_update_logprobs: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    loss_mask_sum: Optional[torch.Tensor],
+    max_episode_steps: Optional[int],
+    logprob_type: str,
+    single_action_dim: int,
+    reward_type: str,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    clip_ratio_c: Optional[float],
+    behave_weight_threshold: Optional[float],
+) -> dict[str, float]:
+    """Measure the realized update using the same decoupled PPO surrogate as training.
+
+    Unlike an unweighted advantage/logprob correlation, the primary improvement
+    metric below uses the behavior importance weights, behavior threshold, PPO
+    clipping, dual clipping, and embodied loss aggregation used by the actor loss.
+    """
+    device = proximal_logprobs.device
+    advantages = advantages.to(device=device, dtype=torch.float32)
+    old_logprobs = old_logprobs.to(device=device, dtype=torch.float32)
+    proximal_logprobs = proximal_logprobs.to(device=device, dtype=torch.float32)
+    post_update_logprobs = post_update_logprobs.to(device=device, dtype=torch.float32)
+    if loss_mask is None:
+        loss_mask = torch.ones_like(proximal_logprobs, dtype=torch.bool)
+    else:
+        loss_mask = loss_mask.to(device=device, dtype=torch.bool)
+    if loss_mask_sum is not None:
+        loss_mask_sum = loss_mask_sum.to(device=device)
+
+    # Match policy_loss(task_type="embodied") exactly: chunk/action/token-level
+    # logprobs and their associated loss tensors have different native shapes.
+    prepared = preprocess_loss_inputs(
+        logprobs=post_update_logprobs,
+        old_logprobs=old_logprobs,
+        proximal_logprobs=proximal_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_mask_sum=loss_mask_sum,
+        logprob_type=logprob_type,
+        single_action_dim=single_action_dim,
+        reward_type=reward_type,
+    )
+    post_update_logprobs = prepared["logprobs"]
+    old_logprobs = prepared["old_logprobs"]
+    proximal_logprobs = prepared["proximal_logprobs"]
+    advantages = prepared["advantages"]
+    loss_mask = prepared["loss_mask"]
+    loss_mask_sum = prepared["loss_mask_sum"]
+
+    loss_kwargs = {
+        "old_logprobs": old_logprobs,
+        "clip_ratio_low": clip_ratio_low,
+        "clip_ratio_high": clip_ratio_high,
+        "advantages": advantages,
+        "proximal_logprobs": proximal_logprobs,
+        "loss_mask": loss_mask,
+        "clip_ratio_c": clip_ratio_c,
+        "max_episode_steps": max_episode_steps,
+        "loss_mask_sum": loss_mask_sum,
+        "behave_weight_threshold": behave_weight_threshold,
+    }
+    with torch.no_grad():
+        pre_loss, _ = compute_decoupled_ppo_actor_loss(
+            logprobs=proximal_logprobs, **loss_kwargs
+        )
+        post_loss, _ = compute_decoupled_ppo_actor_loss(
+            logprobs=post_update_logprobs, **loss_kwargs
+        )
+
+        behavior_weight = torch.exp(proximal_logprobs - old_logprobs)
+        valid = (
+            loss_mask
+            & torch.isfinite(advantages)
+            & torch.isfinite(proximal_logprobs)
+            & torch.isfinite(post_update_logprobs)
+            & torch.isfinite(behavior_weight)
+        )
+        if behave_weight_threshold is not None:
+            valid &= behavior_weight <= behave_weight_threshold
+
+        metrics = {
+            "actor/post_update_ppo_actor_loss": float(post_loss.item()),
+            "actor/pre_update_ppo_actor_loss": float(pre_loss.item()),
+            "actor/post_update_ppo_surrogate_improvement": float(
+                (pre_loss - post_loss).item()
+            ),
+            "actor/post_update_behavior_weight_mean": float("nan"),
+            "actor/post_update_behavior_weight_max": float("nan"),
+            "actor/post_update_behavior_valid_fraction": float(
+                valid.count_nonzero().float().div(loss_mask.count_nonzero() or 1).item()
+            ),
+            "actor/post_update_ppo_improved_fraction": float("nan"),
+            "actor/post_update_ppo_weighted_improved_fraction": float("nan"),
+            "actor/post_update_pg_weighted_logprob_corr": float("nan"),
+            "actor/post_update_first_order_surrogate_gain": float("nan"),
+        }
+        if not bool(valid.any()):
+            return metrics
+
+        valid_weights = behavior_weight[valid]
+        metrics["actor/post_update_behavior_weight_mean"] = float(
+            valid_weights.mean().item()
+        )
+        metrics["actor/post_update_behavior_weight_max"] = float(
+            valid_weights.max().item()
+        )
+
+        def surrogate_contribution(logprobs: torch.Tensor) -> torch.Tensor:
+            ratio = torch.exp(logprobs - proximal_logprobs)
+            clipped_ratio = torch.clamp(
+                ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high
+            )
+            contribution = torch.maximum(-advantages * ratio, -advantages * clipped_ratio)
+            if clip_ratio_c is not None:
+                dual_clipped = torch.sign(advantages) * clip_ratio_c * advantages
+                contribution = torch.minimum(contribution, dual_clipped)
+            return contribution * behavior_weight
+
+        improvement = surrogate_contribution(proximal_logprobs) - surrogate_contribution(
+            post_update_logprobs
+        )
+        improved = improvement[valid] > 0
+        metrics["actor/post_update_ppo_improved_fraction"] = float(
+            improved.float().mean().item()
+        )
+        metrics["actor/post_update_ppo_weighted_improved_fraction"] = float(
+            (valid_weights * improved.float()).sum().div(valid_weights.sum()).item()
+        )
+
+        delta = post_update_logprobs[valid] - proximal_logprobs[valid]
+        valid_advantages = advantages[valid]
+        weighted_advantage_mean = (valid_weights * valid_advantages).sum() / valid_weights.sum()
+        weighted_delta_mean = (valid_weights * delta).sum() / valid_weights.sum()
+        weighted_adv_var = (
+            valid_weights * (valid_advantages - weighted_advantage_mean).square()
+        ).sum() / valid_weights.sum()
+        weighted_delta_var = (
+            valid_weights * (delta - weighted_delta_mean).square()
+        ).sum() / valid_weights.sum()
+        if weighted_adv_var > 0 and weighted_delta_var > 0:
+            covariance = (
+                valid_weights
+                * (valid_advantages - weighted_advantage_mean)
+                * (delta - weighted_delta_mean)
+            ).sum() / valid_weights.sum()
+            metrics["actor/post_update_pg_weighted_logprob_corr"] = float(
+                (covariance / torch.sqrt(weighted_adv_var * weighted_delta_var)).item()
+            )
+
+        first_order_terms = behavior_weight * advantages * (
+            post_update_logprobs - proximal_logprobs
+        )
+        if loss_mask_sum is not None and max_episode_steps is not None:
+            first_order_gain = masked_mean_ratio(
+                first_order_terms, valid, (loss_mask_sum.float() / max_episode_steps)
+            )
+        else:
+            first_order_gain = masked_mean(first_order_terms, valid)
+        metrics["actor/post_update_first_order_surrogate_gain"] = float(
+            first_order_gain.item()
+        )
+        return metrics
 
 
 class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
@@ -583,9 +818,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             if staleness_threshold is not None
             else -(10**9)
         )
-        min_fresh_chunks = int(
-            self.cfg.algorithm.get("readiness_min_fresh_chunks", 1)
-        )
+        min_fresh_chunks = int(self.cfg.algorithm.get("readiness_min_fresh_chunks", 1))
         start = time.time()
         global_retry = 0
         last_status = 0.0
@@ -600,9 +833,11 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             # timed out OR its recv thread crashed -> every rank raises together.
             now = time.time()
             wait_deadline = timeout if received > 0 else initial_timeout
-            local_abort = 1.0 if (
-                (now - start) >= wait_deadline or self._recv_thread_exc is not None
-            ) else 0.0
+            local_abort = (
+                1.0
+                if ((now - start) >= wait_deadline or self._recv_thread_exc is not None)
+                else 0.0
+            )
             abort = torch.tensor([local_abort], device=device)
             torch.distributed.all_reduce(abort, op=torch.distributed.ReduceOp.MAX)
             if abort.item() >= 1.0:
@@ -626,13 +861,13 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 )
 
             # Phase 1: every rank has >= n candidates?
-            has = torch.tensor(
-                [1.0 if len(candidates) >= n else 0.0], device=device
-            )
+            has = torch.tensor([1.0 if len(candidates) >= n else 0.0], device=device)
             torch.distributed.all_reduce(has, op=torch.distributed.ReduceOp.MIN)
             if has.item() < 1.0:
                 if now - last_status >= status_interval:
-                    self._log_wait_status(start, global_retry, candidates, cutoff, "phase1 wait-candidate")
+                    self._log_wait_status(
+                        start, global_retry, candidates, cutoff, "phase1 wait-candidate"
+                    )
                     last_status = now
                 await asyncio.sleep(1)
                 continue
@@ -670,7 +905,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             self.log_info(
                 f"readiness ready rank={self._rank} version={self.version} "
                 f"took={len(batch)} global_retry={global_retry} "
-                f"wait_s={time.time()-start:.1f} "
+                f"wait_s={time.time() - start:.1f} "
                 f"min_fresh_chunks={min_fresh_chunks}"
             )
             return batch
@@ -689,7 +924,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         stats = count_fresh_chunks(candidates, cutoff)
         self.log_info(
             f"readiness {stage} rank={self._rank} version={self.version} "
-            f"wait_s={now-start:.1f} global_retry={global_retry} "
+            f"wait_s={now - start:.1f} global_retry={global_retry} "
             f"recv_alive={alive} candidates={len(candidates)} "
             f"recv_queue={self._recv_queue.qsize() if self._recv_queue else 0} "
             f"store={len(self.rollout_store)} "
@@ -717,7 +952,10 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
     async def construct_rollout_batch(self, max_trajectories: int | None = None):
         # from _recv_queue to rollout_batch
         rollout_batch = await self._wait_for_rollout_store_ready()
-        if self.cfg.algorithm.get("staleness_filter_mode", "trajectory") != "chunk_mask":
+        if (
+            self.cfg.algorithm.get("staleness_filter_mode", "trajectory")
+            != "chunk_mask"
+        ):
             # trajectory mode: the wait is per-rank, so the barrier is the
             # cross-rank sync point before FSDP training. chunk_mask mode's
             # two-phase collective already synchronized all ranks.
@@ -736,7 +974,10 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         self.rollout_batch = convert_trajectories_to_batch(rollout_batch)
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
-        if self.cfg.algorithm.get("staleness_filter_mode", "trajectory") == "chunk_mask":
+        if (
+            self.cfg.algorithm.get("staleness_filter_mode", "trajectory")
+            == "chunk_mask"
+        ):
             staleness_metrics.update(self._compute_staleness_mask())
         if getattr(self, "_staleness_readiness", None):
             staleness_metrics.update(self._staleness_readiness)
@@ -788,7 +1029,10 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         adv_and_ret = calculate_adv_and_returns(**kwargs)
         self.rollout_batch.update(adv_and_ret)
 
-        if self.cfg.algorithm.get("staleness_filter_mode", "trajectory") == "chunk_mask":
+        if (
+            self.cfg.algorithm.get("staleness_filter_mode", "trajectory")
+            == "chunk_mask"
+        ):
             # GAE consumed the effective low-level mask for reward aggregation;
             # expose the chunk-level effective mask to policy/value/entropy loss
             # (preprocess_loss_inputs flattens the mask, so a low-level mask would
@@ -1141,9 +1385,6 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                     }
 
                     loss_components: dict[str, torch.Tensor] = {}
-                    loss_kwargs["value_loss_coef"] = self.cfg.algorithm.get(
-                        "value_loss_coef", 1.0
-                    )
                     loss_kwargs["loss_components"] = loss_components
                     loss, metrics_data = policy_loss(**loss_kwargs)
 
@@ -1174,28 +1415,12 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         and mb_idx == 0
                     )
                     if run_grad_diagnostics:
-                        policy_grad_norm = self._measure_global_grad_norm(
-                            loss_components["actor_loss"]
-                            / self.gradient_accumulation
+                        raise RuntimeError(
+                            "Sampled gradient conflict diagnostics are unsupported "
+                            "with FSDP: repeated backward calls on a retained graph "
+                            "can invalidate flat-parameter storage. Set "
+                            "actor.grad_diagnostics_interval to 0."
                         )
-                        raw_critic_grad_norm = self._measure_global_grad_norm(
-                            loss_components["critic_loss"]
-                            / self.gradient_accumulation
-                        )
-                        scaled_critic_grad_norm = self._measure_global_grad_norm(
-                            loss_components["scaled_critic_loss"]
-                            / self.gradient_accumulation
-                        )
-                        combined_grad_norm = self._measure_global_grad_norm(loss)
-                        grad_metrics = compute_gradient_conflict_metrics(
-                            policy_grad_norm,
-                            scaled_critic_grad_norm,
-                            combined_grad_norm,
-                        )
-                        grad_metrics["critic/raw_grad_norm_sampled"] = (
-                            raw_critic_grad_norm
-                        )
-                        append_to_dict(metrics, grad_metrics)
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
 
@@ -1219,13 +1444,45 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
 
+        post_update_logprobs = self.compute_post_update_logprobs()
         post_update_metrics = compute_policy_adv_logprob_diagnostics(
             advantages=self.rollout_batch["advantages"],
             proximal_logprobs=self.rollout_batch["proximal_logprobs"],
-            post_update_logprobs=self.compute_post_update_logprobs(),
+            post_update_logprobs=post_update_logprobs,
             loss_mask=self.rollout_batch.get("loss_mask", None),
             logprob_type=self.cfg.algorithm.logprob_type,
             single_action_dim=self.cfg.actor.model.get("action_dim", 7),
+        )
+        post_update_metrics.update(
+            compute_post_update_proximal_metrics(
+                proximal_logprobs=self.rollout_batch["proximal_logprobs"],
+                post_update_logprobs=post_update_logprobs,
+                loss_mask=self.rollout_batch.get("loss_mask", None),
+                logprob_type=self.cfg.algorithm.logprob_type,
+                single_action_dim=self.cfg.actor.model.get("action_dim", 7),
+                clip_ratio_low=self.cfg.algorithm.clip_ratio_low,
+                clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
+            )
+        )
+        post_update_metrics.update(
+            compute_post_update_ppo_surrogate_metrics(
+                advantages=self.rollout_batch["advantages"],
+                old_logprobs=self.rollout_batch["prev_logprobs"],
+                proximal_logprobs=self.rollout_batch["proximal_logprobs"],
+                post_update_logprobs=post_update_logprobs,
+                loss_mask=self.rollout_batch.get("loss_mask", None),
+                loss_mask_sum=self.rollout_batch.get("loss_mask_sum", None),
+                max_episode_steps=self.cfg.env.train.max_episode_steps,
+                logprob_type=self.cfg.algorithm.logprob_type,
+                single_action_dim=self.cfg.actor.model.get("action_dim", 7),
+                reward_type=self.cfg.algorithm.reward_type,
+                clip_ratio_low=self.cfg.algorithm.clip_ratio_low,
+                clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
+                clip_ratio_c=self.cfg.algorithm.get("clip_ratio_c", 3.0),
+                behave_weight_threshold=self.cfg.algorithm.get(
+                    "behave_weight_threshold", None
+                ),
+            )
         )
         append_to_dict(metrics, post_update_metrics)
 

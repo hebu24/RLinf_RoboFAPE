@@ -11,8 +11,144 @@ from rlinf.workers.actor.async_ppo_fsdp_worker import (
     compute_adv_logprob_diagnostics,
     compute_gradient_conflict_metrics,
     compute_policy_adv_logprob_diagnostics,
+    compute_post_update_ppo_surrogate_metrics,
+    compute_post_update_proximal_metrics,
     compute_preupdate_logprob_mismatch_metrics,
 )
+
+
+def test_post_update_ppo_surrogate_matches_decoupled_actor_loss():
+    advantages = torch.tensor([1.0, -1.0, 2.0], dtype=torch.float32)
+    behavior = torch.tensor([-0.2, 0.0, -2.0], dtype=torch.float32)
+    proximal = torch.zeros(3, dtype=torch.float32)
+    post = torch.tensor([0.1, -0.1, 0.8], dtype=torch.float32)
+    loss_mask = torch.ones(3, dtype=torch.bool)
+    common = {
+        "old_logprobs": behavior,
+        "proximal_logprobs": proximal,
+        "advantages": advantages,
+        "clip_ratio_low": 0.1,
+        "clip_ratio_high": 0.1,
+        "clip_ratio_c": 3.0,
+        "loss_mask": loss_mask,
+        "loss_mask_sum": torch.full((3,), 2.0),
+        "max_episode_steps": 2,
+        "behave_weight_threshold": 2.0,
+    }
+    expected_pre, _ = compute_decoupled_ppo_actor_loss(
+        logprobs=proximal, **common
+    )
+    expected_post, _ = compute_decoupled_ppo_actor_loss(logprobs=post, **common)
+
+    metrics = compute_post_update_ppo_surrogate_metrics(
+        advantages=advantages,
+        old_logprobs=behavior,
+        proximal_logprobs=proximal,
+        post_update_logprobs=post,
+        loss_mask=loss_mask,
+        loss_mask_sum=torch.full((3,), 2.0),
+        max_episode_steps=2,
+        logprob_type="chunk_level",
+        single_action_dim=1,
+        reward_type="chunk_level",
+        clip_ratio_low=0.1,
+        clip_ratio_high=0.1,
+        clip_ratio_c=3.0,
+        behave_weight_threshold=2.0,
+    )
+
+    assert metrics["actor/pre_update_ppo_actor_loss"] == pytest.approx(
+        expected_pre.item()
+    )
+    assert metrics["actor/post_update_ppo_actor_loss"] == pytest.approx(
+        expected_post.item()
+    )
+    assert metrics["actor/post_update_ppo_surrogate_improvement"] == pytest.approx(
+        (expected_pre - expected_post).item()
+    )
+    # The third element has behavior weight exp(2) and is excluded by threshold.
+    assert metrics["actor/post_update_behavior_valid_fraction"] == pytest.approx(2 / 3)
+    assert metrics["actor/post_update_ppo_improved_fraction"] == pytest.approx(1.0)
+    assert metrics["actor/post_update_first_order_surrogate_gain"] > 0
+
+
+def test_post_update_ppo_surrogate_detects_reverse_update():
+    advantages = torch.tensor([2.0, 1.0, -1.0, -2.0], dtype=torch.float32)
+    proximal = torch.zeros(4, dtype=torch.float32)
+    post = torch.tensor([-0.05, -0.02, 0.02, 0.05], dtype=torch.float32)
+
+    metrics = compute_post_update_ppo_surrogate_metrics(
+        advantages=advantages,
+        old_logprobs=proximal,
+        proximal_logprobs=proximal,
+        post_update_logprobs=post,
+        loss_mask=torch.ones(4, dtype=torch.bool),
+        loss_mask_sum=None,
+        max_episode_steps=None,
+        logprob_type="chunk_level",
+        single_action_dim=1,
+        reward_type="chunk_level",
+        clip_ratio_low=0.1,
+        clip_ratio_high=0.1,
+        clip_ratio_c=3.0,
+        behave_weight_threshold=2.0,
+    )
+
+    assert metrics["actor/post_update_ppo_surrogate_improvement"] < 0
+    assert metrics["actor/post_update_first_order_surrogate_gain"] < 0
+    assert metrics["actor/post_update_pg_weighted_logprob_corr"] < -0.99
+    assert metrics["actor/post_update_ppo_improved_fraction"] == 0.0
+
+
+def test_post_update_ppo_surrogate_empty_effective_mask_is_safe():
+    metrics = compute_post_update_ppo_surrogate_metrics(
+        advantages=torch.tensor([1.0], dtype=torch.float32),
+        old_logprobs=torch.tensor([0.0], dtype=torch.float32),
+        proximal_logprobs=torch.tensor([0.0], dtype=torch.float32),
+        post_update_logprobs=torch.tensor([0.1], dtype=torch.float32),
+        loss_mask=torch.zeros(1, dtype=torch.bool),
+        loss_mask_sum=None,
+        max_episode_steps=None,
+        logprob_type="chunk_level",
+        single_action_dim=1,
+        reward_type="chunk_level",
+        clip_ratio_low=0.1,
+        clip_ratio_high=0.1,
+        clip_ratio_c=3.0,
+        behave_weight_threshold=2.0,
+    )
+
+    assert metrics["actor/pre_update_ppo_actor_loss"] == 0.0
+    assert metrics["actor/post_update_ppo_actor_loss"] == 0.0
+    assert math.isnan(metrics["actor/post_update_ppo_improved_fraction"])
+
+
+def test_post_update_ppo_surrogate_preprocesses_chunk_logprobs_like_training():
+    advantages = torch.tensor([1.0, -1.0], dtype=torch.float32)
+    proximal = torch.zeros((2, 2, 3), dtype=torch.float32)
+    post = proximal.clone()
+    post[0] = 0.02
+    post[1] = -0.02
+
+    metrics = compute_post_update_ppo_surrogate_metrics(
+        advantages=advantages,
+        old_logprobs=proximal,
+        proximal_logprobs=proximal,
+        post_update_logprobs=post,
+        loss_mask=torch.ones(2, dtype=torch.bool),
+        loss_mask_sum=torch.full((2,), 2.0),
+        max_episode_steps=2,
+        logprob_type="chunk_level",
+        single_action_dim=3,
+        reward_type="chunk_level",
+        clip_ratio_low=0.1,
+        clip_ratio_high=0.1,
+        clip_ratio_c=3.0,
+        behave_weight_threshold=2.0,
+    )
+
+    assert metrics["actor/post_update_ppo_surrogate_improvement"] > 0
+    assert metrics["actor/post_update_ppo_improved_fraction"] == 1.0
 
 
 def test_policy_adv_diagnostics_ignore_behavior_backend_mismatch():
@@ -73,6 +209,43 @@ def test_policy_adv_diagnostics_normalize_inputs_to_advantage_device():
 
     assert metrics["actor/policy_adv_direction_match_rate"] == 1.0
     assert metrics["actor/adv_weighted_policy_logprob_delta"] > 0
+
+
+def test_post_update_proximal_metrics_measure_optimizer_step_and_mask():
+    proximal = torch.zeros(4)
+    post = torch.tensor([0.2, -0.2, 100.0, float("nan")])
+    metrics = compute_post_update_proximal_metrics(
+        proximal_logprobs=proximal,
+        post_update_logprobs=post,
+        loss_mask=torch.tensor([True, True, False, True]),
+        logprob_type="chunk_level",
+        single_action_dim=2,
+        clip_ratio_low=0.1,
+        clip_ratio_high=0.1,
+    )
+
+    assert metrics["actor/post_update_proximal_approx_kl"] == pytest.approx(0.0)
+    assert metrics["actor/post_update_proximal_ratio"] == pytest.approx(
+        (math.exp(0.2) + math.exp(-0.2)) / 2
+    )
+    assert metrics["actor/post_update_proximal_clip_fraction"] == 1.0
+    assert metrics["actor/post_update_logprob_delta_mean"] == pytest.approx(0.0)
+    assert metrics["actor/post_update_logprob_delta_abs_mean"] == pytest.approx(0.2)
+    assert metrics["actor/post_update_logprob_delta_abs_max"] == pytest.approx(0.2)
+
+
+def test_post_update_proximal_metrics_empty_mask_is_safe():
+    metrics = compute_post_update_proximal_metrics(
+        proximal_logprobs=torch.zeros(2),
+        post_update_logprobs=torch.ones(2),
+        loss_mask=torch.zeros(2, dtype=torch.bool),
+        logprob_type="chunk_level",
+        single_action_dim=2,
+        clip_ratio_low=0.1,
+        clip_ratio_high=0.1,
+    )
+
+    assert all(math.isnan(value) for value in metrics.values())
 
 
 def test_gradient_conflict_metrics_from_three_norms():
