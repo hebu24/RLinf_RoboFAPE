@@ -256,6 +256,12 @@ def compute_policy_adv_logprob_diagnostics(
     single_action_dim: int,
 ) -> dict[str, float]:
     """Measure advantage alignment against the frozen actor-side policy."""
+    device = advantages.device
+    proximal_logprobs = proximal_logprobs.to(device=device)
+    post_update_logprobs = post_update_logprobs.to(device=device)
+    if loss_mask is not None:
+        loss_mask = loss_mask.to(device=device)
+
     base = compute_adv_logprob_diagnostics(
         advantages=advantages,
         prev_logprobs=proximal_logprobs,

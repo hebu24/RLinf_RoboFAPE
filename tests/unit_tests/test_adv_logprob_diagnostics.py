@@ -60,6 +60,21 @@ def test_policy_adv_diagnostics_report_negative_alignment_and_respect_mask():
     assert metrics["actor/adv_weighted_policy_logprob_delta"] < 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_policy_adv_diagnostics_normalize_inputs_to_advantage_device():
+    metrics = compute_policy_adv_logprob_diagnostics(
+        advantages=torch.tensor([2.0, -2.0]),
+        proximal_logprobs=torch.zeros(2, device="cuda"),
+        post_update_logprobs=torch.tensor([0.2, -0.2], device="cuda"),
+        loss_mask=torch.ones(2, dtype=torch.bool, device="cuda"),
+        logprob_type="chunk_level",
+        single_action_dim=2,
+    )
+
+    assert metrics["actor/policy_adv_direction_match_rate"] == 1.0
+    assert metrics["actor/adv_weighted_policy_logprob_delta"] > 0
+
+
 def test_gradient_conflict_metrics_from_three_norms():
     orthogonal = compute_gradient_conflict_metrics(3.0, 4.0, 5.0)
     aligned = compute_gradient_conflict_metrics(3.0, 4.0, 7.0)
