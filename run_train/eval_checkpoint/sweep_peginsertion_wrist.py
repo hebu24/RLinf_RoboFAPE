@@ -58,6 +58,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--venv-dir", default="/data/yingxi/kairan/envs/rlinf")
     parser.add_argument("--gpu-ids", default="0-3")
     parser.add_argument(
+        "--gpus-per-ckpt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Give EVERY checkpoint the full --gpu-ids set (e.g. 4,5 -> 2 env "
+            "workers, ranks 0+1, env seeds 0+1) so checkpoints run SEQUENTIALLY "
+            "and each reproduces training's multi-env-worker seed topology "
+            "(training used 2 env workers, 4 sub-envs each = 8 seeds). Default "
+            "false: one GPU per parallel checkpoint slot (1 env worker each, "
+            "rank-0 seeds only). Use --num-envs=8 --num-eval-episodes as a "
+            "multiple of 8 with this for exact training-seed coverage."
+        ),
+    )
+    parser.add_argument(
         "--ray-num-cpus",
         type=int,
         default=None,
@@ -543,6 +557,14 @@ def run_checkpoint_sweep(
     args: argparse.Namespace,
 ) -> list[dict[str, Any]]:
     gpu_ids = parse_gpu_ids(args.gpu_ids)
+    # When --gpus-per-ckpt, every checkpoint gets the FULL gpu set (one worker,
+    # checkpoints run sequentially) so a 2-GPU set yields 2 env workers (ranks
+    # 0+1, env seeds 0+1) = training's multi-worker seed topology. Otherwise
+    # (default) one GPU per parallel worker slot (1 env worker each).
+    if args.gpus_per_ckpt:
+        worker_gpu_ids = [",".join(gpu_ids)]
+    else:
+        worker_gpu_ids = gpu_ids
     rows: list[dict[str, Any]] = []
     completed: dict[int, dict[str, Any]] = {}
     rows_lock = threading.Lock()
@@ -590,10 +612,10 @@ def run_checkpoint_sweep(
                 write_rows(rows, output_dir)
                 plot_rows(rows, output_dir)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_gpu_ids)) as executor:
         futures = [
             executor.submit(gpu_worker, worker_slot, gpu_id)
-            for worker_slot, gpu_id in enumerate(gpu_ids)
+            for worker_slot, gpu_id in enumerate(worker_gpu_ids)
         ]
         for future in concurrent.futures.as_completed(futures):
             future.result()

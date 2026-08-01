@@ -704,14 +704,20 @@ Notes:
   different `--seed` values to get variance bars.
 - **Covering the training seeds:** the example uses `--num-envs 8` (24 = 8 × 3,
   a multiple of 8) to mirror the training run's `total_num_envs=8`. Note the
-  topology difference: the eval runs its 8 envs under **1 env worker** (rank 0,
-  env seed 0), so its 8 sub-env seeds are all derived from the rank-0 env seed
-  — this reproduces training's rank-0 half (4 seeds) plus 4 additional
-  seed-0-derived seeds, but **not** training's rank-1 half (training used 2 env
-  workers, ranks 0+1, 4 sub-envs each). For exact coverage of all 8 training
-  seeds, evaluate each checkpoint with **2 GPUs** (`--gpu-ids g0,g1` per
-  checkpoint, giving 2 env workers, ranks 0+1, 4 sub-envs each = training's
-  topology); this needs a 2-GPU-per-checkpoint sweep variant.
+  topology difference: with the default (one GPU per parallel checkpoint slot)
+  the eval runs its 8 envs under **1 env worker** (rank 0, env seed 0), so its
+  8 sub-env seeds are all derived from the rank-0 env seed — this reproduces
+  training's rank-0 half (4 seeds) plus 4 additional seed-0-derived seeds, but
+  **not** training's rank-1 half (training used 2 env workers, ranks 0+1, 4
+  sub-envs each). For **exact** coverage of all 8 training seeds, pass
+  `--gpus-per-ckpt` so every checkpoint uses the full `--gpu-ids` set (e.g.
+  `--gpu-ids 4,5` → 2 env workers, ranks 0+1, env seeds 0+1, 4 sub-envs each =
+  training's exact topology); checkpoints then run **sequentially** (one at a
+  time across both cards). Use `--num-eval-episodes 48` (6 × 8) for 6 repeats of
+  each of the 8 training seeds:
+  ```bash
+  ... --num-eval-episodes 48 --num-envs 8 --gpu-ids 4,5 --gpus-per-ckpt ...
+  ```
 
 Verified on the absolute run
 `logs/20260731-11:18:41-peg_insertion_rl_async_absolute_16ep_single_step` (4
