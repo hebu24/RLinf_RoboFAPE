@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import torch
 
+from rlinf.algorithms.utils import aggregate_embodied_chunk_rewards
 from rlinf.models.embodiment.reward.robometer_reward_model import (
     _apply_stepwise_success_shift,
     _interpolate_insert_progress_from_downsampled_frames,
@@ -11,7 +12,6 @@ from rlinf.models.embodiment.reward.robometer_reward_model import (
     reconstruct_robometer_episode_reward,
     robometer_assignment_metric_values,
 )
-from rlinf.algorithms.utils import aggregate_embodied_chunk_rewards
 
 
 def test_resolve_env_success_prefers_final_info_episode_success_once():
@@ -358,6 +358,43 @@ def test_delta_reward_failure_chunk_has_no_bonus():
     # Only deltas, no bonus.
     np.testing.assert_allclose(r.chunk_reward[:, 0], [0.1, 0.1, 0.1, 0.1], atol=1e-6)
     assert r.episode_success is False
+
+
+def test_delta_reward_failure_terminal_penalty_is_applied_once():
+    success = [False] * 40
+    progress = [0.0, 0.1, 0.2, 0.3, 0.4]
+    r = reconstruct_robometer_delta_reward(
+        progress,
+        history_len=40,
+        pickup_count=0,
+        success_trace=success,
+        chunk_size=10,
+        total_chunks=4,
+        success_bonus=0.1,
+        failure_terminal_penalty=-0.4,
+    )
+
+    np.testing.assert_allclose(r.chunk_reward[:, 0], [0.1, 0.1, 0.1, -0.3], atol=1e-6)
+    assert r.chunk_reward[:, 0].sum() == pytest.approx(0.0)
+
+
+def test_delta_reward_success_does_not_receive_failure_terminal_penalty():
+    success = [False] * 40
+    success[19] = True
+    progress = [0.0, 0.1, 0.2, 0.3, 0.4]
+    r = reconstruct_robometer_delta_reward(
+        progress,
+        history_len=40,
+        pickup_count=0,
+        success_trace=success,
+        chunk_size=10,
+        total_chunks=4,
+        success_bonus=0.1,
+        failure_terminal_penalty=-0.4,
+    )
+
+    np.testing.assert_allclose(r.chunk_reward[:, 0], [0.1, 0.2, 0.1, 0.1], atol=1e-6)
+    assert r.chunk_reward[:, 0].sum() == pytest.approx(0.5)
 
 
 def test_delta_reward_telescope_sum_equals_final_progress():

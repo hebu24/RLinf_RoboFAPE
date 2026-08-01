@@ -168,6 +168,9 @@ class EnvWorker(Worker):
             self.delta_success_bonus = float(
                 self.cfg.reward.get("delta", {}).get("success_bonus", 0.1)
             )
+            self.delta_failure_terminal_penalty = float(
+                self.cfg.reward.get("delta", {}).get("failure_terminal_penalty", 0.0)
+            )
 
         # Env configurations
         self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
@@ -1526,6 +1529,7 @@ class EnvWorker(Worker):
                     chunk_size=chunk_size,
                     total_chunks=total_chunks,
                     success_bonus=self.delta_success_bonus,
+                    failure_terminal_penalty=self.delta_failure_terminal_penalty,
                 )
             else:
                 expected_progress = len(

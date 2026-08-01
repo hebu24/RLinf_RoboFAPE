@@ -439,6 +439,7 @@ def reconstruct_robometer_delta_reward(
     chunk_size: int,
     total_chunks: int,
     success_bonus: float = 0.1,
+    failure_terminal_penalty: float = 0.0,
 ) -> RobometerEpisodeReward:
     """Reconstruct per-chunk delta reward for a completed episode (delta shaping).
 
@@ -446,6 +447,7 @@ def reconstruct_robometer_delta_reward(
     (``n_chunks + 1`` frames). The per-chunk reward is::
 
         chunk_reward[i] = (p[i+1] - p[i]) + success_bonus * 1[success[i]]
+        + failure_terminal_penalty * 1[episode_failure and i == last_chunk]
 
     where ``p`` is the boundary-frame progress and ``success[i]`` is whether chunk
     ``i`` ends in a success step. No interpolation, no per-step success shift -- the
@@ -508,6 +510,10 @@ def reconstruct_robometer_delta_reward(
     episode_success = (
         bool(insert_success.any()) if insert_success.size > 0 else False
     )
+    if not episode_success:
+        # Keep dense progress feedback, but make an incomplete insertion
+        # unambiguously worse than a successful trajectory at episode end.
+        chunk_reward[-1, 0] += float(failure_terminal_penalty)
 
     # per_step_* diagnostics: report per-chunk delta + bonus as the low-level
     # proxy so robometer_assignment_metric_values still has arrays to summarize.

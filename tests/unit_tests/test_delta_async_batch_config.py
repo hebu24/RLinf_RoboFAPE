@@ -45,6 +45,7 @@ def test_delta_async_update_uses_16_completed_episodes_and_one_optimizer_step():
     )
     assert float(cfg.actor.optim.lr) == 3e-7
     assert int(cfg.actor.optim.critic_warmup_steps) == 50
+    assert float(cfg.reward.delta.failure_terminal_penalty) == -0.4
     assert "value_loss_coef" not in cfg.algorithm
     assert bool(cfg.actor.model.openpi.detach_critic_input)
     assert int(cfg.actor.grad_diagnostics_interval) == 0

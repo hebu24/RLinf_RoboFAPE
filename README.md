@@ -551,7 +551,7 @@ identical fixed input constants, not learned during RL):
 
 ```bash
 SFT=logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/checkpoints/global_step_40000/actor
-RL=logs/20260729-00:47:48-peg_insertion_rl_async_delta_lr5e7_smoke/peg_insertion_async_ppo_pi05_robometer_delta_lr5e7_smoke/checkpoints/global_step_100_trainenvstep_47189/actor
+RL=logs/20260730-23:30:28-peg_insertion_rl_async_delta_resume50_postppo_shape/peg_insertion_async_ppo_pi05_robometer/checkpoints/global_step_140_trainenvstep_132205/actor
 cp -r "$SFT/physical-intelligence" "$RL/"
 ```
 
@@ -565,12 +565,12 @@ export TMPDIR=/data/yingxi/tmp HF_HOME=/data/yingxi/.cache/huggingface \
        RAY_TMP_DIR=/data/yingxi/ray_tmp_eval_6500 \
        RLINF_ROBOFPE_PATH=/home/yingxi/RoboFAC/mani_envs
 VENV_DIR=/data/yingxi/kairan/envs/rlinf \
-CHECKPOINT_PATH=logs/20260729-00:47:48-peg_insertion_rl_async_delta_lr5e7_smoke/peg_insertion_async_ppo_pi05_robometer_delta_lr5e7_smoke/checkpoints/global_step_100_trainenvstep_47189/actor \
-GPU_IDS=0 \
+CHECKPOINT_PATH=logs/20260730-23:30:28-peg_insertion_rl_async_delta_resume50_postppo_shape/peg_insertion_async_ppo_pi05_robometer/checkpoints/global_step_140_trainenvstep_132205/actor \
+GPU_IDS=2 \
 NUM_EVAL_EPISODES=8 NUM_ENVS=2 \
 EVAL_ACTION_SCALE=1.0 SAVE_VIDEO=true \
 MANAGE_RAY=true EVAL_RAY_PORT=6500 \
-LOG_DIR=logs/20260729-00:47:48-peg_insertion_rl_async_delta_lr5e7_smoke/peg_insertion_async_ppo_pi05_robometer_delta_lr5e7_smoke/checkpoints/global_step_100_trainenvstep_47189/eval \
+LOG_DIR=logs/20260730-23:30:28-peg_insertion_rl_async_delta_resume50_postppo_shape/peg_insertion_async_ppo_pi05_robometer/checkpoints/global_step_140_trainenvstep_132205/eval \
 bash run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh --save-episode-metrics
 ```
 

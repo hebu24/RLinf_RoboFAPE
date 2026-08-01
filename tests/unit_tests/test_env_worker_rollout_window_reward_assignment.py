@@ -39,6 +39,7 @@ def _build_worker(shaping: str) -> EnvWorker:
     worker.reward_weight = 1.0
     worker.reward_shaping = shaping
     worker.delta_success_bonus = 0.1
+    worker.delta_failure_terminal_penalty = 0.0
     worker.model_cfg = OmegaConf.create({"num_action_chunks": 2})
     worker.use_completed_episode_buffer = False
     worker.reward_mode = "history_buffer"
@@ -158,6 +159,28 @@ def test_assign_history_reward_delta_backfills_only_current_window(monkeypatch):
     torch.testing.assert_close(
         worker.rollout_results[0].rewards[1][0], torch.tensor([2.2, 2.3])
     )
+
+
+def test_assign_history_reward_delta_passes_failure_terminal_penalty(monkeypatch):
+    worker = _build_worker("delta")
+    worker.delta_failure_terminal_penalty = -0.4
+    worker._window_chunk_refs = [[
+        [env_worker_module.WindowChunkRef(episode_id=3, chunk_index=0)],
+    ]]
+    worker.rollout_results[0].append_step_result(
+        ChunkStepResult(rewards=torch.zeros((1, 2), dtype=torch.float32))
+    )
+    worker._last_history_query_info[0][0] = (3, 2, 0, [False, False])
+    captured = {}
+
+    def _reconstruct(*args, **kwargs):
+        captured.update(kwargs)
+        return _assignment([[0.2, 0.3]])
+
+    monkeypatch.setattr(env_worker_module, "reconstruct_robometer_delta_reward", _reconstruct)
+    worker.assign_history_reward(0, torch.ones((1, 2), dtype=torch.float32))
+
+    assert captured["failure_terminal_penalty"] == pytest.approx(-0.4)
 
 
 def test_window_chunk_refs_ignore_steps_without_rewards(monkeypatch):

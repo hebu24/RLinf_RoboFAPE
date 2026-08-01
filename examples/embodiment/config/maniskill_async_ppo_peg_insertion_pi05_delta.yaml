@@ -199,6 +199,7 @@ reward:
   shaping: delta                  # per-chunk progress delta plus an env-success bonus
   delta:
     success_bonus: 1.0            # make true task success dominate Robometer delta noise
+    failure_terminal_penalty: -0.4  # applied once to the final chunk of an unsuccessful episode
   model:
     model_type: robometer
     server_url: "http://127.0.0.1:8000"
