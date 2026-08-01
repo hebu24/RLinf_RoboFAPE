@@ -605,6 +605,124 @@ exit 0, both eval processes pinned to the chosen GPU (no spill to the training
 GPUs).
 
 
+### 3.7 Sweep all RL checkpoints under a run
+
+The same `sweep_peginsertion_wrist.py` driver (§2) sweeps **every** RL
+checkpoint under a run's `checkpoints/` dir. It matches both SFT
+(`global_step_<N>`) and RL (`global_step_<N>_trainenvstep_<M>`) directory
+names, so the only RL-specific steps are:
+
+1. point `--norm-stats-source` at the SFT checkpoint the policy was initialized
+   from — RL checkpoints do not save `norm_stats.json` (the assets are fixed
+   input constants, identical across the run), and the sweep copies the
+   `physical-intelligence/` dir in idempotently before each eval (no-op if
+   already present);
+2. pick GPUs and a Ray port disjoint from the still-training RL cluster and the
+   Robometer server.
+
+The output is identical to the SFT sweep: `wrist_sweep_metrics.{csv,json}` +
+`success_rate_vs_step.png` / `max_reward_vs_step.png` / `wrist_sweep_curves.png`,
+plus a per-checkpoint subdir (`global_step_<N>_trainenvstep_<M>/`) holding
+`evaluation_summary.json`, `trajectory_metrics.json`, `eval.log`, and
+`video/eval/...`. The CSV/JSON rows carry an extra `trainenvstep` and
+`checkpoint_name` column for RL checkpoints; the plot x-axis is the PPO step
+(group 1 of the checkpoint name).
+
+```bash
+cd /data/yingxi/RLinf_RoboFAPE
+export TMPDIR=/data/yingxi/tmp HF_HOME=/data/yingxi/.cache/huggingface \
+       RLINF_ROBOFPE_PATH=/home/yingxi/RoboFAC/mani_envs MPLCONFIGDIR=/tmp/matplotlib
+
+# SFT checkpoint the RL policy was initialized from — its physical-intelligence/
+# assets hold norm_stats.json (fixed input constants; not learned during RL, so
+# the same source serves every RL checkpoint in the run).
+SFT_BASE=logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/checkpoints/global_step_40000/actor
+
+/data/yingxi/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
+  --ray-port 6501 --ray-dashboard-port 8267 \
+  --checkpoint-dir logs/20260731-11:18:41-peg_insertion_rl_async_absolute_16ep_single_step/peg_insertion_async_ppo_pi05_robometer/checkpoints \
+  --norm-stats-source "$SFT_BASE" \
+  --output-dir logs/20260731-11:18:41-peg_insertion_rl_async_absolute_16ep_single_step/peg_insertion_async_ppo_pi05_robometer/rl_eval_sweep \
+  --num-eval-episodes 24 --num-envs 8 \
+  --gpu-ids 1,4,5 --action-scale 1.0 \
+  --save-video --continue-on-error
+```
+
+Run it in a persistent tmux so it survives SSH disconnect (the sweep starts its
+own scoped Ray head on `--ray-port` and tears it down on exit via a scoped
+port-keyed kill — never a bare `ray stop`, so the training cluster and the
+Robometer server are never touched):
+
+```bash
+tmux new-session -d -s rl_eval_sweep "cd /data/yingxi/RLinf_RoboFAPE && \
+  TMPDIR=/data/yingxi/tmp HF_HOME=/data/yingxi/.cache/huggingface \
+  RLINF_ROBOFPE_PATH=/home/yingxi/RoboFAC/mani_envs MPLCONFIGDIR=/tmp/matplotlib \
+  /data/yingxi/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
+    --ray-port 6501 --ray-dashboard-port 8267 \
+    --checkpoint-dir <...>/<run>/peg_insertion_async_ppo_pi05_robometer/checkpoints \
+    --norm-stats-source <...>/<sft_run>/checkpoints/global_step_<N>/actor \
+    --output-dir <...>/<run>/peg_insertion_async_ppo_pi05_robometer/rl_eval_sweep \
+    --num-eval-episodes 24 --num-envs 8 \
+    --gpu-ids 1,4,5 --action-scale 1.0 \
+    --save-video --continue-on-error \
+  ; echo ===EXIT=\$?=== ; exec bash"
+```
+
+Notes:
+
+- **GPUs:** pick GPUs disjoint from the still-training RL cluster (the absolute
+  run trains on 2-3, so the example uses 1,4,5) and from the Robometer server's
+  GPU (0). The eval pins each checkpoint's env+rollout actors to the listed
+  GPUs via `cluster.component_placement` — no spill to the training or
+  Robometer GPUs.
+- **Ray ports:** `--ray-port 6501` is isolated from the RL cluster (6381/6383),
+  the SFT cluster (6379), the wrist-eval port (6380), and the Robometer HTTP
+  server (:8000). Two concurrent RL sweeps need distinct ports + dashboard ports
+  (cf. §2 / `RAY_ISOLATION.md`).
+- **Ray tmp on /data:** the sweep head's `--ray-tmp-dir` defaults to
+  `/data/yingxi/ray_tmp_eval_sweep` (NOT `/tmp`) — xulab's root-backed `/tmp`
+  fills to 100% and Ray's object store + logs would crash it with `Errno 28`.
+- **`--resume`** skips checkpoints that already wrote `trajectory_metrics.json`
+  (re-run the same command after more checkpoints appear to fill in the curve
+  without re-evaluating finished steps); **`--continue-on-error`** records a
+  failed checkpoint (e.g. one superseded/removed by the still-training run's
+  checkpoint rotation mid-sweep) and continues.
+- **Moving checkpoint set:** the still-training RL run saves a new checkpoint
+  every `checkpoint_interval` steps and removes the previous non-permanent one
+  (checkpoints at multiples of `checkpoint_permanent_interval` are kept). The
+  sweep snapshots the set at discovery time; a checkpoint removed mid-eval is
+  caught by `--continue-on-error`. Permanent checkpoints are stable.
+- **Seed / episode semantics:** every checkpoint is evaluated with the same base
+  seed (`--seed 0`, the default) so the comparison across checkpoints is
+  controlled (identical eval conditions). The `--num-envs` parallel envs each get
+  a distinct seed derived from the base seed (`env.seed = cfg.seed +
+  seed_offset`, `seed_offset = rank * stage_num + stage_id`); ManiSkill
+  re-seeds each env to its fixed seed on every reset, so `--num-eval-episodes N`
+  spans `num_envs` seed-derived scenarios × `N/num_envs` stochastic-policy
+  repeats (pi0.5 samples actions), not `N` distinct scenarios. The reported
+  success rate is therefore a single-base-seed point estimate; re-run with
+  different `--seed` values to get variance bars.
+- **Covering the training seeds:** the example uses `--num-envs 8` (24 = 8 × 3,
+  a multiple of 8) to mirror the training run's `total_num_envs=8`. Note the
+  topology difference: the eval runs its 8 envs under **1 env worker** (rank 0,
+  env seed 0), so its 8 sub-env seeds are all derived from the rank-0 env seed
+  — this reproduces training's rank-0 half (4 seeds) plus 4 additional
+  seed-0-derived seeds, but **not** training's rank-1 half (training used 2 env
+  workers, ranks 0+1, 4 sub-envs each). For exact coverage of all 8 training
+  seeds, evaluate each checkpoint with **2 GPUs** (`--gpu-ids g0,g1` per
+  checkpoint, giving 2 env workers, ranks 0+1, 4 sub-envs each = training's
+  topology); this needs a 2-GPU-per-checkpoint sweep variant.
+
+Verified on the absolute run
+`logs/20260731-11:18:41-peg_insertion_rl_async_absolute_16ep_single_step` (4
+checkpoints: steps 50/100/150/180, 24 episodes each = 8 parallel eval envs × 3
+epochs, on GPUs 1,4,5 — disjoint from the still-training absolute cluster on
+2-3 and the Robometer server on 0): exit 0, `success_rate`
+0.167/0.167/0.125/0.167, `max_reward` 1.0 on every step, `mean_max_reward`
+0.882-0.888, eval actors pinned to the chosen GPUs with no spill, norm_stats
+copied in idempotently from the SFT base.
+
+
 ## Troubleshooting
 
 - `failed to find device "cuda:0"`: run on a node with Vulkan render devices, or

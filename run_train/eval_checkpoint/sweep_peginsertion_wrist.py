@@ -28,7 +28,10 @@ import matplotlib.pyplot as plt
 
 
 REPO_PATH = Path(__file__).resolve().parents[2]
-STEP_RE = re.compile(r"global_step_(\d+)$")
+# Matches both SFT checkpoints (global_step_<N>) and RL checkpoints
+# (global_step_<N>_trainenvstep_<M>). Group 1 = PPO/SFT step, group 2 = the
+# optional RL trainenvstep. The `$` anchor keeps us from matching substrings.
+STEP_RE = re.compile(r"global_step_(\d+)(?:_trainenvstep_(\d+))?$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +112,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ray-tmp-dir",
+        default="/data/yingxi/ray_es",
+        help=(
+            "Temp dir for the sweep's Ray head. Must be on /data (NOT /tmp): "
+            "xulab's root-backed /tmp fills to 100% and Ray's object store + "
+            "logs would crash it with Errno 28. Keep the BASE path SHORT: Ray "
+            "appends sweep_<pid>/session_<ts>_<pid>/sockets/plasma_store, and "
+            "the AF_UNIX socket path must stay under 107 bytes (a long base "
+            "like /data/yingxi/ray_tmp_eval_sweep overflows it)."
+        ),
+    )
+    parser.add_argument(
         "--ray-dashboard-port",
         type=int,
         default=8266,
@@ -150,6 +165,19 @@ def parse_args() -> argparse.Namespace:
         help="Extra Hydra override passed through to eval_checkpoint.py.",
     )
     parser.add_argument(
+        "--norm-stats-source",
+        default=None,
+        help=(
+            "Source actor checkpoint dir whose physical-intelligence/ assets "
+            "hold norm_stats.json. Before evaluating each checkpoint, if it "
+            "lacks those assets, copy them from here. RL checkpoints do not save "
+            "norm_stats.json (the assets are fixed input constants, identical to "
+            "the SFT checkpoint the policy was initialized from), so point this "
+            "at that SFT actor dir. Leave unset for an SFT sweep (SFT ckpts "
+            "already contain the assets)."
+        ),
+    )
+    parser.add_argument(
         "--run-script",
         default=str(REPO_PATH / "run_train/eval_checkpoint/run_peginsertion_wrist_insert_only.sh"),
         help=(
@@ -186,7 +214,10 @@ def discover_checkpoints(checkpoint_dir: Path) -> list[tuple[int, Path]]:
         if match:
             return [(int(match.group(1)), checkpoint_dir)]
 
-    checkpoints: dict[tuple[int, str], Path] = {}
+    # Key by (step, trainenvstep, path) so RL checkpoints
+    # (global_step_<N>_trainenvstep_<M>) sort by PPO step first, then
+    # trainenvstep — never out of order relative to one another.
+    checkpoints: dict[tuple[int, int, str], Path] = {}
     for actor_dir in checkpoint_dir.rglob("actor"):
         if not actor_dir.is_dir():
             continue
@@ -194,9 +225,44 @@ def discover_checkpoints(checkpoint_dir: Path) -> list[tuple[int, Path]]:
         if not match:
             continue
         step = int(match.group(1))
-        checkpoints[(step, str(actor_dir.resolve()))] = actor_dir.resolve()
+        trainenvstep = int(match.group(2)) if match.group(2) is not None else 0
+        checkpoints[(step, trainenvstep, str(actor_dir.resolve()))] = actor_dir.resolve()
 
-    return [(step, path) for (step, _), path in sorted(checkpoints.items())]
+    return [(step, path) for (step, _, _), path in sorted(checkpoints.items())]
+
+
+def _checkpoint_name(checkpoint_path: Path) -> str:
+    """The global_step_<N>[_trainenvstep_<M>] directory name holding this actor."""
+    return checkpoint_path.parent.name
+
+
+def _trainenvstep_of(checkpoint_path: Path) -> int | None:
+    match = STEP_RE.match(checkpoint_path.parent.name)
+    if match and match.group(2) is not None:
+        return int(match.group(2))
+    return None
+
+
+def _ensure_norm_stats(checkpoint_path: Path, source_path: Path) -> None:
+    """Copy physical-intelligence/ norm_stats assets into a checkpoint if missing.
+
+    RL checkpoints do not save norm_stats.json (the assets are fixed input
+    constants, identical to the SFT checkpoint the policy was initialized
+    from). The OpenPI loader reads them from
+    ``<checkpoint_path>/<asset_id>/norm_stats.json``, so they must live inside
+    the actor dir. Idempotent: skip if already present.
+    """
+    dest_assets = checkpoint_path / "physical-intelligence"
+    if dest_assets.exists():
+        return
+    src_assets = source_path.expanduser().resolve() / "physical-intelligence"
+    if not src_assets.exists():
+        raise FileNotFoundError(
+            f"--norm-stats-source {source_path} has no physical-intelligence/ "
+            f"assets dir; cannot copy norm_stats into {checkpoint_path}"
+        )
+    print(f"[norm_stats] copying {src_assets} -> {dest_assets}", flush=True)
+    shutil.copytree(src_assets, dest_assets)
 
 
 def _to_float_list(values: Any) -> list[float]:
@@ -225,6 +291,8 @@ def summarize_episode_metrics(
 
     row = {
         "step": step,
+        "trainenvstep": _trainenvstep_of(checkpoint_path),
+        "checkpoint_name": _checkpoint_name(checkpoint_path),
         "checkpoint_path": str(checkpoint_path),
         "num_trajectories": int(metrics.get("num_trajectories", len(success_values))),
         "success_rate": mean(success_values),
@@ -263,6 +331,13 @@ def run_eval_for_checkpoint(
         row["log_dir"] = str(log_dir)
         return row
 
+    # RL checkpoints lack norm_stats.json; copy the fixed input-normalization
+    # assets from the SFT checkpoint the policy was initialized from (they are
+    # identical constants, not learned during RL). Idempotent; no-op for SFT
+    # sweeps that leave --norm-stats-source unset.
+    if args.norm_stats_source:
+        _ensure_norm_stats(checkpoint_path, Path(args.norm_stats_source))
+
     env = os.environ.copy()
     env.update(
         {
@@ -278,7 +353,7 @@ def run_eval_for_checkpoint(
             "EVAL_ACTION_SCALE": str(args.action_scale),
             "SAVE_VIDEO": "true" if args.save_video else "false",
             "MANAGE_RAY": "false",
-            "RAY_TMP_DIR": f"/tmp/ray_eval_wrist_{os.getpid()}_{step}",
+            "RAY_TMP_DIR": f"{args.ray_tmp_dir}_{os.getpid()}_{step}",
         }
     )
     unique_suffix = f"{os.getpid()}_{worker_slot}_{step}"
@@ -420,7 +495,7 @@ def start_shared_ray(args: argparse.Namespace) -> None:
     if not ray_bin.exists():
         raise FileNotFoundError(f"Ray binary does not exist: {ray_bin}")
     ray_port = int(args.ray_port)
-    ray_tmp_dir = Path(f"/tmp/ray_eval_wrist_sweep_{os.getpid()}")
+    ray_tmp_dir = Path(args.ray_tmp_dir) / f"sweep_{os.getpid()}"
     ray_tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # Scoped stale cleanup: only the eval port, never SFT's 6379. Never bare `ray stop`.
@@ -458,7 +533,7 @@ def stop_shared_ray(args: argparse.Namespace) -> None:
     # (that would kill an SFT cluster on 6379).
     _scoped_ray_kill(int(args.ray_port))
     # Clean this sweep's temp dir only.
-    ray_tmp_dir = Path(f"/tmp/ray_eval_wrist_sweep_{os.getpid()}")
+    ray_tmp_dir = Path(args.ray_tmp_dir) / f"sweep_{os.getpid()}"
     shutil.rmtree(ray_tmp_dir, ignore_errors=True)
 
 
@@ -482,7 +557,10 @@ def run_checkpoint_sweep(
                 step, checkpoint_path = task_queue.get_nowait()
             except queue.Empty:
                 return
-            log_dir = output_dir / f"global_step_{step}"
+            # Use the checkpoint's own dir name (global_step_<N> for SFT,
+            # global_step_<N>_trainenvstep_<M> for RL) so RL checkpoints are
+            # unambiguous and never collide; SFT behavior is unchanged.
+            log_dir = output_dir / _checkpoint_name(checkpoint_path)
             log_dir.mkdir(parents=True, exist_ok=True)
             try:
                 row = run_eval_for_checkpoint(
