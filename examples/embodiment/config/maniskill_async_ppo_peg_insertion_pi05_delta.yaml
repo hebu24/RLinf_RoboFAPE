@@ -59,7 +59,9 @@ runner:
 algorithm:
   normalize_advantages: True
   normalize_returns: True     # wire to GAE (advantages.py:83) via async_ppo_fsdp_worker kwargs; returns -> O(1), value_loss O(1), un-dominate clip_grad_norm so actor policy grad isn't starved
-  kl_penalty: kl
+  # Frozen SFT reference policy constraint. low_var_kl is non-negative per
+  # sample, unlike the high-variance sampled k1 estimator.
+  kl_penalty_type: low_var_kl
   group_size: 1
   reward_coef: 1.0
   staleness_threshold: 1
@@ -90,7 +92,7 @@ algorithm:
   adv_type: gae
   loss_type: decoupled_actor_critic
   loss_agg_func: "token-mean"
-  kl_beta: 0.0
+  kl_beta: 0.05
   entropy_bonus: 0.0
   clip_ratio_high: 0.1
   clip_ratio_low: 0.1
@@ -158,16 +160,16 @@ actor:
     model_type: "openpi"
     add_value_head: True          # SFT ckpt had add_value_head=False -> cold-start value head
     num_action_chunks: 10
-    num_steps: 4
+    num_steps: 5                 # match the SFT evaluation sampler
     openpi:
       detach_critic_input: True    # train value head without critic gradients entering the policy backbone
       value_after_vlm: True
       config_name: "pi05_maniskill_peg_insertion_wrist"
       num_images_in_input: 2
-      noise_method: "flow_noise"
+      noise_method: "flow_sde"  # match the SFT evaluation sampler
       action_horizon: 10
-      noise_params: [0.16, 0.12, 200]
-      joint_logprob: True         # True for flow_noise (PPO logprob)
+      noise_params: [0.7, 0.3, 400]  # SFT flow-SDE sampler defaults
+      joint_logprob: False        # flow-SDE uses the single denoise-step logprob
     policy_setup: panda-ee-target-dpose
   optim:
     lr: 3.0e-7                    # conservative PPO update for the pretrained policy

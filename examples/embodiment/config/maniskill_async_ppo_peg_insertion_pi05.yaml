@@ -105,7 +105,7 @@ env:
   enable_offload: False
   train:
     rollout_epoch: 1
-    total_num_envs: 8             # divisible by env_world_size (2 GPUs x stage 1 = 2)
+    total_num_envs: 16            # 8 completed episodes per actor rank, 16 episodes/update
     auto_reset: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 600
@@ -143,7 +143,7 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 8
-  global_batch_size: 240         # 240%(8x2=16)=0 and matches the prior 2-GPU regime
+  global_batch_size: 960         # one optimizer step over all 16 episodes
   seed: 0
   enable_offload: False
   model:
@@ -151,24 +151,25 @@ actor:
     model_type: "openpi"
     add_value_head: True          # SFT ckpt had add_value_head=False -> cold-start value head
     num_action_chunks: 10
-    num_steps: 4
+    num_steps: 5                 # match the SFT evaluation sampler
     openpi:
+      detach_critic_input: True    # isolate policy features from value-loss gradients
       value_after_vlm: True
       config_name: "pi05_maniskill_peg_insertion_wrist"
       num_images_in_input: 2
-      noise_method: "flow_noise"
+      noise_method: "flow_sde"  # match the SFT evaluation sampler
       action_horizon: 10
-      noise_params: [0.16, 0.12, 200]
-      joint_logprob: True         # True for flow_noise (PPO logprob)
+      noise_params: [0.7, 0.3, 400]  # SFT flow-SDE sampler defaults
+      joint_logprob: False        # flow-SDE uses the single denoise-step logprob
     policy_setup: panda-ee-target-dpose
   optim:
-    lr: 3.0e-7                    # conservative PPO update for the pretrained policy
+    lr: 5.0e-7                    # reduce the oversized 1e-6 PPO updates
     value_lr: 5.0e-5              # limit critic gradients in the shared grad clip
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 100       # warmup value head 100 steps before joint actor/critic updates
+    critic_warmup_steps: 30        # preserve the latest 16-episode Absolute regime
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"   # shard the ~4B model+optim across the RL GPUs (shared xulab GPUs have limited free mem)

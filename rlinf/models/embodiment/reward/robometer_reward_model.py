@@ -291,11 +291,15 @@ def robometer_assignment_metric_values(
     if not assignments:
         return {}
     assignment_values = list(assignments.values())
+    episode_success = torch.tensor(
+        [float(assignment.episode_success) for assignment in assignment_values],
+        dtype=torch.float32,
+    )
     metrics = {
-        "reward/robometer_episode_success_rate": torch.tensor(
-            [float(assignment.episode_success) for assignment in assignment_values],
-            dtype=torch.float32,
-        )
+        # This is resolved exclusively from the environment-side sticky success
+        # trace. Keep the legacy name and expose an unambiguous primary metric.
+        "reward/robometer_episode_success_rate": episode_success,
+        "episode_success_rate": episode_success.clone(),
     }
     successful_assignments = [
         assignment for assignment in assignment_values if assignment.episode_success

@@ -129,6 +129,9 @@ def test_failed_episode_diagnostics_use_reconstruction_success_trace():
         metrics["reward/robometer_episode_success_rate"].numpy(), [0.0, 1.0]
     )
     np.testing.assert_allclose(
+        metrics["episode_success_rate"].numpy(), [0.0, 1.0]
+    )
+    np.testing.assert_allclose(
         metrics["reward/failed_episode_reward_sum"].numpy(), [-1.4]
     )
     np.testing.assert_allclose(

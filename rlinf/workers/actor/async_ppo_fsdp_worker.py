@@ -25,7 +25,7 @@ import torch
 
 from rlinf.algorithms.losses import compute_decoupled_ppo_actor_loss
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
-from rlinf.algorithms.utils import preprocess_loss_inputs
+from rlinf.algorithms.utils import kl_penalty, preprocess_loss_inputs
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.priority_store import PriorityStore
@@ -40,9 +40,11 @@ from rlinf.utils.metric_utils import (
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import (
     clear_memory,
+    cpu_weight_swap,
     masked_mean,
     masked_mean_ratio,
     reshape_entropy,
+    retrieve_model_state_dict_in_cpu,
 )
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
@@ -646,6 +648,15 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # EmbodiedFSDPActor does not inherit FSDPActor's reference-policy
+        # initialization. Keep the async PPO reference anchored to the SFT
+        # weights loaded during init_worker(), before the first actor update.
+        self.kl_beta = float(self.cfg.algorithm.get("kl_beta", 0.0))
+        self.kl_penalty_type = self.cfg.algorithm.get(
+            "kl_penalty_type", self.cfg.algorithm.get("kl_penalty", "low_var_kl")
+        )
+        self.ref_policy_state_dict = None
+        self.offload_model_buffer = {}
         self.rollout_store_size = self.cfg.algorithm.get(
             "rollout_store_size_per_rank", 1
         )
@@ -653,6 +664,16 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         # Captured by the receive thread on a fatal error so the readiness
         # collective can sync an all-reduce abort instead of deadlocking.
         self._recv_thread_exc: Exception | None = None
+
+    def init_worker(self) -> None:
+        """Initialize the actor and capture the immutable SFT KL reference."""
+        super().init_worker()
+        if self.kl_beta > 0:
+            if self.is_weight_offloaded:
+                self.load_param_and_grad(self.device, load_grad=False)
+            self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+            if self.enable_offload:
+                self.offload_param_and_grad()
 
     async def recv_rollout_trajectories(self, input_channel):
         # drain channel
@@ -1147,6 +1168,48 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         )
 
     @torch.inference_mode()
+    def compute_reference_logprobs(self) -> None:
+        """Compute frozen-SFT logprobs without retaining a second GPU model."""
+        if self.kl_beta <= 0:
+            return
+        assert self.ref_policy_state_dict is not None, (
+            "Reference KL is enabled but the frozen reference weights are missing."
+        )
+        assert not self.is_weight_offloaded, (
+            "Reference-KL recomputation does not support weight offloading."
+        )
+
+        total = self.rollout_batch["prev_logprobs"].shape[0]
+        micro_batch_size = self.cfg.actor.micro_batch_size
+        num_splits = (total + micro_batch_size - 1) // micro_batch_size
+        iterator = split_dict_to_chunk(self.rollout_batch, num_splits)
+        reference_logprobs_list = []
+
+        self.model.eval()
+        with cpu_weight_swap(
+            self.model, self.ref_policy_state_dict, self.offload_model_buffer
+        ):
+            for micro_batch in iterator:
+                micro_batch = put_tensor_device(micro_batch, self.device)
+                forward_inputs = micro_batch.get("forward_inputs", None)
+                if forward_inputs is None:
+                    raise ValueError(
+                        "Missing forward_inputs in compute_reference_logprobs."
+                    )
+                out = self.model(
+                    forward_inputs=forward_inputs,
+                    compute_logprobs=True,
+                    compute_entropy=False,
+                    compute_values=False,
+                    use_cache=False,
+                )
+                reference_logprobs_list.append(out["logprobs"].cpu())
+
+        self.rollout_batch["reference_logprobs"] = torch.cat(
+            reference_logprobs_list, dim=0
+        )
+
+    @torch.inference_mode()
     def compute_post_update_logprobs(self) -> torch.Tensor:
         """Recompute logprobs under the final post-update actor for diagnostics."""
         assert not self.is_weight_offloaded, (
@@ -1240,6 +1303,10 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 self.rollout_batch.get("loss_mask", None),
             )
 
+        # The batch is shuffled before this call, so reference logprobs share the
+        # exact loss-mask and sample order used by every optimizer microbatch.
+        self.compute_reference_logprobs()
+
         self.model.train()
 
         world_size = int(self._world_size)
@@ -1309,6 +1376,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
                     versions = data.get("versions", None)
                     proximal_logprobs = data.get("proximal_logprobs", None)
+                    reference_logprobs = data.get("reference_logprobs", None)
                     proximal_values = data.get("proximal_values", None)
                     current_version = int(self.version) + 1
 
@@ -1403,6 +1471,51 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
 
+                    reference_kl = torch.tensor(0.0, device=out["logprobs"].device)
+                    reference_kl_penalty = torch.tensor(
+                        0.0, device=out["logprobs"].device
+                    )
+                    if self.kl_beta > 0 and not loss_kwargs["critic_warmup"]:
+                        if reference_logprobs is None:
+                            raise RuntimeError(
+                                "Reference KL is enabled but reference logprobs "
+                                "were not computed."
+                            )
+                        reference_logprobs = reference_logprobs.to(
+                            device=out["logprobs"].device,
+                            dtype=out["logprobs"].dtype,
+                        )
+                        # logprobs and loss_mask can carry different trailing
+                        # action dimensions (e.g. joint flow logprobs versus
+                        # per-action validity). Reduce each to PPO's item
+                        # granularity before masking instead of relying on
+                        # incompatible tensor broadcasting.
+                        reference_kl_items = _reduce_to_item_level(
+                            kl_penalty(
+                                out["logprobs"],
+                                reference_logprobs,
+                                self.kl_penalty_type,
+                            ),
+                            self.cfg.algorithm.logprob_type,
+                            self.cfg.actor.model.get("action_dim", 7),
+                            reduction="mean",
+                        )
+                        reference_mask_items = (
+                            torch.ones_like(reference_kl_items, dtype=torch.bool)
+                            if loss_mask is None
+                            else _reduce_to_item_level(
+                                loss_mask.bool(),
+                                self.cfg.algorithm.logprob_type,
+                                self.cfg.actor.model.get("action_dim", 7),
+                                reduction="any",
+                            ).bool()
+                        )
+                        reference_kl = masked_mean(
+                            reference_kl_items, mask=reference_mask_items
+                        )
+                        reference_kl_penalty = self.kl_beta * reference_kl
+                        loss = loss + reference_kl_penalty
+
                     loss = loss / self.gradient_accumulation
                     grad_diagnostics_interval = int(
                         self.cfg.actor.get("grad_diagnostics_interval", 0)
@@ -1427,6 +1540,13 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                     metrics_data["actor/entropy_loss"] = float(
                         entropy_loss.detach().item()
                     )
+                    metrics_data["actor/reference_kl"] = float(
+                        reference_kl.detach().item()
+                    )
+                    metrics_data["actor/reference_kl_penalty"] = float(
+                        reference_kl_penalty.detach().item()
+                    )
+                    metrics_data["actor/reference_kl_beta"] = float(self.kl_beta)
                     metrics_data["actor/total_loss"] = float(loss.detach().item())
                     append_to_dict(metrics, metrics_data)
 
