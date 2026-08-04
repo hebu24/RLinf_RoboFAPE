@@ -3,6 +3,7 @@ import queue
 from unittest.mock import MagicMock
 
 import pytest
+import numpy as np
 
 from rlinf.envs.maniskill import peg_insertion_lift_planner as planner_module
 from rlinf.envs.maniskill.peg_insertion_lift_planner import (
@@ -45,3 +46,23 @@ def test_plan_lifted_state_times_out_instead_of_blocking(monkeypatch):
 
     with pytest.raises(RuntimeError, match="timed out after 0.01s"):
         planner.plan_lifted_state(seed=11)
+
+
+def test_shared_reset_seed_is_identical_for_all_envs_and_episodes(monkeypatch):
+    planner = PegInsertionLiftPlanner(base_seed=0, shared_reset_seed=True)
+    requested_seeds = []
+
+    def fake_plan(seed):
+        requested_seeds.append(seed)
+        return {
+            "robot_qpos": np.zeros(9, dtype=np.float32),
+            "peg_pose": np.zeros(7, dtype=np.float32),
+            "hole_pose": np.zeros(7, dtype=np.float32),
+            "trajectory": [],
+        }
+
+    monkeypatch.setattr(planner, "plan_lifted_state", fake_plan)
+    planner.plan_lifted_states([0, 3, 7])
+    planner.plan_lifted_states([2])
+
+    assert requested_seeds == [0, 0, 0, 0]

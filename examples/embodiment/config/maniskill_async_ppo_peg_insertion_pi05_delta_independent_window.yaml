@@ -1,6 +1,17 @@
 # Async PPO (decoupled_actor_critic) on the peg-insertion pi0.5 wrist SFT ckpt,
 # with Robometer progress first reconstructed on low-level env steps and then
-# aggregated back into chunk rewards for PPO.
+# aggregated back into chunk rewards for PPO — INDEPENDENT ROLLOUT WINDOW mode.
+#
+# This config mirrors maniskill_async_ppo_peg_insertion_pi05_delta.yaml except
+# env.train.rollout_window_mode=independent (see
+# ASYNC_INDEPENDENT_ROLLOUT_WINDOW_IMPLEMENTATION.md). Each training rollout
+# window is a self-contained unit: at the window boundary every unfinished
+# episode is force-closed as a synthetic *truncation* (never a task termination),
+# Robometer rewards are settled up to the boundary, then all train envs are
+# reset + history cleared so the next window starts from a fresh reset obs.
+# Cross-window resume via last_obs_list is disabled; prefetch_train_bootstrap is
+# disabled in this mode. Requires auto_reset=true, reward.history_train_mode=
+# rollout_window, rollout_epoch=1 (env_worker validates these).
 #
 # Reward: history_buffer mode accumulates the scene's render_camera frames at
 # every low-level env step. At trajectory done, the reward worker
@@ -19,6 +30,8 @@
 # use 2 RL GPUs per run and keep the Robometer server outside the Ray cluster.
 # component_placement below assumes 2 logical GPUs (0-1);
 # CUDA_VISIBLE_DEVICES remaps the chosen physical GPUs to 0,1.
+# Keep the log/experiment dir names containing "independent_window" to avoid
+# confusing these runs with legacy continuous-window experiments.
 
 defaults:
   - env/maniskill_peg_insertion_vertical_rl@env.train
@@ -45,7 +58,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "peg_insertion_async_ppo_pi05_robometer"
+    experiment_name: "peg_insertion_async_ppo_pi05_robometer_independent_window"
     logger_backends: ["tensorboard"]
   max_epochs: 1000
   max_steps: -1
@@ -112,6 +125,7 @@ env:
     rollout_epoch: 1
     total_num_envs: 8             # divisible by env_world_size (2 GPUs x stage 1 = 2)
     auto_reset: True
+    rollout_window_mode: independent  # force-close unfinished episodes + reset all envs/clear history at each window boundary
     use_fixed_reset_state_ids: True
     shared_reset_seed: True       # reproduce one SFT reset across every env/reset
     max_episode_steps: 600
@@ -195,7 +209,7 @@ reward:
   debug_chunk_funnel: false
   fail_fast_on_unexpected_chunk_filter: false
   reward_mode: history_buffer
-  history_train_mode: rollout_window  # keep full Robometer history for reward reconstruction, but train on the current rollout window
+  history_train_mode: rollout_window  # keep full Robometer history for reward reconstruction, but train on the current rollout window; MUST NOT be complete_episode in independent mode
   history_reward_assign: True
   env_reward_weight: 0.0          # drop ManiSkill reward; robometer progress only
   reward_weight: 1.0
@@ -203,7 +217,7 @@ reward:
   shaping: delta                  # per-chunk progress delta plus an env-success bonus
   delta:
     success_bonus: 1.0            # make true task success dominate Robometer delta noise
-    failure_terminal_penalty: -0.4  # applied once to the final chunk of an unsuccessful episode
+    failure_terminal_penalty: -0.4  # applied once to the final chunk of an unsuccessful episode (incl. synthetic timeouts)
   model:
     model_type: robometer
     server_url: "http://127.0.0.1:8000"

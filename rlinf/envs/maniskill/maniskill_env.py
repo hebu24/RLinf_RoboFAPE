@@ -25,6 +25,7 @@ from mani_skill.utils.structs.types import Array
 from mani_skill.utils.visualization.misc import put_info_on_image, tile_images
 from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
+
 from rlinf.utils.logging import get_logger
 
 __all__ = ["ManiskillEnv"]
@@ -96,7 +97,11 @@ class ManiskillEnv(gym.Env):
         record_metrics=True,
     ):
         env_seed = cfg.seed
-        self.seed = env_seed + seed_offset
+        self.shared_reset_seed = bool(getattr(cfg, "shared_reset_seed", False))
+        # Training normally decorrelates environment workers by rank.  For
+        # deterministic SFT-baseline runs, deliberately keep every worker on
+        # the exact same reset seed instead.
+        self.seed = env_seed if self.shared_reset_seed else env_seed + seed_offset
         self.total_num_processes = total_num_processes
         self.worker_info = worker_info
         self.auto_reset = cfg.auto_reset
@@ -187,12 +192,16 @@ class ManiskillEnv(gym.Env):
         self.update_reset_state_ids()
 
     def update_reset_state_ids(self):
+        if self.shared_reset_seed and hasattr(self, "reset_state_ids"):
+            return
         reset_state_ids = torch.randint(
             low=0,
             high=self.total_num_group_envs,
-            size=(self.num_group,),
+            size=(1 if self.shared_reset_seed else self.num_group,),
             generator=self._generator,
         )
+        if self.shared_reset_seed:
+            reset_state_ids = reset_state_ids.repeat(self.num_group)
         self.reset_state_ids = reset_state_ids.repeat_interleave(
             repeats=self.group_size
         ).to(self.device)
@@ -398,6 +407,8 @@ class ManiskillEnv(gym.Env):
             )
         else:
             options = dict(options)
+            if self.shared_reset_seed:
+                seed = self.seed
         base_options = self._base_reset_options()
         if base_options:
             merged_options = dict(base_options)
@@ -432,6 +443,20 @@ class ManiskillEnv(gym.Env):
         else:
             self._reset_metrics()
         return extracted_obs, infos
+
+    def reset_all_for_rollout_window(self):
+        """Reset all vectorized environments for an independent rollout window.
+
+        Thin wrapper over ``reset`` signaling a fresh episode start
+        (``is_start=True``) so pick-up replay-render stashes new frames for the
+        robometer history prefix. This is a worker-level rollout-window semantic
+        (independent windows reset between windows), NOT an environment-dynamics
+        change: it does not forge done flags, modify chunk_step, or call
+        update_reset_state_ids (existing shared_reset_seed /
+        use_fixed_reset_state_ids reproduction semantics are preserved).
+        """
+        self.is_start = True
+        return self.reset()
 
     def consume_pickup_frames(self):
         """Return and clear stashed pick-up render frames (for robometer prepend).

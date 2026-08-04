@@ -1,18 +1,27 @@
-"""Validate the formal 16-episode async Delta training batch."""
+"""Validate the formal 16-episode async Delta training batch (continuous and
+independent rollout-window variants).
+
+§15 of ASYNC_INDEPENDENT_ROLLOUT_WINDOW_IMPLEMENTATION.md: in independent mode
+the 16 env slots each finalize as a window-local episode per window (some natural
+completions, some synthetic timeouts), so ``episodes_per_update`` stays 16 but
+its semantics shift from "16 completed episodes" to "16 window-local finalized
+episodes".
+"""
 
 from pathlib import Path
 
 from omegaconf import OmegaConf
 
-CONFIG_PATH = (
-    Path(__file__).parents[2]
-    / "examples/embodiment/config/maniskill_async_ppo_peg_insertion_pi05_delta.yaml"
+CONFIG_DIR = Path(__file__).parents[2] / "examples/embodiment/config"
+CONTINUOUS_CONFIG_PATH = (
+    CONFIG_DIR / "maniskill_async_ppo_peg_insertion_pi05_delta.yaml"
+)
+INDEPENDENT_CONFIG_PATH = (
+    CONFIG_DIR / "maniskill_async_ppo_peg_insertion_pi05_delta_independent_window.yaml"
 )
 
 
-def test_delta_async_update_uses_16_completed_episodes_and_one_optimizer_step():
-    cfg = OmegaConf.load(CONFIG_PATH)
-
+def _assert_16_episode_one_optimizer_batch(cfg) -> None:
     actor_world_size = 2
     episodes_per_trajectory_per_rank = (
         int(cfg.env.train.total_num_envs) // actor_world_size
@@ -21,8 +30,10 @@ def test_delta_async_update_uses_16_completed_episodes_and_one_optimizer_step():
     episodes_per_update = (
         episodes_per_trajectory_per_rank * trajectories_per_rank * actor_world_size
     )
+    # PPO samples model action chunks (10 actions), while execute_action_chunks
+    # controls low-level environment stepping and must not change flattening.
     chunks_per_episode = int(cfg.env.train.max_episode_steps) // int(
-        cfg.env.train.execute_action_chunks
+        cfg.actor.model.num_action_chunks
     )
     flattened_samples_per_rank = (
         episodes_per_trajectory_per_rank * trajectories_per_rank * chunks_per_episode
@@ -34,7 +45,10 @@ def test_delta_async_update_uses_16_completed_episodes_and_one_optimizer_step():
     assert episodes_per_trajectory_per_rank == 4
     assert trajectories_per_rank == 2
     assert episodes_per_update == 16
+    assert chunks_per_episode == 60
     assert flattened_samples_per_rank == 480
+    assert int(cfg.env.train.execute_action_chunks) == 8
+    assert int(cfg.env.eval.execute_action_chunks) == 8
     assert flattened_samples_per_rank // samples_per_optimizer_step_per_rank == 1
     assert int(cfg.actor.micro_batch_size) == 8
     assert samples_per_optimizer_step_per_rank // int(cfg.actor.micro_batch_size) == 60
@@ -49,3 +63,30 @@ def test_delta_async_update_uses_16_completed_episodes_and_one_optimizer_step():
     assert "value_loss_coef" not in cfg.algorithm
     assert bool(cfg.actor.model.openpi.detach_critic_input)
     assert int(cfg.actor.grad_diagnostics_interval) == 0
+    assert bool(cfg.env.train.shared_reset_seed)
+    assert bool(cfg.env.eval.shared_reset_seed)
+    assert bool(cfg.env.train.use_fixed_reset_state_ids)
+    assert bool(cfg.env.eval.use_fixed_reset_state_ids)
+
+
+def test_delta_async_update_uses_16_window_local_episodes_and_one_optimizer_step():
+    """Renamed from ..._16_completed_episodes_...: in independent mode the 16
+    slots are window-local finalized episodes (natural + synthetic timeout),
+    not necessarily 16 natural completions."""
+    cfg = OmegaConf.load(CONTINUOUS_CONFIG_PATH)
+    _assert_16_episode_one_optimizer_batch(cfg)
+    # Continuous (legacy) config does not opt into independent windows.
+    assert cfg.env.train.get("rollout_window_mode", "continuous") == "continuous"
+
+
+def test_independent_window_delta_config():
+    """§15: the independent-window delta config opts into independent windows
+    while preserving the 16-episode / one-optimizer-step batch."""
+    cfg = OmegaConf.load(INDEPENDENT_CONFIG_PATH)
+    _assert_16_episode_one_optimizer_batch(cfg)
+    assert cfg.env.train.rollout_window_mode == "independent"
+    assert bool(cfg.env.train.auto_reset)
+    assert cfg.reward.history_train_mode == "rollout_window"
+    assert bool(cfg.reward.history_reward_assign)
+    # experiment/log name must distinguish from legacy continuous-window runs.
+    assert "independent_window" in cfg.runner.logger.experiment_name

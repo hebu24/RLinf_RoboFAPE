@@ -44,16 +44,19 @@ class PreGraspedInitWrapper(gym.Wrapper):
     Args:
         env: A batched ``ManiskillEnv`` (GPU). ``env.env.unwrapped`` must be a
             ``PegInsertionVerticalEnv`` exposing ``set_lift_planner``.
-        seed: Base seed for per-env/per-episode planner seeds.
+        seed: Base seed for planner requests.
+        shared_reset_seed: Keep every planner request on ``seed``.
     """
 
-    def __init__(self, env, *, seed: int = 0):
+    def __init__(self, env, *, seed: int = 0, shared_reset_seed: bool = False):
         super().__init__(env)
         from rlinf.envs.maniskill.peg_insertion_lift_planner import (
             PegInsertionLiftPlanner,
         )
 
-        self._planner = PegInsertionLiftPlanner(base_seed=int(seed))
+        self._planner = PegInsertionLiftPlanner(
+            base_seed=int(seed), shared_reset_seed=shared_reset_seed
+        )
         # Register on the underlying PegInsertionVerticalEnv so
         # _initialize_episode (initial reset + auto-reset) plans a grasped
         # state. self.env = ManiskillEnv; .env = gym env; .unwrapped = task.

@@ -107,10 +107,11 @@ env:
     rollout_epoch: 1
     total_num_envs: 16            # 8 completed episodes per actor rank, 16 episodes/update
     auto_reset: True
-    use_fixed_reset_state_ids: False
+    use_fixed_reset_state_ids: True
+    shared_reset_seed: True       # reproduce one SFT reset across every env/reset
     max_episode_steps: 600
     max_steps_per_rollout_epoch: 600
-    execute_action_chunks: 10
+    execute_action_chunks: 8
     temporal_ensemble_weight: 0.01
   eval:
     rollout_epoch: 1
@@ -119,10 +120,11 @@ env:
     ignore_terminations: False
     max_episode_steps: 600
     max_steps_per_rollout_epoch: 600
-    use_fixed_reset_state_ids: False
+    use_fixed_reset_state_ids: True
+    shared_reset_seed: True
     group_size: ${algorithm.group_size}
     is_eval: True
-    execute_action_chunks: 10
+    execute_action_chunks: 8
     temporal_ensemble_weight: 0.01
     video_cfg:
       save_video: True
@@ -143,7 +145,7 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 8
-  global_batch_size: 960         # one optimizer step over all 16 episodes
+  global_batch_size: 960         # one optimizer step over all 16 episodes (60 chunks each)
   seed: 0
   enable_offload: False
   model:

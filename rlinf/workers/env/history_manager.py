@@ -360,6 +360,18 @@ class HistoryManager:
         self.history_counts[env_id] = 0
         self.pickup_counts[env_id] = 0
 
+    def reset_all(self) -> None:
+        """Clear all per-environment histories before a new independent rollout window.
+
+        Mirrors ``clear_history`` for every env (history_entries,
+        success_history_entries, history_counts, pickup_counts) so the next
+        window's Robometer video never spans the previous window. Does not
+        rebuild the HistoryManager; pickup prefixes are re-established by the
+        env_worker via ``consume_pickup_frames`` + ``prepend_history_entries``.
+        """
+        for env_id in range(self.num_envs):
+            self.clear_history(env_id)
+
     def trim_history(self, env_idx: int) -> None:
         cur_len = len(self.history_entries[env_idx])
         if cur_len <= self.max_history_size:

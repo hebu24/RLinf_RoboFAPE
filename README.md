@@ -180,10 +180,30 @@ export TMPDIR=/data/yingxi/tmp
 export HF_HOME=/data/yingxi/.cache/huggingface
 export RLINF_ROBOFPE_PATH=/home/yingxi/RoboFAC/mani_envs
 export CUDA_VISIBLE_DEVICES=0,1
-export RL_RAY_PORT=6381
-export RAY_DASHBOARD_AGENT_PORT=52367
-bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh
+export RL_RAY_PORT=6384
+export RAY_DASHBOARD_PORT=8264
+export RAY_DASHBOARD_AGENT_PORT=52370
+export RAY_MIN_WORKER_PORT=10002
+export RAY_MAX_WORKER_PORT=10399
+export CONFIG_NAME=maniskill_async_ppo_peg_insertion_pi05   # absolute shaping (default)
+# env.train.rollout_window_mode=independent: each rollout window is self-contained —
+# unfinished episodes are force-closed as a synthetic truncation at the window
+# boundary, Robometer settles them, then all train envs reset + history clears so
+# the next window starts fresh (no cross-window last_obs resume). Default is
+# `continuous` (legacy cross-window continuation). See
+# ASYNC_INDEPENDENT_ROLLOUT_WINDOW_IMPLEMENTATION.md.
+bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
+  env.train.rollout_window_mode=independent \
+  reward.model.timeout_s=600 \
+  algorithm.rollout_store_wait_timeout_s=1800
 ```
+
+For `reward.shaping=delta` instead, export
+`CONFIG_NAME=maniskill_async_ppo_peg_insertion_pi05_delta` and add the Hydra
+overrides `reward.shaping=delta reward.model.server_url=http://127.0.0.1:8001`
+(delta uses a second Robometer server on `:8001`; see §3.5). The launcher
+auto-selects the `_delta` config when `reward.shaping=delta` is passed, but
+setting `CONFIG_NAME` explicitly is clearer for concurrent runs.
 
 Useful Hydra overrides:
 
@@ -429,81 +449,103 @@ logic is wrong.
 
 ### 3.5 Dual concurrent RL runs (absolute vs delta)
 
-Two async-PPO runs with different reward shaping can train at once on the same
-host: Run A with `reward.shaping=absolute` on GPUs 0-1 (port `6381`), Run B with
-`reward.shaping=delta` on GPUs 2-3 (port `6382`). They share one Robometer
-server (`:8000`) and use disjoint GPU sets + distinct Ray ports/dashboard-agent
-ports/temp-dirs, so each run's scoped teardown touches only its own head.
+Two async-PPO runs with different reward shaping train concurrently on the same
+host, both in **independent rollout-window mode** (`env.train.rollout_window_mode=independent`):
+Run A with `reward.shaping=absolute` on GPUs 0-1 (GCS port `6384`), Run B with
+`reward.shaping=delta` on GPUs 2-3 (GCS port `6386`). Each run HTTP-calls its own
+Robometer server (`:8000` for absolute, `:8001` for delta) and uses disjoint GPU
+sets + fully distinct Ray GCS/dashboard/agent/worker ports + temp-dirs, so each
+run's scoped teardown touches only its own head.
 
-| run | shaping | GPUs | GCS port | dashboard | experiment_name override |
-|---|---|---|---|---|---|
-| A | `absolute` | 0,1 | `6381` | `52367` | `..._robometer_absolute` |
-| B | `delta` | 2,3 | `6382` | `52368` | `..._robometer_delta` |
+| run | shaping | GPUs | GCS port | dashboard | agent | worker ports | robometer | CONFIG_NAME |
+|---|---|---|---|---|---|---|---|---|
+| A | `absolute` | 0,1 | `6384` | `8264` | `52370` | `10002-10399` | `:8000` (GPU 0) | `maniskill_async_ppo_peg_insertion_pi05` |
+| B | `delta` | 2,3 | `6386` | `8266` | `52372` | `13000-13399` | `:8001` (GPU 2) | `maniskill_async_ppo_peg_insertion_pi05_delta` |
 
-Launch order: Robometer → wait for `/health` → Run A → Run B (A/B order does not
-matter — ports are distinct). Each `tmux new-session -d` survives SSH disconnect;
-attach with `tmux attach -t rl_absolute` / `rl_delta` (detach: `Ctrl-b d`).
-The launcher auto-selects `maniskill_async_ppo_peg_insertion_pi05_delta` when
-you pass `reward.shaping=delta`, so the delta run uses its own placement config.
+Launch order: Robometer `:8000` → Robometer `:8001` → wait for both `/health` →
+Run A → Run B (A/B order does not matter — ports are distinct). Each
+`tmux new-session -d` survives SSH disconnect; attach with
+`tmux attach -t rl_abs_independent_window_gpu01` / `rl_delta_independent_window_gpu23`
+(detach: `Ctrl-b d`). The launcher auto-selects the `_delta` config when
+`reward.shaping=delta` is passed, but `CONFIG_NAME` is set explicitly here so the
+pane-root cmdline is unambiguous. Both runs pass
+`env.train.rollout_window_mode=independent` so every window force-closes
+unfinished episodes, settles them via Robometer, then resets all train envs +
+clears history before the next window (see
+`ASYNC_INDEPENDENT_ROLLOUT_WINDOW_IMPLEMENTATION.md`).
 
 ```bash
-# Step 0 — shared Robometer server (GPU 4; outside both RL clusters)
+# Step 0 — two Robometer servers (one per run; each co-located on the run's
+# first GPU, with the eval_server empty_cache mitigation for co-location).
 tmux new-session -d -s robometer_server \
   "cd /home/yingxi/RoboFAC/robometer && \
    mkdir -p /data/yingxi/tmp && \
-   TMPDIR=/data/yingxi/tmp CUDA_VISIBLE_DEVICES=4 uv run python robometer/evals/eval_server.py \
+   TMPDIR=/data/yingxi/tmp CUDA_VISIBLE_DEVICES=0 uv run python robometer/evals/eval_server.py \
      model_path=/data/yingxi/robometer/logs/checkpoint-400 \
      server_url=0.0.0.0 server_port=8000 num_gpus=1 batch_size=4 \
-   2>&1 | tee /data/yingxi/RLinf_RoboFAPE/logs/robometer_server.log"
-until curl -sS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1; do sleep 2; done && echo "Robometer healthy"
+   2>&1 | tee /data/yingxi/RLinf_RoboFAPE/logs/robometer_server_8000.log"
+tmux new-session -d -s robometer_server_8001_gpu2 \
+  "cd /home/yingxi/RoboFAC/robometer && \
+   mkdir -p /data/yingxi/tmp && \
+   TMPDIR=/data/yingxi/tmp CUDA_VISIBLE_DEVICES=2 uv run python robometer/evals/eval_server.py \
+     model_path=/data/yingxi/robometer/logs/checkpoint-400 \
+     server_url=0.0.0.0 server_port=8001 num_gpus=1 batch_size=4 \
+   2>&1 | tee /data/yingxi/RLinf_RoboFAPE/logs/robometer_server_8001.log"
+until curl -sS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1; do sleep 2; done && echo "Robometer :8000 healthy"
+until curl -sS --max-time 5 http://127.0.0.1:8001/health >/dev/null 2>&1; do sleep 2; done && echo "Robometer :8001 healthy"
 
-# Step 1 — Run A: absolute reward, GPUs 0-1, port 6381
-tmux new-session -d -s rl_absolute \
+# Step 1 — Run A: absolute reward + independent windows, GPUs 0-1, port 6384
+tmux new-session -d -s rl_abs_independent_window_gpu01 -c /data/yingxi/RLinf_RoboFAPE \
   "cd /data/yingxi/RLinf_RoboFAPE && \
    CUDA_VISIBLE_DEVICES=0,1 \
-   RL_RAY_PORT=6381 RAY_DASHBOARD_AGENT_PORT=52367 \
-   RLINF_REWARD_DEBUG_LOG=/tmp/robometer_rdebug_absolute.log \
+   RL_RAY_PORT=6384 RAY_DASHBOARD_PORT=8264 RAY_DASHBOARD_AGENT_PORT=52370 \
+   RAY_MIN_WORKER_PORT=10002 RAY_MAX_WORKER_PORT=10399 \
+   CONFIG_NAME=maniskill_async_ppo_peg_insertion_pi05 \
+   LOG_DIR=logs/\$(date +%Y%m%d-%H:%M:%S)-peg_insertion_rl_async_absolute_independent_window_gpu01 \
    bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
-     reward.shaping=absolute \
-     runner.logger.experiment_name=peg_insertion_async_ppo_pi05_robometer_absolute \
+     env.train.rollout_window_mode=independent \
+     reward.model.timeout_s=600 algorithm.rollout_store_wait_timeout_s=1800 \
    ; echo ===EXIT=\$?=== ; exec bash"
 
-# Step 2 — Run B: delta reward, GPUs 2-3, port 6382
-tmux new-session -d -s rl_delta \
+# Step 2 — Run B: delta reward + independent windows, GPUs 2-3, port 6386
+tmux new-session -d -s rl_delta_independent_window_gpu23 -c /data/yingxi/RLinf_RoboFAPE \
   "cd /data/yingxi/RLinf_RoboFAPE && \
    CUDA_VISIBLE_DEVICES=2,3 \
-   RL_RAY_PORT=6382 RAY_DASHBOARD_AGENT_PORT=52368 \
-   RLINF_REWARD_DEBUG_LOG=/tmp/robometer_rdebug_delta.log \
+   RL_RAY_PORT=6386 RAY_DASHBOARD_PORT=8266 RAY_DASHBOARD_AGENT_PORT=52372 \
+   RAY_MIN_WORKER_PORT=13000 RAY_MAX_WORKER_PORT=13399 \
+   CONFIG_NAME=maniskill_async_ppo_peg_insertion_pi05_delta \
+   LOG_DIR=logs/\$(date +%Y%m%d-%H:%M:%S)-peg_insertion_rl_async_delta_independent_window_gpu23 \
    bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
-     reward.shaping=delta \
-     runner.logger.experiment_name=peg_insertion_async_ppo_pi05_robometer_delta \
+     reward.shaping=delta reward.model.server_url=http://127.0.0.1:8001 \
+     env.train.rollout_window_mode=independent \
+     reward.model.timeout_s=600 algorithm.rollout_store_wait_timeout_s=1800 \
    ; echo ===EXIT=\$?=== ; exec bash"
 ```
 
-Each run writes its Robometer reward debug log to its own file when
-`RLINF_REWARD_DEBUG=1` is also set (the path is read from
-`RLINF_REWARD_DEBUG_LOG`, defaulting to the shared
-`/tmp/robometer_rdebug.log`); the two runs above use `_absolute.log` /
-`_delta.log` so their debug output never interleaves.
-
-The `experiment_name` override keeps the two runs distinguishable in TensorBoard
-(checkpoint paths are already separated by the timestamped `LOG_DIR`, but the
-override makes the dirs self-documenting). Confirm both clusters coexist:
+The `LOG_DIR` names carry `independent_window` so these runs are
+distinguishable from legacy continuous-window runs at a glance. Each run writes
+its Robometer reward debug log to `/tmp/robometer_rdebug.log` (or
+`$RLINF_REWARD_DEBUG_LOG` if set with `RLINF_REWARD_DEBUG=1`). Confirm both
+clusters coexist:
 
 ```bash
-pgrep -fa gcs_server | grep -oE 'gcs_server_port=[0-9]+' | sort -u   # both 6381 and 6382
-ss -tlnp | grep -E '6381|6382|52367|52368'
-nvidia-smi --query-gpu=index,memory.used --format=csv,noheader         # RL uses 0-1 and 2-3; Robometer uses 4
+pgrep -fa gcs_server | grep -oE 'gcs_server_port=[0-9]+' | sort -u   # both 6384 and 6386
+ss -tlnp | grep -E '6384|6386|52370|52372|8000|8001'
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader         # A uses 0-1, B uses 2-3
 ```
 
-Scoped teardown of one run leaves the other alive — replace `P` with the run's
-GCS port (see `RAY_ISOLATION.md`):
+Scoped teardown of one run leaves the other alive — target that run's GCS port
+(`6384` for Run A / absolute, `6386` for Run B / delta; see `RAY_ISOLATION.md`).
+Use a **character class** (`638[4]` / `638[6]`) in the pattern: a bare `6384`
+makes `pkill -f` match the shell running the command itself (its cmdline contains
+the pattern string), killing your shell before the `|| true` runs:
 
 ```bash
-P=6381
-pkill -9 -f "gcs_server.*--gcs_server_port=${P}"  || true
-pkill -9 -f "raylet.*--gcs-address=[^ ]*:${P}"     || true
-pkill -9 -f "dashboard.*--gcs-address=[^ ]*:${P}"  || true
+# Run A (absolute, GCS 6384) — swap to 638[6] for Run B (delta)
+pkill -9 -f 'ray_tmp_rl_638[4]'                 || true
+pkill -9 -f 'gcs_server_port=638[4]'            || true
+pkill -9 -f 'raylet.*gcs-address=[^ ]*:638[4]'   || true
+pkill -9 -f 'dashboard.*gcs-address=[^ ]*:638[4]' || true
 sleep 2
 ```
 

@@ -338,11 +338,18 @@ class PegInsertionLiftPlanner:
     spawned per proxy and reused across all episodes.
     """
 
-    def __init__(self, *, python_bin: str | None = None, base_seed: int = 0):
+    def __init__(
+        self,
+        *,
+        python_bin: str | None = None,
+        base_seed: int = 0,
+        shared_reset_seed: bool = False,
+    ):
         self._python_bin = python_bin or sys.executable
         self._proc: subprocess.Popen | None = None
         self._req_id = 0
         self._base_seed = int(base_seed)
+        self._shared_reset_seed = bool(shared_reset_seed)
         self._episode_counter = 0
         # Bounded buffer of recent worker stderr lines, drained by a background
         # thread so the stderr pipe never fills and blocks the worker (which
@@ -461,9 +468,10 @@ class PegInsertionLiftPlanner:
         ``env_global_indices`` is the list of env indices ManiSkill is resetting
         (the ``env_idx`` subset on auto-reset, or all envs on the initial reset).
         Returns ``{robot_qpos:(b,9), peg_pose:(b,7), hole_pose:(b,7)}`` as
-        ``np.float32``. Per-env seeds are derived deterministically from the
-        base seed, a monotonic episode counter, and the global env index so
-        parallel envs and successive episodes all differ.
+        ``np.float32``. Normally per-env seeds are derived deterministically
+        from the base seed, a monotonic episode counter, and the global env
+        index. ``shared_reset_seed`` instead uses the base seed for every
+        environment and episode to reproduce a single SFT reset.
         """
         import numpy as np
 
@@ -475,12 +483,15 @@ class PegInsertionLiftPlanner:
         hole_pose = np.zeros((b, 7), dtype=np.float32)
         trajectories: list[list[dict]] = []
         for j, gi in enumerate(idxs):
-            seed = (
-                self._base_seed * 1_000_003
-                + self._episode_counter * 1_009
-                + int(gi) * 97
-                + 7
-            )
+            if self._shared_reset_seed:
+                seed = self._base_seed
+            else:
+                seed = (
+                    self._base_seed * 1_000_003
+                    + self._episode_counter * 1_009
+                    + int(gi) * 97
+                    + 7
+                )
             # Retry with a different seed on planner errors: some seeds yield no
             # valid grasp/lift (e.g. "no lifted state for seed=..."). The env uses
             # the lifted state the planner RETURNS (robot_qpos/peg_pose/hole_pose

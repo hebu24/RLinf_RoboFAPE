@@ -189,6 +189,35 @@ class EnvWorker(Worker):
         )
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
 
+        # Independent rollout windows (ASYNC_INDEPENDENT_ROLLOUT_WINDOW_IMPLEMENTATION.md).
+        # continuous: legacy cross-window continuation (last_obs_list resumes the
+        #   previous window's sim state/history into the next bootstrap_step).
+        # independent: force-close unfinished episodes at each window boundary
+        #   (synthetic truncation, never a task termination), settle Robometer
+        #   rewards up to the boundary, then reset all train envs + clear history
+        #   so the next window starts from a fresh reset observation.
+        rollout_window_mode = (
+            train_env_cfg.get("rollout_window_mode", "continuous")
+            if train_env_cfg is not None
+            else "continuous"
+        )
+        self.independent_rollout_windows = self._validate_rollout_window_mode(
+            rollout_window_mode,
+            (
+                train_env_cfg.get("auto_reset", False)
+                if train_env_cfg is not None
+                else False
+            ),
+            self.history_train_mode,
+            self.rollout_epoch,
+        )
+        # Per-stage forced-timeout mask stashed by _finalize_independent_window_boundary
+        # for reward-query settlement assertions + debug. None when no window has
+        # been finalized yet.
+        self._independent_window_forced_timeout_masks: list[torch.Tensor | None] = [
+            None
+        ] * self.stage_num
+
         self.train_enable_offload = (
             train_env_cfg.get("enable_offload", False)
             if train_env_cfg is not None
@@ -716,7 +745,15 @@ class EnvWorker(Worker):
                 from rlinf.envs.wrappers import PreGraspedInitWrapper
 
                 env = PreGraspedInitWrapper(
-                    env, seed=int(getattr(env_cfg, "seed", 0)) + self._rank
+                    env,
+                    seed=(
+                        int(getattr(env_cfg, "seed", 0))
+                        if bool(getattr(env_cfg, "shared_reset_seed", False))
+                        else int(getattr(env_cfg, "seed", 0)) + self._rank
+                    ),
+                    shared_reset_seed=bool(
+                        getattr(env_cfg, "shared_reset_seed", False)
+                    ),
                 )
             if env_cfg.video_cfg.save_video:
                 env = RecordVideo(env, env_cfg.video_cfg)
@@ -1767,6 +1804,15 @@ class EnvWorker(Worker):
 
     def prefetch_train_bootstrap(self, rollout_channel: Channel) -> None:
         """Prepare and send the first env batch for the next training rollout."""
+        # Independent windows: the env+history reset happens at the END of
+        # _run_interact_once (replacing store_last_obs). The runner overlaps this
+        # prefetch with actor training (embodied_runner), so it could read a stale
+        # last_obs_list (pre-reset) and cache the previous window's state for the
+        # next window. Disable prefetch entirely; _run_interact_once then falls
+        # through to _bootstrap_and_send_train on a fresh last_obs_list. Cost: a
+        # small latency (no overlap of the first env batch with actor compute).
+        if self.independent_rollout_windows:
+            return
         if self._prefetched_train_bootstrap is not None:
             raise RuntimeError(
                 "A prefetched train bootstrap already exists. "
@@ -1790,6 +1836,196 @@ class EnvWorker(Worker):
             (env_output.intervene_actions, env_output.intervene_flags)
             for env_output in env_output_list
         ]
+
+    @staticmethod
+    def _validate_rollout_window_mode(
+        rollout_window_mode: str,
+        auto_reset: bool,
+        history_train_mode: str,
+        rollout_epoch: int,
+    ) -> bool:
+        """Validate env.train.rollout_window_mode and return whether independent.
+
+        Pure (no self) so unit tests can exercise the validation without
+        constructing a distributed EnvWorker. continuous is the legacy
+        cross-window continuation; independent force-closes unfinished episodes
+        at each window boundary and requires auto_reset=true,
+        history_train_mode='rollout_window' (not complete_episode, which retains
+        trajectories across windows), and rollout_epoch=1 (each internal epoch
+        is a window; otherwise reset would cut mid-trajectory).
+        """
+        if rollout_window_mode not in {"continuous", "independent"}:
+            raise ValueError(
+                "env.train.rollout_window_mode must be 'continuous' or "
+                f"'independent', got {rollout_window_mode!r}."
+            )
+        independent = rollout_window_mode == "independent"
+        if independent:
+            if not auto_reset:
+                raise ValueError(
+                    "env.train.rollout_window_mode='independent' requires "
+                    "env.train.auto_reset=true."
+                )
+            if history_train_mode == "complete_episode":
+                raise ValueError(
+                    "Independent rollout windows require "
+                    "reward.history_train_mode='rollout_window'; "
+                    "'complete_episode' retains trajectories across windows."
+                )
+            if rollout_epoch != 1:
+                raise ValueError(
+                    "Independent rollout windows currently require rollout_epoch=1 "
+                    f"(got {rollout_epoch}); each internal epoch would otherwise "
+                    "reset mid-trajectory."
+                )
+        return independent
+
+    def _finalize_independent_window_boundary(
+        self,
+        env_output: EnvOutput,
+        stage_id: int,
+        env_metrics: dict[str, list],
+    ) -> EnvOutput:
+        """Force unfinished env slots to end at an independent window boundary.
+
+        Models the artificial window boundary as a *truncation* (time-limit cut),
+        never a task *termination*: only the last action-chunk step ``[:, -1]`` is
+        touched, naturally-done envs keep their original flags, and forced-timeout
+        envs get ``dones[:, -1]=True`` + ``truncations[:, -1]|=True`` so the post-loop
+        Robometer query settles them and GAE stops bootstrapping at the boundary.
+        Returns a *new* EnvOutput (cloned tensors); the original tensors owned by the
+        already-recorded ChunkStepResults are left untouched, so the synthetic
+        terminal lands only on the trajectory's T+1 bootstrap boundary, not on the
+        last action chunk.
+        """
+        if env_output.dones is None:
+            raise RuntimeError("Cannot finalize rollout window without done flags.")
+
+        dones = env_output.dones.clone().to(dtype=torch.bool)
+        terminations = (
+            env_output.terminations.clone().to(dtype=torch.bool)
+            if env_output.terminations is not None
+            else torch.zeros_like(dones)
+        )
+        truncations = (
+            env_output.truncations.clone().to(dtype=torch.bool)
+            if env_output.truncations is not None
+            else torch.zeros_like(dones)
+        )
+
+        naturally_done = dones[:, -1].clone()
+        forced_timeout = ~naturally_done
+
+        dones[:, -1] = True
+        truncations[:, -1] = torch.logical_or(truncations[:, -1], forced_timeout)
+
+        self._independent_window_forced_timeout_masks[stage_id] = forced_timeout
+
+        env_metrics["window/episodes"].append(
+            torch.tensor([dones.shape[0]], dtype=torch.float32)
+        )
+        env_metrics["window/natural_terminal_episodes"].append(
+            torch.tensor([naturally_done.sum().item()], dtype=torch.float32)
+        )
+        env_metrics["window/forced_timeout_episodes"].append(
+            torch.tensor([forced_timeout.sum().item()], dtype=torch.float32)
+        )
+        env_metrics["window/forced_timeout_fraction"].append(
+            forced_timeout.float().mean().reshape(1).cpu()
+        )
+
+        return EnvOutput(
+            obs=env_output.obs,
+            final_obs=env_output.final_obs,
+            rewards=env_output.rewards,
+            env_infos=env_output.env_infos,
+            dones=dones,
+            terminations=terminations,
+            truncations=truncations,
+            intervene_actions=env_output.intervene_actions,
+            intervene_flags=env_output.intervene_flags,
+        )
+
+    def _reset_train_stage_for_next_independent_window(self, stage_id: int) -> None:
+        """Reset one train stage's env + history for the next independent window.
+
+        Order matters: this is called *after* the post-loop Robometer query and
+        reward assignment (and after trajectories are sent), so settling is
+        already complete. ``env.is_start=True`` + ``reset()`` re-renders the
+        pick-up prefix on the GPU env; ``reset_all`` wipes the previous window's
+        history so the next Robometer video never spans windows; then the fresh
+        pick-up frames are prepended. ``last_obs_list`` is overwritten with the
+        fresh reset observation so the next ``bootstrap_step`` does not resume.
+        """
+        env = self.env_list[stage_id]
+        if hasattr(env, "reset_all_for_rollout_window"):
+            extracted_obs, _ = env.reset_all_for_rollout_window()
+        else:
+            env.is_start = True
+            extracted_obs, _ = env.reset()
+
+        if self.reward_mode == "history_buffer":
+            history_manager = self.train_history_managers[stage_id]
+            history_manager.reset_all()
+
+            consume_pickup_frames = get_env_attr(env, "consume_pickup_frames")
+            pickup_frames = (
+                consume_pickup_frames()
+                if callable(consume_pickup_frames)
+                else (consume_pickup_frames or {})
+            )
+            for env_id, frames in pickup_frames.items():
+                if frames:
+                    history_manager.prepend_history_entries(int(env_id), frames)
+
+        self.last_obs_list[stage_id] = extracted_obs
+        self.last_intervened_info_list[stage_id] = (None, None)
+
+    def _assert_independent_forced_timeouts_settled(
+        self,
+        stage_id: int,
+        forced_timeout: torch.Tensor,
+        assignments: dict[int, "RobometerEpisodeReward"],
+    ) -> None:
+        """Verify every forced-timeout env was settled by the Robometer query.
+
+        Forbids silently dropping unfinished trajectories. ``assign_history_reward``
+        pops ``_last_history_query_info[stage]`` internally, so the authoritative
+        record of what was settled is the returned ``assignments`` dict: each
+        forced env must have an entry, that entry must be a failure
+        (``episode_success is False`` — a synthetic truncation must never look
+        like a task success), and its window chunk refs must be non-empty. Raises
+        ``RuntimeError`` (never a silent skip) with enough context to debug the
+        funnel.
+        """
+        forced_env_ids = (
+            torch.nonzero(forced_timeout, as_tuple=False).flatten().tolist()
+        )
+        for env_id in forced_env_ids:
+            episode_id = int(self._episode_chunk_ids[stage_id][env_id])
+            chunk_refs = tuple(
+                self._window_chunk_slices_for_episode(stage_id, env_id, episode_id)
+            )
+            assignment = assignments.get(env_id)
+            if assignment is None:
+                raise RuntimeError(
+                    f"[independent-window] forced-timeout env {env_id} "
+                    f"(stage {stage_id}, episode {episode_id}) has no reward "
+                    "assignment; unfinished trajectory was not queried/settled "
+                    "by Robometer (was reward_model_output None?)."
+                )
+            if assignment.episode_success:
+                raise RuntimeError(
+                    f"[independent-window] forced-timeout env {env_id} "
+                    f"(stage {stage_id}, episode {episode_id}) settled as "
+                    "success; synthetic truncation must be a failure."
+                )
+            if not chunk_refs:
+                raise RuntimeError(
+                    f"[independent-window] forced-timeout env {env_id} "
+                    f"(stage {stage_id}, episode {episode_id}) has no window "
+                    "chunk refs; the trajectory has no policy steps to cover."
+                )
 
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
@@ -2021,6 +2257,16 @@ class EnvWorker(Worker):
                     )
                     if should_record:
                         self.record_env_metrics(env_metrics, env_info)
+            # Independent rollout windows: force-close unfinished envs at the
+            # window boundary BEFORE the post-loop Robometer query so their
+            # done=True makes the reward worker settle them, and the T+1
+            # bootstrap boundary carries the synthetic truncation (GAE stops
+            # here; no cross-window bootstrap).
+            if self.independent_rollout_windows:
+                for stage_id in range(self.stage_num):
+                    env_outputs[stage_id] = self._finalize_independent_window_boundary(
+                        env_outputs[stage_id], stage_id, env_metrics
+                    )
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
@@ -2031,7 +2277,13 @@ class EnvWorker(Worker):
 
                 reward_model_output = None
                 if reward_channel is not None:
-                    last_run = epoch == self.rollout_epoch - 1
+                    # In independent mode this post-loop query is the window's
+                    # final settlement (last_run=True forces unfinished-prefix
+                    # queries); rollout_epoch is pinned to 1 there.
+                    last_run = (
+                        self.independent_rollout_windows
+                        or epoch == self.rollout_epoch - 1
+                    )
                     reward_model_output = self.get_reward_model_output(
                         env_output,
                         send_channel=reward_channel,
@@ -2065,6 +2317,7 @@ class EnvWorker(Worker):
                     # rollout window; adding a placeholder reward here would make
                     # loss_mask/rewards one step longer than versions/actions.
                     rewards = None
+                    assignments: dict[int, RobometerEpisodeReward] = {}
                     if reward_model_output is not None:
                         assignments = self.assign_history_reward(
                             stage_id, reward_model_output
@@ -2073,6 +2326,18 @@ class EnvWorker(Worker):
                             assignments
                         ).items():
                             env_metrics[key].append(values)
+                    # Independent windows: every forced-timeout env MUST be
+                    # settled here. If reward_model_output was None (no Robometer
+                    # query) assignments stays empty and this fires, surfacing
+                    # dropped unfinished trajectories instead of silencing them.
+                    if self.independent_rollout_windows:
+                        forced_timeout = self._independent_window_forced_timeout_masks[
+                            stage_id
+                        ]
+                        if forced_timeout is not None and bool(forced_timeout.any()):
+                            self._assert_independent_forced_timeouts_settled(
+                                stage_id, forced_timeout, assignments
+                            )
                 else:
                     rewards = self._history_reward_placeholder(rewards, rollout_result)
                 chunk_step_result = ChunkStepResult(
@@ -2118,7 +2383,17 @@ class EnvWorker(Worker):
                 ]
                 self._reset_window_chunk_refs()
 
-            self.store_last_obs_and_intervened_info(env_outputs)
+            # Independent windows: reset all train envs + clear history now
+            # (after Robometer settlement and trajectory send) and overwrite
+            # last_obs_list with the fresh reset observation. The next
+            # bootstrap_step() then starts a genuinely new window instead of
+            # resuming the previous sim state/history. Prefetch is disabled in
+            # this mode, so no stale cached bootstrap can race the reset.
+            if self.independent_rollout_windows:
+                for stage_id in range(self.stage_num):
+                    self._reset_train_stage_for_next_independent_window(stage_id)
+            else:
+                self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
 
         if not self.use_training_pipeline and actor_channel is not None:

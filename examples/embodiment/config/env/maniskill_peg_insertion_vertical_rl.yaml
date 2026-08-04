@@ -12,6 +12,14 @@ wrap_obs_mode: simple
 use_wrist_image: True
 use_wrist_back_image: False
 auto_reset: True
+# continuous: legacy cross-window continuation (last_obs_list resumes the
+#   previous window's sim state/history into the next bootstrap_step).
+# independent: force-close unfinished episodes at each window boundary
+#   (synthetic truncation), settle Robometer rewards to the boundary, then
+#   reset all train envs + clear history so the next window starts fresh.
+#   Requires auto_reset=true, reward.history_train_mode=rollout_window,
+#   rollout_epoch=1 (env_worker validates these).
+rollout_window_mode: continuous
 ignore_terminations: False        # RL: truncate on success (eval used True + success_once)
 use_rel_reward: False
 sync_target_pose_per_chunk: True
@@ -20,6 +28,7 @@ action_scale: 1.0
 seed: 0
 group_size: 1
 use_fixed_reset_state_ids: False
+shared_reset_seed: False          # set by deterministic SFT-baseline RL configs
 max_steps_per_rollout_epoch: 600
 max_episode_steps: 600
 task_description: "insert the peg into the hole"   # shadowed at runtime by get_language_instruction
