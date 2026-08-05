@@ -29,7 +29,11 @@ from rlinf.algorithms.utils import kl_penalty, preprocess_loss_inputs
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.priority_store import PriorityStore
-from rlinf.data.staleness_mask import compute_staleness_mask, count_fresh_chunks
+from rlinf.data.staleness_mask import (
+    candidate_batch_is_usable,
+    compute_staleness_mask,
+    count_fresh_chunks,
+)
 from rlinf.scheduler import CommMapper, Worker
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.metric_utils import (
@@ -664,6 +668,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         # Captured by the receive thread on a fatal error so the readiness
         # collective can sync an all-reduce abort instead of deadlocking.
         self._recv_thread_exc: Exception | None = None
+        self._rollout_credit_channel = None
 
     def init_worker(self) -> None:
         """Initialize the actor and capture the immutable SFT KL reference."""
@@ -675,7 +680,8 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             if self.enable_offload:
                 self.offload_param_and_grad()
 
-    async def recv_rollout_trajectories(self, input_channel):
+    async def recv_rollout_trajectories(self, input_channel, credit_channel=None):
+        self._rollout_credit_channel = credit_channel
         # drain channel
         if getattr(self, "_recv_queue", None) is None:
             self._recv_queue = queue.Queue()
@@ -893,17 +899,22 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 await asyncio.sleep(1)
                 continue
 
-            # Phase 2: every rank has >= min_fresh_chunks fresh chunks?
-            fresh = torch.tensor(
-                [float(self._count_fresh_chunks(candidates, cutoff))],
-                device=device,
+            # Phase 2: an intentionally all-masked no-op shard is usable. Only a
+            # shard that has trainable chunks but no sufficiently fresh chunks is
+            # stale and must be discarded. This keeps skip-zero-success windows
+            # from being confused with stale data and deadlocking production.
+            local_stats = count_fresh_chunks(candidates, cutoff)
+            local_usable = float(
+                candidate_batch_is_usable(local_stats, min_fresh_chunks)
             )
-            torch.distributed.all_reduce(fresh, op=torch.distributed.ReduceOp.MIN)
-            if fresh.item() < float(min_fresh_chunks):
+            usable = torch.tensor([local_usable], device=device)
+            torch.distributed.all_reduce(usable, op=torch.distributed.ReduceOp.MIN)
+            if usable.item() < 1.0:
                 # All ranks have candidates but some rank lacks the minimum
                 # fresh chunk budget: discard in lockstep and wait for fresher
                 # data so critic statistics are defined on >1 sample.
                 self.rollout_store.discard_topn(n)
+                await self._return_rollout_credits(n, reason="stale_discard")
                 global_retry += 1
                 if now - last_status >= status_interval:
                     self._log_wait_status(
@@ -918,6 +929,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 continue
 
             batch = self.rollout_store.take_topn(n)
+            await self._return_rollout_credits(len(batch), reason="consumed")
             self._staleness_readiness = {
                 "staleness_received_trajectories": len(batch),
                 "staleness_global_retry_rounds": global_retry,
@@ -930,6 +942,25 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 f"min_fresh_chunks={min_fresh_chunks}"
             )
             return batch
+
+    async def _return_rollout_credits(self, count: int, *, reason: str) -> None:
+        """Return global window credits after a collective store disposition."""
+        if self._rank != 0 or self._rollout_credit_channel is None or count <= 0:
+            return
+        rollout_ws = self._component_placement.get_world_size("rollout")
+        works = []
+        for rollout_rank in range(rollout_ws):
+            key = CommMapper.build_channel_key(
+                rollout_rank, rollout_rank, "rollout_credit"
+            )
+            works.append(
+                self._rollout_credit_channel.put(count, key=key, async_op=True)
+            )
+        await asyncio.gather(*(work.async_wait() for work in works))
+        self.log_info(
+            f"returned rollout credits count={count} reason={reason} "
+            f"rollout_world_size={rollout_ws}"
+        )
 
     def _count_fresh_chunks(self, candidates, cutoff: int) -> int:
         """Count fresh chunk-steps across candidate trajectories (readiness phase 2)."""

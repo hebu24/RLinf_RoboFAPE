@@ -38,3 +38,24 @@ def test_milestone_save_removes_previous_rolling_checkpoint(tmp_path):
     assert {path.name for path in tmp_path.iterdir()} == {
         "global_step_100_trainenvstep_10000"
     }
+
+
+def test_prune_rolling_checkpoints_keeps_explicit_permanent_step(tmp_path):
+    for step in (10, 15, 20, 30):
+        _checkpoint(tmp_path, step)
+
+    removed = prune_rolling_checkpoints(
+        str(tmp_path),
+        current_step=30,
+        permanent_interval=50,
+        permanent_steps=[15],
+    )
+
+    assert {Path(path).name for path in removed} == {
+        "global_step_10_trainenvstep_1000",
+        "global_step_20_trainenvstep_2000",
+    }
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "global_step_15_trainenvstep_1500",
+        "global_step_30_trainenvstep_3000",
+    }

@@ -13,6 +13,7 @@ from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
 from rlinf.models.embodiment.reward.robometer_reward_model import RobometerEpisodeReward
+from rlinf.utils.utils import masked_mean, masked_mean_ratio
 from rlinf.workers.env.env_worker import EnvWorker
 
 
@@ -569,6 +570,7 @@ def _build_independent_worker(shaping: str = "delta", num_envs: int = 1) -> EnvW
     worker.train_num_envs_per_stage = num_envs
     worker.independent_rollout_windows = True
     worker._independent_window_forced_timeout_masks = [None]
+    worker._window_any_episode_success = [False]
     worker.last_obs_list = [None]
     worker.last_intervened_info_list = [(None, None)]
     worker._episode_chunk_ids = [torch.zeros(num_envs, dtype=torch.long)]
@@ -763,10 +765,13 @@ def test_assert_independent_forced_timeouts_settled_passes_and_raises():
     with pytest.raises(RuntimeError, match="settled as success"):
         worker._assert_independent_forced_timeouts_settled(0, forced, {0: bad})
 
-    # No chunk refs -> RuntimeError.
+    # No chunk refs (env auto-reset into an empty episode at the window
+    # boundary; previous episode was naturally completed + settled mid-window)
+    # -> SKIPPED, not a dropped trajectory. Must NOT raise even with no
+    # assignment, because there is no window trajectory to settle.
     worker._window_chunk_refs = [[]]
-    with pytest.raises(RuntimeError, match="no window chunk refs"):
-        worker._assert_independent_forced_timeouts_settled(0, forced, {0: ok})
+    worker._assert_independent_forced_timeouts_settled(0, forced, {0: ok})
+    worker._assert_independent_forced_timeouts_settled(0, forced, {})
 
 
 def test_assign_history_reward_delta_applies_failure_penalty_to_forced_timeout(
@@ -863,6 +868,69 @@ def test_prefetch_train_bootstrap_disabled_in_independent_mode():
     worker._bootstrap_and_send_train = _fail
     worker.prefetch_train_bootstrap(rollout_channel=None)
     assert worker._prefetched_train_bootstrap is None
+
+
+def test_skip_zero_success_windows_masks_all_fail_trajectory():
+    """SR==0 window (no episode succeeded) -> whole trajectory loss_mask all
+    False so the actor's masked_mean loss is 0 (no-op update); metric flags it."""
+    worker = _build_independent_worker("delta", num_envs=1)
+    worker.rollout_results[0] = EmbodiedRolloutResult(max_episode_length=8)
+    # Two chunks with some True loss_mask (would normally train).
+    worker.rollout_results[0].loss_mask = [
+        torch.tensor([[True, True], [True, False]]),
+        torch.tensor([[False, True], [True, True]]),
+    ]
+    worker._window_any_episode_success[0] = False  # window SR == 0
+
+    env_metrics: defaultdict[str, list] = defaultdict(list)
+    worker._skip_zero_success_windows(env_metrics)
+
+    # All loss_mask entries now False (trajectory excluded from the gradient).
+    for lm in worker.rollout_results[0].loss_mask:
+        assert not bool(lm.any())
+    assert float(env_metrics["window/skipped_zero_success"][0].item()) == 1.0
+
+
+def test_skip_zero_success_windows_keeps_successful_trajectory():
+    """Window with at least one success -> loss_mask untouched; metric = 0."""
+    worker = _build_independent_worker("delta", num_envs=1)
+    worker.rollout_results[0] = EmbodiedRolloutResult(max_episode_length=8)
+    original = [
+        torch.tensor([[True, True], [True, False]]),
+        torch.tensor([[False, True], [True, True]]),
+    ]
+    worker.rollout_results[0].loss_mask = [t.clone() for t in original]
+    worker._window_any_episode_success[0] = True  # window had a success
+
+    env_metrics: defaultdict[str, list] = defaultdict(list)
+    worker._skip_zero_success_windows(env_metrics)
+
+    # loss_mask unchanged.
+    for got, exp in zip(worker.rollout_results[0].loss_mask, original):
+        torch.testing.assert_close(got, exp)
+    assert float(env_metrics["window/skipped_zero_success"][0].item()) == 0.0
+
+
+def test_masked_mean_and_ratio_safe_on_all_false_mask():
+    """masked_mean already returns 0 for all-False mask; masked_mean_ratio clamps
+    loss_mask_ratio to avoid div-by-zero, so an all-fail (fully-masked) batch
+    yields a finite 0-grad no-op update (no inf/nan)."""
+    values = torch.tensor([1.0, 2.0, 3.0])
+    mask = torch.tensor([False, False, False])
+    torch.testing.assert_close(masked_mean(values, mask), torch.tensor(0.0))
+    # Scalar loss_mask_ratio == 0 -> clamped, mask zeroes it -> 0 (scalar mean).
+    out = masked_mean_ratio(values, mask, torch.tensor(0.0))
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, torch.tensor(0.0))
+    # Multi-element (per-batch) loss_mask_ratio with a zero entry -> no crash
+    # (the bug that took down the delta-fresh run: float() on a multi-element
+    # tensor). Masked batch contributes 0, no inf/nan.
+    values2d = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    mask2d = torch.tensor([[True, True], [False, False]])
+    ratio = torch.tensor([0.5, 0.0])  # batch 1 fully masked
+    out2 = masked_mean_ratio(values2d, mask2d, ratio)
+    assert torch.isfinite(out2).all()
+
 
 
 @pytest.mark.parametrize(

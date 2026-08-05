@@ -1,6 +1,9 @@
+import asyncio
+
 import pytest
 
 from rlinf.workers.rollout.hf.async_huggingface_worker import (
+    AsyncMultiStepRolloutWorker,
     rollout_episode_capacity,
 )
 
@@ -43,3 +46,25 @@ def test_rollout_capacity_rejects_nonpositive_store_size():
             total_num_train_envs=8,
             rollout_epoch=1,
         )
+
+
+def test_credit_refill_allows_replacement_without_version_advance():
+    class _Work:
+        async def async_wait(self):
+            return 2
+
+    class _Channel:
+        def get(self, **kwargs):
+            assert kwargs["key"] == "0_0_rollout_credit"
+            assert kwargs["async_op"] is True
+            return _Work()
+
+    worker = object.__new__(AsyncMultiStepRolloutWorker)
+    worker._rank = 0
+    worker._rollout_credits = 0
+    worker._rollout_credit_waits = 0
+    worker.log_info = lambda *_args, **_kwargs: None
+
+    asyncio.run(worker._acquire_rollout_credit(_Channel()))
+    assert worker._rollout_credits == 1
+    assert worker._rollout_credit_waits == 1

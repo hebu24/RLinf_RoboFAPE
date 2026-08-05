@@ -53,6 +53,8 @@ runner:
   val_check_interval: 10
   save_interval: 10
   checkpoint_permanent_interval: 50
+  checkpoint_permanent_steps: [15]
+  save_critic_warmup_checkpoint: true
   resume_dir: null
   ckpt_path: null
 
@@ -68,8 +70,11 @@ algorithm:
   # chunk_mask: keep the WHOLE completed episode for GAE + Robometer reward
   # reconstruction, only mask stale CHUNKS out of loss/reward aggregation (do
   # NOT drop the trajectory by versions.min()). The actor readiness loop uses a
-  # two-phase all_reduce(MIN) collective (peek/take/discard_topn) so every rank
-  # has a fresh chunk before take_topn. Default "trajectory" keeps legacy behavior.
+  # two-phase all_reduce(MIN) collective (peek/take/discard_topn). Intentionally
+  # all-masked zero-success shards are valid no-ops; only trainable-but-stale
+  # shards are discarded. Actor take/discard returns bounded production credits
+  # to rollout workers, preventing the actor-version/capacity circular wait.
+  # Default "trajectory" keeps legacy behavior.
   staleness_filter_mode: chunk_mask
   # Keyed routing: each env worker shards completed episodes to a per-actor-rank
   # dedicated channel key (CommMapper.get_dst_ranks/build_channel_key), so no two
@@ -171,7 +176,7 @@ actor:
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 30        # preserve the latest 16-episode Absolute regime
+    critic_warmup_steps: 15        # preserve the latest 16-episode Absolute regime
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"   # shard the ~4B model+optim across the RL GPUs (shared xulab GPUs have limited free mem)
@@ -192,6 +197,8 @@ reward:
   reward_weight: 1.0
   group_name: "RewardGroup"
   shaping: absolute               # absolute | delta ; delta = per-chunk (progress_{i+1} - progress_i) + success_bonus*1[success_i]
+  absolute:
+    success_terminal_bonus: 60.0
   delta:
     success_bonus: 0.1            # C: bonus added to every success chunk in delta mode (delta telescopes to ~1.0; ~20 success chunks -> bonus ~2.0)
   model:

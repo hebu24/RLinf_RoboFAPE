@@ -56,6 +56,11 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         super().__init__(cfg, actor, rollout, env, reward=reward, critic=critic)
         self.env_metric_channel = Channel.create("EnvMetric")
         self.rollout_metric_channel = Channel.create("RolloutMetric")
+        self.rollout_credit_channel = Channel.create("RolloutCredit")
+        self.use_rollout_credit = (
+            self.cfg.algorithm.get("staleness_filter_mode", "trajectory")
+            == "chunk_mask"
+        )
         self.recompute_logprobs = bool(
             self.cfg.rollout.get("recompute_logprobs", False)
         )
@@ -68,6 +73,17 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             self.cfg.runner.get("stop_on_first_ev_nan", False)
         )
         self.stop_reason: str | None = None
+        self.save_critic_warmup_checkpoint = bool(
+            self.cfg.runner.get("save_critic_warmup_checkpoint", False)
+        )
+        self.critic_warmup_checkpoint_step = int(
+            self.cfg.actor.optim.get("critic_warmup_steps", 0)
+        )
+        if self.save_critic_warmup_checkpoint and self.critic_warmup_checkpoint_step <= 0:
+            self.logger.warning(
+                "save_critic_warmup_checkpoint is enabled but "
+                "actor.optim.critic_warmup_steps <= 0; no warmup checkpoint will be saved."
+            )
 
     def get_rollout_metrics(self) -> tuple[dict, list[dict]]:
         results: list[dict] = []
@@ -146,6 +162,9 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
             metric_channel=self.rollout_metric_channel,
+            credit_channel=(
+                self.rollout_credit_channel if self.use_rollout_credit else None
+            ),
         )
         reward_handle: Handle | None = None
         if self.reward is not None:
@@ -155,7 +174,10 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             )
 
         actor_handle: Handle = self.actor.recv_rollout_trajectories(
-            input_channel=self.actor_channel
+            input_channel=self.actor_channel,
+            credit_channel=(
+                self.rollout_credit_channel if self.use_rollout_credit else None
+            ),
         )
 
         while self.global_step < self.max_steps:
@@ -321,7 +343,20 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                 1.0,
                 run_time_exceeded=False,
             )
-            if save_model:
+            is_critic_warmup_boundary = (
+                self.save_critic_warmup_checkpoint
+                and self.critic_warmup_checkpoint_step > 0
+                and self.global_step == self.critic_warmup_checkpoint_step
+            )
+
+            if is_critic_warmup_boundary:
+                self.logger.info(
+                    "Saving permanent post-critic-warmup checkpoint at step %s.",
+                    self.global_step,
+                )
+                self._save_checkpoint()
+
+            if save_model and not is_critic_warmup_boundary:
                 self._save_checkpoint()
 
             if profiled_step is not None:

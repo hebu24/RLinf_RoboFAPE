@@ -328,9 +328,15 @@ def seq_mean_token_sum(values: torch.Tensor, mask: torch.Tensor, dim: int = -1):
 
 
 def seq_mean_token_mean(values: torch.Tensor, mask: torch.Tensor, dim: int = -1):
-    seq_losses = torch.sum(values * mask, dim=-1) / torch.sum(
-        mask, dim=-1
-    )  # token-mean
+    token_sums = torch.sum(mask, dim=-1)
+    # Guard div-by-zero when a sequence is fully masked (e.g. an all-fail
+    # window skipped via loss_mask=False): yield 0 for that sequence so the
+    # seq-mean stays finite instead of nan.
+    safe = token_sums.clamp(min=1)
+    seq_losses = torch.sum(values * mask, dim=-1) / safe  # token-mean
+    seq_losses = torch.where(
+        token_sums > 0, seq_losses, torch.zeros_like(seq_losses)
+    )
     loss = torch.mean(seq_losses)  # seq-mean
     return loss
 
@@ -338,7 +344,16 @@ def seq_mean_token_mean(values: torch.Tensor, mask: torch.Tensor, dim: int = -1)
 def masked_mean_ratio(
     values: torch.Tensor, mask: torch.Tensor, loss_mask_ratio: torch.Tensor
 ):
-    # for embodied tasks
+    # for embodied tasks. loss_mask_ratio may be a scalar OR a per-batch
+    # tensor; guard div-by-zero (zero entries = fully-masked batch, e.g. an
+    # all-fail window skipped via loss_mask=False) by clamping to a tiny
+    # epsilon. The mask zeroes those entries (finite * 0 = 0), so the result
+    # is 0 for the masked batch -> 0-grad no-op update, no inf/nan.
+    if loss_mask_ratio is not None:
+        if torch.is_tensor(loss_mask_ratio):
+            loss_mask_ratio = loss_mask_ratio.clamp(min=1e-8)
+        elif float(loss_mask_ratio) == 0:
+            loss_mask_ratio = 1e-8
     return (values / loss_mask_ratio * mask).mean()
 
 

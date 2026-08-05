@@ -13,7 +13,7 @@ import torch
 
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.priority_store import PriorityStore
-from rlinf.data.staleness_mask import count_fresh_chunks
+from rlinf.data.staleness_mask import candidate_batch_is_usable, count_fresh_chunks
 
 
 def _traj(versions_1d, loss_mask_1d):
@@ -100,3 +100,19 @@ def test_readiness_min_fresh_chunks_threshold_logic():
     stats2 = count_fresh_chunks([traj2], cutoff=9)
     assert stats2["fresh"] == 3
     assert stats2["fresh"] >= 2
+
+
+def test_all_masked_candidate_is_noop_not_stale():
+    traj = _traj([10, 10, 10], [False, False, False])
+    stats = count_fresh_chunks([traj], cutoff=10)
+    assert stats["trainable"] == 0
+    assert stats["fresh"] == 0
+    assert candidate_batch_is_usable(stats, min_fresh_chunks=1)
+
+
+def test_trainable_all_stale_candidate_is_not_usable():
+    traj = _traj([8, 8, 8], [True, True, True])
+    stats = count_fresh_chunks([traj], cutoff=10)
+    assert stats["trainable"] == 3
+    assert stats["fresh"] == 0
+    assert not candidate_batch_is_usable(stats, min_fresh_chunks=1)

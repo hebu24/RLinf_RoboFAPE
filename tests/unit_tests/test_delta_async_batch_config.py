@@ -58,8 +58,6 @@ def _assert_16_episode_one_optimizer_batch(cfg) -> None:
         == 0
     )
     assert float(cfg.actor.optim.lr) == 3e-7
-    assert int(cfg.actor.optim.critic_warmup_steps) == 50
-    assert float(cfg.reward.delta.failure_terminal_penalty) == -0.4
     assert "value_loss_coef" not in cfg.algorithm
     assert bool(cfg.actor.model.openpi.detach_critic_input)
     assert int(cfg.actor.grad_diagnostics_interval) == 0
@@ -75,6 +73,8 @@ def test_delta_async_update_uses_16_window_local_episodes_and_one_optimizer_step
     not necessarily 16 natural completions."""
     cfg = OmegaConf.load(CONTINUOUS_CONFIG_PATH)
     _assert_16_episode_one_optimizer_batch(cfg)
+    assert int(cfg.actor.optim.critic_warmup_steps) == 50
+    assert float(cfg.reward.delta.failure_terminal_penalty) == -0.4
     # Continuous (legacy) config does not opt into independent windows.
     assert cfg.env.train.get("rollout_window_mode", "continuous") == "continuous"
 
@@ -84,9 +84,14 @@ def test_independent_window_delta_config():
     while preserving the 16-episode / one-optimizer-step batch."""
     cfg = OmegaConf.load(INDEPENDENT_CONFIG_PATH)
     _assert_16_episode_one_optimizer_batch(cfg)
+    assert int(cfg.actor.optim.critic_warmup_steps) == 15
+    assert float(cfg.reward.delta.failure_terminal_penalty) == -1.0
     assert cfg.env.train.rollout_window_mode == "independent"
     assert bool(cfg.env.train.auto_reset)
     assert cfg.reward.history_train_mode == "rollout_window"
     assert bool(cfg.reward.history_reward_assign)
     # experiment/log name must distinguish from legacy continuous-window runs.
     assert "independent_window" in cfg.runner.logger.experiment_name
+    # warmup-end permanent checkpoint (step 15) for clean resume.
+    assert bool(cfg.runner.get("save_critic_warmup_checkpoint"))
+    assert 15 in list(cfg.runner.get("checkpoint_permanent_steps", []))

@@ -29,6 +29,19 @@ from typing import Any
 import torch
 
 
+def candidate_batch_is_usable(stats: dict, min_fresh_chunks: int) -> bool:
+    """Return whether a candidate batch can safely enter the actor collective.
+
+    An all-masked batch is an intentional no-op (for example, a skipped
+    zero-success window), not stale data. A batch with trainable chunks is usable
+    only when it contains the configured minimum number of fresh chunks.
+    """
+    return bool(
+        int(stats.get("trainable", 0)) == 0
+        or int(stats.get("fresh", 0)) >= int(min_fresh_chunks)
+    )
+
+
 def compute_staleness_mask(
     rollout_batch: dict[str, Any],
     actor_version: int,

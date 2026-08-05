@@ -165,6 +165,11 @@ class EnvWorker(Worker):
             # chunks). Delta mode POSTs chunk-boundary frames instead of a uniformly
             # down-sampled video; see reconstruct_robometer_delta_reward.
             self.reward_shaping = self.cfg.reward.get("shaping", "absolute")
+            self.absolute_success_terminal_bonus = float(
+                self.cfg.reward.get("absolute", {}).get(
+                    "success_terminal_bonus", 0.0
+                )
+            )
             self.delta_success_bonus = float(
                 self.cfg.reward.get("delta", {}).get("success_bonus", 0.1)
             )
@@ -217,6 +222,10 @@ class EnvWorker(Worker):
         self._independent_window_forced_timeout_masks: list[torch.Tensor | None] = [
             None
         ] * self.stage_num
+        # Per-stage flag: True iff any episode in the current window succeeded
+        # (any assignment.episode_success). Reset each window in
+        # _reset_window_chunk_refs. Used to mask (skip) SR==0 all-fail windows.
+        self._window_any_episode_success: list[bool] = [False] * self.stage_num
 
         self.train_enable_offload = (
             train_env_cfg.get("enable_offload", False)
@@ -386,6 +395,9 @@ class EnvWorker(Worker):
         self._window_chunk_funnel = [
             self._new_chunk_funnel_state() for _ in range(self.stage_num)
         ]
+        # Reset the per-window success flag (set True by assign_history_reward
+        # when any episode succeeds; used to skip SR==0 all-fail windows).
+        self._window_any_episode_success = [False] * self.stage_num
 
     @staticmethod
     def _new_chunk_funnel_state() -> dict[str, Any]:
@@ -1587,6 +1599,9 @@ class EnvWorker(Worker):
                     fail_shift=fail_shift,
                     chunk_size=chunk_size,
                     total_chunks=total_chunks,
+                    success_terminal_bonus=getattr(
+                        self, "absolute_success_terminal_bonus", 0.0
+                    ),
                 )
             if __import__("os").environ.get("RLINF_REWARD_DEBUG"):
                 try:
@@ -1987,16 +2002,19 @@ class EnvWorker(Worker):
         forced_timeout: torch.Tensor,
         assignments: dict[int, "RobometerEpisodeReward"],
     ) -> None:
-        """Verify every forced-timeout env was settled by the Robometer query.
+        """Verify every forced-timeout env WITH a window trajectory was settled.
 
         Forbids silently dropping unfinished trajectories. ``assign_history_reward``
         pops ``_last_history_query_info[stage]`` internally, so the authoritative
-        record of what was settled is the returned ``assignments`` dict: each
-        forced env must have an entry, that entry must be a failure
-        (``episode_success is False`` — a synthetic truncation must never look
-        like a task success), and its window chunk refs must be non-empty. Raises
-        ``RuntimeError`` (never a silent skip) with enough context to debug the
-        funnel.
+        record of what was settled is the returned ``assignments`` dict: each forced
+        env whose current episode has window chunk refs must have an assignment, and
+        that assignment must be a failure (``episode_success is False`` — a synthetic
+        truncation must never look like a task success). A forced env whose current
+        episode has 0 window chunk refs is SKIPPED: it auto-reset into a fresh
+        episode at the boundary (its previous episode was naturally completed +
+        settled mid-window), so there is no trajectory in this window to drop.
+        Raises ``RuntimeError`` (never a silent skip) with enough context to debug
+        the funnel.
         """
         forced_env_ids = (
             torch.nonzero(forced_timeout, as_tuple=False).flatten().tolist()
@@ -2006,6 +2024,13 @@ class EnvWorker(Worker):
             chunk_refs = tuple(
                 self._window_chunk_slices_for_episode(stage_id, env_id, episode_id)
             )
+            if not chunk_refs:
+                # Forced-timeout env whose current episode has 0 window chunks:
+                # it auto-reset into a fresh episode right at the boundary (its
+                # previous episode was naturally completed + settled mid-window).
+                # There is no trajectory in this window to settle, so this is
+                # NOT a dropped trajectory — skip it (keep checking the rest).
+                continue
             assignment = assignments.get(env_id)
             if assignment is None:
                 raise RuntimeError(
@@ -2020,12 +2045,31 @@ class EnvWorker(Worker):
                     f"(stage {stage_id}, episode {episode_id}) settled as "
                     "success; synthetic truncation must be a failure."
                 )
-            if not chunk_refs:
-                raise RuntimeError(
-                    f"[independent-window] forced-timeout env {env_id} "
-                    f"(stage {stage_id}, episode {episode_id}) has no window "
-                    "chunk refs; the trajectory has no policy steps to cover."
-                )
+
+    def _skip_zero_success_windows(
+        self, env_metrics: dict[str, list]
+    ) -> None:
+        """Mask (skip) SR==0 all-fail windows before sending trajectories.
+
+        For each stage whose current window had NO successful episode
+        (``_window_any_episode_success[stage_id]`` is False, i.e. window-level
+        ``episode_success_rate == 0``), set the whole trajectory's per-chunk
+        ``loss_mask`` to False. The actor's token-mean loss (``masked_mean``)
+        then returns 0 for those chunks -> 0 gradient -> the all-fail batch is a
+        no-op update (the policy does not move on noise-only failures), without
+        breaking the FSDP collective (backward still runs with 0 grad). Stages
+        with at least one success keep their loss_mask untouched.
+        """
+        for stage_id in range(self.stage_num):
+            skipped = not self._window_any_episode_success[stage_id]
+            if skipped:
+                rollout_result = self.rollout_results[stage_id]
+                for lm in rollout_result.loss_mask:
+                    if lm is not None:
+                        lm.fill_(False)
+            env_metrics["window/skipped_zero_success"].append(
+                torch.tensor([1.0 if skipped else 0.0], dtype=torch.float32)
+            )
 
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
@@ -2219,6 +2263,10 @@ class EnvWorker(Worker):
                             assignments
                         ).items():
                             env_metrics[key].append(values)
+                        if any(
+                            a.episode_success for a in assignments.values()
+                        ):
+                            self._window_any_episode_success[stage_id] = True
                     if rollout_result.save_flags is not None:
                         self.rollout_results[stage_id].mark_last_step_with_flags(
                             rollout_result.save_flags
@@ -2326,6 +2374,10 @@ class EnvWorker(Worker):
                             assignments
                         ).items():
                             env_metrics[key].append(values)
+                        if any(
+                            a.episode_success for a in assignments.values()
+                        ):
+                            self._window_any_episode_success[stage_id] = True
                     # Independent windows: every forced-timeout env MUST be
                     # settled here. If reward_model_output was None (no Robometer
                     # query) assignments stays empty and this fires, surfacing
@@ -2353,6 +2405,14 @@ class EnvWorker(Worker):
                 self._record_window_chunk_ref(
                     stage_id, env_output, has_rewards=rewards is not None
                 )
+
+            # Independent windows: skip SR==0 all-fail windows by masking the
+            # whole trajectory's loss_mask False (no episode succeeded this
+            # window). The actor's token-mean loss (masked_mean) then returns 0
+            # for these chunks -> 0 grad -> no-op update (the all-fail batch
+            # does not move the policy), without breaking the FSDP collective.
+            if self.independent_rollout_windows:
+                self._skip_zero_success_windows(env_metrics)
 
             if self.use_training_pipeline and actor_channel is not None:
                 send_results: list[EmbodiedRolloutResult | Trajectory]

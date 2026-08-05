@@ -384,6 +384,7 @@ def reconstruct_robometer_episode_reward(
     fail_shift: float,
     chunk_size: int,
     total_chunks: int,
+    success_terminal_bonus: float = 0.0,
 ) -> RobometerEpisodeReward:
     """Reconstruct low-level and chunk-aligned reward for a completed episode."""
     if chunk_size <= 0 or total_chunks <= 0:
@@ -410,6 +411,13 @@ def reconstruct_robometer_episode_reward(
     per_step_reward = _apply_stepwise_success_shift(
         per_step_progress, insert_success, fail_shift=fail_shift
     )
+    episode_success = bool(insert_success.any())
+    if episode_success:
+        # 将 bonus 加在第一次达到环境真实成功的低层 action 上，而不是
+        # 任意 Robometer 高进度帧上；success_trace 来自环境 sticky success。
+        first_success_step = int(np.flatnonzero(insert_success)[0])
+        per_step_reward[first_success_step] += float(success_terminal_bonus)
+
     capacity = total_chunks * chunk_size
     if per_step_reward.shape[0] > capacity:
         raise ValueError(
@@ -428,9 +436,12 @@ def reconstruct_robometer_episode_reward(
         per_step_loss_mask=per_step_loss_mask,
         chunk_reward=chunk_reward,
         chunk_loss_mask=chunk_loss_mask,
-        episode_success=bool(insert_success.any()),
+        episode_success=episode_success,
         initial_progress=float(per_step_progress[0]),
         final_progress=float(per_step_progress[-1]),
+        success_bonus_sum=(
+            float(success_terminal_bonus) if episode_success else 0.0
+        ),
     )
 
 

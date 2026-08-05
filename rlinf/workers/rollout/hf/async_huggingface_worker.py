@@ -21,6 +21,7 @@ from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
 from rlinf.scheduler import Channel, Worker
+from rlinf.scheduler.worker.routing import CommMapper
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -51,6 +52,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self.rollout_store_size_per_rank = int(
             cfg.algorithm.get("rollout_store_size_per_rank", 1)
         )
+        self._rollout_credits = self.rollout_store_size_per_rank
+        self._rollout_credit_waits = 0
         # set the decoupled rollout worker sync weight time
         self.sync_rollout_weight_time = (
             self.num_pipeline_stages * self.n_train_chunk_steps * self.rollout_epoch
@@ -93,12 +96,15 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         input_channel: Channel,
         output_channel: Channel,
         metric_channel: Channel,
+        credit_channel: Channel | None = None,
     ):
         assert self._generate_task is None, (
             "generate task is not None but generate function is called."
         )
         self._generate_task = asyncio.create_task(
-            self._generate(input_channel, output_channel, metric_channel)
+            self._generate(
+                input_channel, output_channel, metric_channel, credit_channel
+            )
         )
         try:
             await self._generate_task
@@ -110,6 +116,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         input_channel: Channel,
         output_channel: Channel,
         metric_channel: Channel,
+        credit_channel: Channel | None = None,
     ):
         if self.env_decoupled_mode:
             await self.decoupled_generate_one_epoch(input_channel, output_channel)
@@ -117,7 +124,10 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             while True:
                 if self._background_weight_sync_active:
                     await self._poll_background_weight_sync()
-                await self.wait_if_stale()
+                if credit_channel is None:
+                    await self.wait_if_stale()
+                else:
+                    await self._acquire_rollout_credit(credit_channel)
                 for _ in range(self.rollout_epoch):
                     await self.generate_one_epoch(input_channel, output_channel)
                 if self.finished_episodes is not None:
@@ -132,6 +142,30 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     {"rank": self._rank, "time": rollout_metrics},
                     async_op=True,
                 )
+
+    async def _acquire_rollout_credit(self, credit_channel: Channel) -> None:
+        """Consume one actor-issued credit before producing a rollout window.
+
+        Credits bound the number of windows in flight. The actor returns credits
+        when trajectories are consumed or explicitly discarded, so a readiness
+        retry can always trigger replacement production without waiting for the
+        actor version to advance.
+        """
+        while self._rollout_credits <= 0:
+            self._rollout_credit_waits += 1
+            key = CommMapper.build_channel_key(
+                self._rank, self._rank, "rollout_credit"
+            )
+            amount = await credit_channel.get(key=key, async_op=True).async_wait()
+            amount = int(amount)
+            if amount <= 0:
+                raise ValueError(f"Rollout credit must be positive, got {amount}")
+            self._rollout_credits += amount
+            self.log_info(
+                f"received rollout credits rank={self._rank} amount={amount} "
+                f"available={self._rollout_credits} waits={self._rollout_credit_waits}"
+            )
+        self._rollout_credits -= 1
 
     async def wait_if_stale(self) -> None:
         if self.staleness_threshold is None:

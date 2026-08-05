@@ -14,6 +14,42 @@ from rlinf.models.embodiment.reward.robometer_reward_model import (
 )
 
 
+def test_absolute_reward_applies_terminal_bonus_only_to_success():
+    successful = reconstruct_robometer_episode_reward(
+        [0.2, 0.8],
+        history_len=2,
+        pickup_count=0,
+        success_trace=[False, True],
+        max_frames=2,
+        fail_shift=1.0,
+        chunk_size=2,
+        total_chunks=1,
+        success_terminal_bonus=3.0,
+    )
+    failed = reconstruct_robometer_episode_reward(
+        [0.2, 0.8],
+        history_len=2,
+        pickup_count=0,
+        success_trace=[False, False],
+        max_frames=2,
+        fail_shift=1.0,
+        chunk_size=2,
+        total_chunks=1,
+        success_terminal_bonus=3.0,
+    )
+
+    np.testing.assert_allclose(
+        successful.per_step_reward,
+        np.array([-0.8, 3.8], dtype=np.float32),
+    )
+    assert successful.success_bonus_sum == pytest.approx(3.0)
+
+    np.testing.assert_allclose(
+        failed.per_step_reward,
+        np.array([-0.8, -0.2], dtype=np.float32),
+    )
+    assert failed.success_bonus_sum == pytest.approx(0.0)
+
 def test_resolve_env_success_prefers_final_info_episode_success_once():
     env_infos = {
         "final_info": {"episode": {"success_once": np.array([True, False])}},

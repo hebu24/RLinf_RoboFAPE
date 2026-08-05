@@ -20,7 +20,7 @@ import shutil
 import threading
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Collection, Union
 
 from omegaconf.dictconfig import DictConfig
 
@@ -42,14 +42,20 @@ def prune_rolling_checkpoints(
     checkpoints_dir: str,
     current_step: int,
     permanent_interval: int,
+    permanent_steps: Collection[int] = (),
 ) -> list[str]:
     """Remove superseded rolling checkpoints after a successful save.
 
-    Checkpoints at multiples of ``permanent_interval`` are retained forever.
+    Checkpoints at multiples of ``permanent_interval`` and explicitly listed
+    ``permanent_steps`` are retained forever.
     Among other checkpoints, only ``current_step`` is retained. Directory names
     that do not match RLinf's checkpoint naming scheme are left untouched.
     """
-    if permanent_interval <= 0 or not os.path.isdir(checkpoints_dir):
+    if not os.path.isdir(checkpoints_dir):
+        return []
+
+    permanent_steps = {int(step) for step in permanent_steps}
+    if permanent_interval <= 0 and not permanent_steps:
         return []
 
     removed = []
@@ -60,7 +66,10 @@ def prune_rolling_checkpoints(
         if match is None:
             continue
         step = int(match.group(1))
-        if step == current_step or step % permanent_interval == 0:
+        is_interval_milestone = (
+            permanent_interval > 0 and step % permanent_interval == 0
+        )
+        if step == current_step or step in permanent_steps or is_interval_milestone:
             continue
         shutil.rmtree(entry.path)
         removed.append(entry.path)
@@ -757,11 +766,13 @@ class EmbodiedRunner:
         permanent_interval = int(
             self.cfg.runner.get("checkpoint_permanent_interval", 0)
         )
+        permanent_steps = self.cfg.runner.get("checkpoint_permanent_steps", [])
         checkpoints_dir = os.path.dirname(base_output_dir)
         removed = prune_rolling_checkpoints(
             checkpoints_dir=checkpoints_dir,
             current_step=self.global_step,
             permanent_interval=permanent_interval,
+            permanent_steps=permanent_steps,
         )
         for checkpoint_path in removed:
             self.logger.info("Removed superseded checkpoint %s", checkpoint_path)

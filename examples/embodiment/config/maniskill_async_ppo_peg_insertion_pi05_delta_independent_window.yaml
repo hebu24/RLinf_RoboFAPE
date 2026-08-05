@@ -66,6 +66,8 @@ runner:
   val_check_interval: 10
   save_interval: 10
   checkpoint_permanent_interval: 50
+  checkpoint_permanent_steps: [15]      # retain the post-warmup (step 15) ckpt forever
+  save_critic_warmup_checkpoint: true   # force-save at global_step==critic_warmup_steps (15)
   resume_dir: null
   ckpt_path: null
 
@@ -83,8 +85,11 @@ algorithm:
   # chunk_mask: keep the WHOLE completed episode for GAE + Robometer reward
   # reconstruction, only mask stale CHUNKS out of loss/reward aggregation (do
   # NOT drop the trajectory by versions.min()). The actor readiness loop uses a
-  # two-phase all_reduce(MIN) collective (peek/take/discard_topn) so every rank
-  # has a fresh chunk before take_topn. Default "trajectory" keeps legacy behavior.
+  # two-phase all_reduce(MIN) collective (peek/take/discard_topn). Intentionally
+  # all-masked zero-success shards are valid no-ops; only trainable-but-stale
+  # shards are discarded. Actor take/discard returns bounded production credits
+  # to rollout workers, preventing the actor-version/capacity circular wait.
+  # Default "trajectory" keeps legacy behavior.
   staleness_filter_mode: chunk_mask
   # Keyed routing: each env worker shards completed episodes to a per-actor-rank
   # dedicated channel key (CommMapper.get_dst_ranks/build_channel_key), so no two
@@ -194,7 +199,7 @@ actor:
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 50        # one optimizer step/version: preserve ~50-version warmup
+    critic_warmup_steps: 15        # one optimizer step/version: warmup ends at step 15 (saved permanent ckpt)
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"   # shard the ~4B model+optim across the RL GPUs (shared xulab GPUs have limited free mem)
@@ -217,7 +222,7 @@ reward:
   shaping: delta                  # per-chunk progress delta plus an env-success bonus
   delta:
     success_bonus: 1.0            # make true task success dominate Robometer delta noise
-    failure_terminal_penalty: -0.4  # applied once to the final chunk of an unsuccessful episode (incl. synthetic timeouts)
+    failure_terminal_penalty: -1.0  # applied once to the final chunk of an unsuccessful episode (incl. synthetic timeouts); raised from -0.4 to sharpen the success/failure gap
   model:
     model_type: robometer
     server_url: "http://127.0.0.1:8000"
