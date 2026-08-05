@@ -198,12 +198,13 @@ bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
   algorithm.rollout_store_wait_timeout_s=1800
 ```
 
-For `reward.shaping=delta` instead, export
-`CONFIG_NAME=maniskill_async_ppo_peg_insertion_pi05_delta` and add the Hydra
-overrides `reward.shaping=delta reward.model.server_url=http://127.0.0.1:8001`
-(delta uses a second Robometer server on `:8001`; see §3.5). The launcher
-auto-selects the `_delta` config when `reward.shaping=delta` is passed, but
-setting `CONFIG_NAME` explicitly is clearer for concurrent runs.
+For the active `reward.shaping=delta` setting, export
+`CONFIG_NAME=maniskill_async_ppo_peg_insertion_pi05_delta_independent_window`
+and add the Hydra overrides
+`reward.shaping=delta reward.model.server_url=http://127.0.0.1:8001` (delta
+uses a second Robometer server on `:8001`; see §3.5). The launcher auto-selects
+the legacy `_delta` config when `reward.shaping=delta` is passed, so set
+`CONFIG_NAME` explicitly for the independent-window training settings.
 
 Useful Hydra overrides:
 
@@ -460,7 +461,7 @@ run's scoped teardown touches only its own head.
 | run | shaping | GPUs | GCS port | dashboard | agent | worker ports | robometer | CONFIG_NAME |
 |---|---|---|---|---|---|---|---|---|
 | A | `absolute` | 0,1 | `6384` | `8264` | `52370` | `10002-10399` | `:8000` (GPU 0) | `maniskill_async_ppo_peg_insertion_pi05` |
-| B | `delta` | 2,3 | `6386` | `8266` | `52372` | `13000-13399` | `:8001` (GPU 2) | `maniskill_async_ppo_peg_insertion_pi05_delta` |
+| B | `delta` | 2,3 | `6386` | `8266` | `52372` | `13000-13399` | `:8001` (GPU 2) | `maniskill_async_ppo_peg_insertion_pi05_delta_independent_window` |
 
 Launch order: Robometer `:8000` → Robometer `:8001` → wait for both `/health` →
 Run A → Run B (A/B order does not matter — ports are distinct). Each
@@ -468,8 +469,9 @@ Run A → Run B (A/B order does not matter — ports are distinct). Each
 `tmux attach -t rl_abs_independent_window_gpu01` / `rl_delta_independent_window_gpu23`
 (detach: `Ctrl-b d`). The launcher auto-selects the `_delta` config when
 `reward.shaping=delta` is passed, but `CONFIG_NAME` is set explicitly here so the
-pane-root cmdline is unambiguous. Both runs pass
-`env.train.rollout_window_mode=independent` so every window force-closes
+pane-root cmdline is unambiguous. Run A passes
+`env.train.rollout_window_mode=independent`; Run B uses the
+`_delta_independent_window` config, which encodes the same mode. Every window force-closes
 unfinished episodes, settles them via Robometer, then resets all train envs +
 clears history before the next window (see
 `ASYNC_INDEPENDENT_ROLLOUT_WINDOW_IMPLEMENTATION.md`).
@@ -507,20 +509,31 @@ tmux new-session -d -s rl_abs_independent_window_gpu01 -c /data/yingxi/RLinf_Rob
      reward.model.timeout_s=600 algorithm.rollout_store_wait_timeout_s=1800 \
    ; echo ===EXIT=\$?=== ; exec bash"
 
-# Step 2 — Run B: delta reward + independent windows, GPUs 2-3, port 6386
+# Step 2 — Run B: delta reward + independent windows, GPUs 2-3, port 6386.
+# The selected config contains the training settings listed below; do not add a
+# runner.resume_dir here unless deliberately continuing a prior run.
 tmux new-session -d -s rl_delta_independent_window_gpu23 -c /data/yingxi/RLinf_RoboFAPE \
   "cd /data/yingxi/RLinf_RoboFAPE && \
    CUDA_VISIBLE_DEVICES=2,3 \
    RL_RAY_PORT=6386 RAY_DASHBOARD_PORT=8266 RAY_DASHBOARD_AGENT_PORT=52372 \
    RAY_MIN_WORKER_PORT=13000 RAY_MAX_WORKER_PORT=13399 \
-   CONFIG_NAME=maniskill_async_ppo_peg_insertion_pi05_delta \
-   LOG_DIR=logs/\$(date +%Y%m%d-%H:%M:%S)-peg_insertion_rl_async_delta_independent_window_gpu23 \
+   CONFIG_NAME=maniskill_async_ppo_peg_insertion_pi05_delta_independent_window \
+   LOG_DIR=logs/\$(date +%Y%m%d-%H:%M:%S)-peg_insertion_rl_async_delta_independent_window_skip0_w15_p1_fresh_v3_gpu23 \
    bash run_train/peginsertion_maniskill_pi0.5/run_peg_insertion_rl_async.sh \
      reward.shaping=delta reward.model.server_url=http://127.0.0.1:8001 \
-     env.train.rollout_window_mode=independent \
      reward.model.timeout_s=600 algorithm.rollout_store_wait_timeout_s=1800 \
    ; echo ===EXIT=\$?=== ; exec bash"
 ```
+
+Run B's `maniskill_async_ppo_peg_insertion_pi05_delta_independent_window`
+configuration matches the active delta training: policy `lr=3e-7`,
+`value_lr=5e-5`, `critic_warmup_steps=15`, `micro_batch_size=8`,
+`global_batch_size=960`, 8 train environments, 600-step independent rollout
+windows, and 8 executed actions per chunk. It uses delta rewards with
+`success_bonus=1.0` and `failure_terminal_penalty=-1.0`. Async staleness uses
+`chunk_mask`, threshold 1, keyed actor routing, and
+`rollout_store_size_per_rank=2`; the launch override above sets the readiness
+timeout to 1800 seconds.
 
 The `LOG_DIR` names carry `independent_window` so these runs are
 distinguishable from legacy continuous-window runs at a glance. Each run writes
@@ -555,11 +568,12 @@ sleep 2
   (~20-40 GB) shares the GPU with Run A's FSDP workers. Monitor with
   `watch nvidia-smi`; if it OOMs, move the Robometer to a GPU outside both
   clusters (requires re-splitting) or lower Robometer `batch_size`.
-- **`staleness_filter_mode` desync (affects both runs):** the config defaults to
-  `trajectory` (stale trajectories are silently dropped → data-pipeline desync →
-  NCCL collective timeout). The `chunk_mask` mode is implemented but not yet
-  enabled. To enable for one run, add `algorithm.staleness_filter_mode=chunk_mask`;
-  validate it separately before flipping the default.
+- **Readiness and rollout credits (affects both runs):** the active configs use
+  `staleness_filter_mode=chunk_mask` and keyed actor routing. A consumed or
+  stale-discarded actor batch returns credits to rollout workers; verify
+  `returned rollout credits` and `received rollout credits` appear in `run.log`.
+  `rollout/staleness_global_retry_rounds` may be nonzero, but it must not lead to
+  a `rollout store readiness abort`.
 - **`RLINF_REWARD_DEBUG` logs:** set `RLINF_REWARD_DEBUG=1` plus a per-run
   `RLINF_REWARD_DEBUG_LOG` (the launch commands above use `_absolute.log` /
   `_delta.log`) so the two runs' reward-debug output lands in separate files
