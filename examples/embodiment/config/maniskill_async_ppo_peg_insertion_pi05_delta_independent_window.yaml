@@ -133,8 +133,11 @@ env:
     rollout_window_mode: independent  # force-close unfinished episodes + reset all envs/clear history at each window boundary
     use_fixed_reset_state_ids: True
     shared_reset_seed: True       # reproduce one SFT reset across every env/reset
-    max_episode_steps: 600
-    max_steps_per_rollout_epoch: 600
+    # One OpenPI action chunk spans 10 low-level actions. Bound an unsuccessful
+    # independent rollout window to 40 chunks so its terminal penalty and
+    # Robometer query are settled after 400 actions instead of 600.
+    max_episode_steps: 400
+    max_steps_per_rollout_epoch: 400
     execute_action_chunks: 8
     temporal_ensemble_weight: 0.01
   eval:
@@ -169,7 +172,11 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 8
-  global_batch_size: 960         # one optimizer step over all 16 episodes (60 chunks each)
+  # This 400-step / 40-chunk variant collects 16 window-local episodes per
+  # update: 16 * 40 = 640 chunk samples globally (320 per actor rank).  Keep
+  # the optimizer batch aligned with that collection shape; 960 is only valid
+  # for the 600-step / 60-chunk variants that override this setting.
+  global_batch_size: 640
   # Disabled: sampled diagnostics require repeated backward calls on one FSDP
   # graph, which can invalidate FSDP flat-parameter storage. PPO update
   # diagnostics below remain available without extra backward calls.
@@ -229,7 +236,7 @@ reward:
     task: "Insert the peg vertically into the target hole."
     timeout_s: 120.0
     use_frame_steps: False        # full sequence per POST (no 4-frame prefix expansion);
-    max_robometer_frames: 60      # uniform down-sample the full pick-up+insert buffer to <= this many frames per POST
+    max_robometer_frames: 40      # uniform down-sample the 40-chunk timeout window to <= this many frames per POST
     success_threshold: 0.5      # legacy/ignored for peg-insertion RL; success must come from env infos
     fail_shift: 1.0
     min_history_size: 2

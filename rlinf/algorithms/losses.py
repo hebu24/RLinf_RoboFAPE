@@ -25,6 +25,118 @@ _EXPLAINED_VARIANCE_REASON_TOO_FEW_SAMPLES = 1
 _EXPLAINED_VARIANCE_REASON_ZERO_RETURN_VARIANCE = 2
 _EXPLAINED_VARIANCE_REASON_NON_FINITE_VARIANCE = 3
 
+_EXPLAINED_VARIANCE_STAT_COUNT = 0
+_EXPLAINED_VARIANCE_STAT_RETURN_SUM = 1
+_EXPLAINED_VARIANCE_STAT_RETURN_SQUARE_SUM = 2
+_EXPLAINED_VARIANCE_STAT_ERROR_SUM = 3
+_EXPLAINED_VARIANCE_STAT_ERROR_SQUARE_SUM = 4
+_EXPLAINED_VARIANCE_STAT_NON_FINITE_COUNT = 5
+
+
+def compute_explained_variance_statistics(
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return additive float64 statistics for explained variance.
+
+    The returned tensor can be summed across micro-batches and distributed
+    ranks before calling :func:`explained_variance_metrics_from_statistics`.
+    Non-finite inputs are counted explicitly and excluded from sums so their
+    diagnostic reason is preserved without contaminating the collective.
+    """
+    flat_returns = returns.detach().reshape(-1).to(dtype=torch.float64)
+    flat_values = values.detach().reshape(-1).to(dtype=torch.float64)
+    if flat_returns.numel() != flat_values.numel():
+        raise ValueError(
+            "Explained variance requires returns and values with the same number "
+            f"of elements, got {flat_returns.numel()} and {flat_values.numel()}."
+        )
+
+    if loss_mask is None:
+        mask = torch.ones_like(flat_returns, dtype=torch.bool)
+    else:
+        mask = (
+            loss_mask.detach()
+            .reshape(-1)
+            .to(device=flat_returns.device, dtype=torch.bool)
+        )
+        if mask.numel() != flat_returns.numel():
+            raise ValueError(
+                "Explained variance requires loss_mask to match returns, got "
+                f"{mask.numel()} and {flat_returns.numel()} elements."
+            )
+
+    selected_returns = flat_returns[mask]
+    selected_values = flat_values[mask]
+    finite_mask = torch.isfinite(selected_returns) & torch.isfinite(selected_values)
+    finite_returns = selected_returns[finite_mask]
+    finite_errors = finite_returns - selected_values[finite_mask]
+
+    return torch.stack(
+        (
+            mask.sum().to(dtype=torch.float64),
+            finite_returns.sum(),
+            finite_returns.square().sum(),
+            finite_errors.sum(),
+            finite_errors.square().sum(),
+            (~finite_mask).sum().to(dtype=torch.float64),
+        )
+    )
+
+
+def explained_variance_metrics_from_statistics(
+    statistics: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute explained-variance metrics from globally summed statistics."""
+    stats = statistics.to(dtype=torch.float64)
+    count = stats[_EXPLAINED_VARIANCE_STAT_COUNT]
+    non_finite_count = stats[_EXPLAINED_VARIANCE_STAT_NON_FINITE_COUNT]
+    nan = torch.full((), float("nan"), dtype=torch.float64, device=stats.device)
+    explained_variance = nan.clone()
+    var_returns = nan.clone()
+    valid = torch.zeros((), dtype=torch.float64, device=stats.device)
+    reason = torch.full(
+        (),
+        float(_EXPLAINED_VARIANCE_REASON_VALID),
+        dtype=torch.float64,
+        device=stats.device,
+    )
+
+    if non_finite_count > 0:
+        reason.fill_(float(_EXPLAINED_VARIANCE_REASON_NON_FINITE_VARIANCE))
+    elif count <= 1:
+        reason.fill_(float(_EXPLAINED_VARIANCE_REASON_TOO_FEW_SAMPLES))
+    else:
+        return_sum = stats[_EXPLAINED_VARIANCE_STAT_RETURN_SUM]
+        return_square_sum = stats[_EXPLAINED_VARIANCE_STAT_RETURN_SQUARE_SUM]
+        error_sum = stats[_EXPLAINED_VARIANCE_STAT_ERROR_SUM]
+        error_square_sum = stats[_EXPLAINED_VARIANCE_STAT_ERROR_SQUARE_SUM]
+        return_ss = return_square_sum - return_sum.square() / count
+        error_ss = error_square_sum - error_sum.square() / count
+        # Float64 accumulation can still produce a tiny negative centered sum
+        # from cancellation. Variance is non-negative by definition.
+        return_ss = return_ss.clamp_min(0.0)
+        error_ss = error_ss.clamp_min(0.0)
+        var_returns = return_ss / (count - 1.0)
+        var_errors = error_ss / (count - 1.0)
+
+        if not torch.isfinite(var_returns) or not torch.isfinite(var_errors):
+            reason.fill_(float(_EXPLAINED_VARIANCE_REASON_NON_FINITE_VARIANCE))
+        elif var_returns == 0:
+            reason.fill_(float(_EXPLAINED_VARIANCE_REASON_ZERO_RETURN_VARIANCE))
+        else:
+            explained_variance = 1.0 - var_errors / var_returns
+            valid.fill_(1.0)
+
+    return {
+        "critic/explained_variance": explained_variance,
+        "critic/explained_variance_valid": valid,
+        "critic/explained_variance_numel": count,
+        "critic/explained_variance_var_returns": var_returns,
+        "critic/explained_variance_invalid_reason": reason,
+    }
+
 
 def compute_decoupled_ppo_actor_loss(
     logprobs: torch.Tensor,
@@ -154,6 +266,14 @@ def compute_decoupled_ppo_actor_loss(
         "actor/behav_clip_fraction": behav_clip_fraction,
         "actor/proximal_approx_kl": proximal_approx_kl,
         "actor/behav_approx_kl": behav_approx_kl,
+        # Keep the distributed metric schema identical when this rank receives
+        # an intentionally all-masked no-op shard. Conditional keys make
+        # all_reduce_dict use different tensor lengths across ranks and hang.
+        "actor/average_version": torch.tensor(float("nan"), device=logprobs.device),
+        "actor/current_version": torch.tensor(
+            float(current_version) if current_version is not None else float("nan"),
+            device=logprobs.device,
+        ),
     }
     if (
         versions is not None
@@ -162,9 +282,6 @@ def compute_decoupled_ppo_actor_loss(
         and loss_mask.any()
     ):
         metrics_data["actor/average_version"] = versions[loss_mask].float().mean()
-        metrics_data["actor/current_version"] = torch.tensor(
-            float(current_version), device=logprobs.device
-        )
 
     return pg_loss, metrics_data
 
@@ -373,61 +490,18 @@ def compute_ppo_critic_loss(
         masked_returns = returns
         masked_values = values
 
-    explained_variance_valid = torch.tensor(1.0, device=returns.device)
-    explained_variance_numel = torch.tensor(
-        float(masked_returns.numel()), device=returns.device
+    explained_variance_metrics = explained_variance_metrics_from_statistics(
+        compute_explained_variance_statistics(masked_returns, masked_values)
     )
-    explained_variance_invalid_reason = torch.tensor(
-        float(_EXPLAINED_VARIANCE_REASON_VALID), device=returns.device
-    )
-    explained_variance = torch.tensor(float("nan"), device=returns.device)
-    var_returns = torch.tensor(float("nan"), device=returns.device)
-
-    # Guard <=1 element: var() on <=1 point has dof 0 -> NaN + a PyTorch warning.
-    # This happens in chunk_mask mode when a rank's batch has only 1 effective
-    # (fresh) chunk. EV is undefined there; return NaN cleanly without the warning.
-    if masked_returns.numel() <= 1:
-        explained_variance_valid = torch.tensor(0.0, device=returns.device)
-        explained_variance_invalid_reason = torch.tensor(
-            float(_EXPLAINED_VARIANCE_REASON_TOO_FEW_SAMPLES), device=returns.device
-        )
-    else:
-        var_returns = torch.var(masked_returns)
-        if torch.isnan(var_returns) or torch.isinf(var_returns):
-            explained_variance_valid = torch.tensor(0.0, device=returns.device)
-            explained_variance_invalid_reason = torch.tensor(
-                float(_EXPLAINED_VARIANCE_REASON_NON_FINITE_VARIANCE),
-                device=returns.device,
-            )
-        elif var_returns == 0:
-            explained_variance_valid = torch.tensor(0.0, device=returns.device)
-            explained_variance_invalid_reason = torch.tensor(
-                float(_EXPLAINED_VARIANCE_REASON_ZERO_RETURN_VARIANCE),
-                device=returns.device,
-            )
-        else:
-            var_diff = torch.var(masked_returns - masked_values)
-            if torch.isnan(var_diff) or torch.isinf(var_diff):
-                explained_variance_valid = torch.tensor(0.0, device=returns.device)
-                explained_variance_invalid_reason = torch.tensor(
-                    float(_EXPLAINED_VARIANCE_REASON_NON_FINITE_VARIANCE),
-                    device=returns.device,
-                )
-            else:
-                explained_variance = 1 - var_diff / var_returns
 
     # Compile metrics for logging
     metrics_data = {
         "critic/value_loss": value_loss.detach(),
         "critic/value_clip_ratio": value_clip_ratio.detach(),
-        "critic/explained_variance": explained_variance.detach(),
-        "critic/explained_variance_valid": explained_variance_valid.detach(),
-        "critic/explained_variance_numel": explained_variance_numel.detach(),
-        "critic/explained_variance_var_returns": var_returns.detach(),
-        "critic/explained_variance_invalid_reason": (
-            explained_variance_invalid_reason.detach()
-        ),
     }
+    metrics_data.update(
+        {key: value.detach() for key, value in explained_variance_metrics.items()}
+    )
     return value_loss, metrics_data
 
 

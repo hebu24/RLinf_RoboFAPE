@@ -35,9 +35,7 @@ def test_post_update_ppo_surrogate_matches_decoupled_actor_loss():
         "max_episode_steps": 2,
         "behave_weight_threshold": 2.0,
     }
-    expected_pre, _ = compute_decoupled_ppo_actor_loss(
-        logprobs=proximal, **common
-    )
+    expected_pre, _ = compute_decoupled_ppo_actor_loss(logprobs=proximal, **common)
     expected_post, _ = compute_decoupled_ppo_actor_loss(logprobs=post, **common)
 
     metrics = compute_post_update_ppo_surrogate_metrics(
@@ -303,6 +301,30 @@ def test_frozen_proximal_anchor_gives_unit_ratio_before_parameter_update():
     assert metrics["actor/proximal_ratio"].item() == pytest.approx(1.0)
     assert metrics["actor/proximal_approx_kl"].item() == pytest.approx(0.0)
     assert metrics["actor/behav_approx_kl"].item() == pytest.approx(-0.2)
+
+
+def test_decoupled_actor_metrics_keep_schema_for_all_masked_rank():
+    common = {
+        "logprobs": torch.tensor([0.1, 0.2], dtype=torch.float32),
+        "old_logprobs": torch.tensor([0.0, 0.0], dtype=torch.float32),
+        "proximal_logprobs": torch.tensor([0.0, 0.0], dtype=torch.float32),
+        "advantages": torch.tensor([1.0, -1.0], dtype=torch.float32),
+        "versions": torch.tensor([8.0, 8.0], dtype=torch.float32),
+        "current_version": 9,
+        "clip_ratio_low": 0.1,
+        "clip_ratio_high": 0.1,
+        "behave_weight_threshold": 2.0,
+    }
+    _, trainable_metrics = compute_decoupled_ppo_actor_loss(
+        loss_mask=torch.tensor([True, True]), **common
+    )
+    _, noop_metrics = compute_decoupled_ppo_actor_loss(
+        loss_mask=torch.tensor([False, False]), **common
+    )
+
+    assert set(noop_metrics) == set(trainable_metrics)
+    assert torch.isnan(noop_metrics["actor/average_version"])
+    assert noop_metrics["actor/current_version"].item() == 9.0
 
 
 def test_adv_logprob_diagnostics_chunk_level_positive_alignment():

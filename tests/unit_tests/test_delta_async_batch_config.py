@@ -80,10 +80,8 @@ def test_delta_async_update_uses_16_window_local_episodes_and_one_optimizer_step
 
 
 def test_independent_window_delta_config():
-    """§15: the independent-window delta config opts into independent windows
-    while preserving the 16-episode / one-optimizer-step batch."""
+    """The W40 independent variant keeps its own rollout and batch geometry."""
     cfg = OmegaConf.load(INDEPENDENT_CONFIG_PATH)
-    _assert_16_episode_one_optimizer_batch(cfg)
     assert int(cfg.actor.optim.critic_warmup_steps) == 15
     assert float(cfg.reward.delta.failure_terminal_penalty) == -1.0
     assert cfg.env.train.rollout_window_mode == "independent"
@@ -95,3 +93,23 @@ def test_independent_window_delta_config():
     # warmup-end permanent checkpoint (step 15) for clean resume.
     assert bool(cfg.runner.get("save_critic_warmup_checkpoint"))
     assert 15 in list(cfg.runner.get("checkpoint_permanent_steps", []))
+
+
+def test_400_step_independent_window_batch_matches_40_chunk_rollout():
+    """The W40 variant must not inherit the W60 optimizer batch size."""
+    cfg = OmegaConf.load(INDEPENDENT_CONFIG_PATH)
+    actor_world_size = 2
+    trajectories_per_rank = int(cfg.algorithm.rollout_store_size_per_rank)
+    episodes_per_trajectory_per_rank = int(cfg.env.train.total_num_envs) // actor_world_size
+    chunks_per_episode = int(cfg.env.train.max_episode_steps) // int(
+        cfg.actor.model.num_action_chunks
+    )
+    local_rollout_samples = (
+        trajectories_per_rank * episodes_per_trajectory_per_rank * chunks_per_episode
+    )
+
+    assert int(cfg.env.train.max_episode_steps) == 400
+    assert int(cfg.reward.model.max_robometer_frames) == 40
+    assert local_rollout_samples == 320
+    assert int(cfg.actor.global_batch_size) == local_rollout_samples * actor_world_size
+    assert local_rollout_samples % int(cfg.actor.micro_batch_size) == 0

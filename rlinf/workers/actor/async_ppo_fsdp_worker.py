@@ -23,7 +23,11 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from rlinf.algorithms.losses import compute_decoupled_ppo_actor_loss
+from rlinf.algorithms.losses import (
+    compute_decoupled_ppo_actor_loss,
+    compute_explained_variance_statistics,
+    explained_variance_metrics_from_statistics,
+)
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import kl_penalty, preprocess_loss_inputs
 from rlinf.config import SupportedModel
@@ -593,15 +597,17 @@ def compute_post_update_ppo_surrogate_metrics(
             clipped_ratio = torch.clamp(
                 ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high
             )
-            contribution = torch.maximum(-advantages * ratio, -advantages * clipped_ratio)
+            contribution = torch.maximum(
+                -advantages * ratio, -advantages * clipped_ratio
+            )
             if clip_ratio_c is not None:
                 dual_clipped = torch.sign(advantages) * clip_ratio_c * advantages
                 contribution = torch.minimum(contribution, dual_clipped)
             return contribution * behavior_weight
 
-        improvement = surrogate_contribution(proximal_logprobs) - surrogate_contribution(
-            post_update_logprobs
-        )
+        improvement = surrogate_contribution(
+            proximal_logprobs
+        ) - surrogate_contribution(post_update_logprobs)
         improved = improvement[valid] > 0
         metrics["actor/post_update_ppo_improved_fraction"] = float(
             improved.float().mean().item()
@@ -612,7 +618,9 @@ def compute_post_update_ppo_surrogate_metrics(
 
         delta = post_update_logprobs[valid] - proximal_logprobs[valid]
         valid_advantages = advantages[valid]
-        weighted_advantage_mean = (valid_weights * valid_advantages).sum() / valid_weights.sum()
+        weighted_advantage_mean = (
+            valid_weights * valid_advantages
+        ).sum() / valid_weights.sum()
         weighted_delta_mean = (valid_weights * delta).sum() / valid_weights.sum()
         weighted_adv_var = (
             valid_weights * (valid_advantages - weighted_advantage_mean).square()
@@ -630,8 +638,8 @@ def compute_post_update_ppo_surrogate_metrics(
                 (covariance / torch.sqrt(weighted_adv_var * weighted_delta_var)).item()
             )
 
-        first_order_terms = behavior_weight * advantages * (
-            post_update_logprobs - proximal_logprobs
+        first_order_terms = (
+            behavior_weight * advantages * (post_update_logprobs - proximal_logprobs)
         )
         if loss_mask_sum is not None and max_episode_steps is not None:
             first_order_gain = masked_mean_ratio(
@@ -1241,8 +1249,10 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         )
 
     @torch.inference_mode()
-    def compute_post_update_logprobs(self) -> torch.Tensor:
-        """Recompute logprobs under the final post-update actor for diagnostics."""
+    def compute_post_update_outputs(
+        self,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Recompute policy and critic outputs at one post-update snapshot."""
         assert not self.is_weight_offloaded, (
             "Weight offloading is not supported when recomputing post-update logprobs."
         )
@@ -1255,13 +1265,15 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         self.model.eval()
         post_update_logprobs_list = []
+        post_update_values_list = []
+        compute_values = self.cfg.algorithm.adv_type == "gae"
 
         for micro_batch in iterator:
             micro_batch = put_tensor_device(micro_batch, self.device)
             forward_inputs = micro_batch.get("forward_inputs", None)
             if forward_inputs is None:
                 raise ValueError(
-                    "Missing forward_inputs in compute_post_update_logprobs. "
+                    "Missing forward_inputs in compute_post_update_outputs. "
                     "This usually means batch splitting dropped nested dict fields."
                 )
 
@@ -1284,13 +1296,32 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 forward_inputs=forward_inputs,
                 compute_logprobs=True,
                 compute_entropy=False,
-                compute_values=False,
+                compute_values=compute_values,
                 use_cache=False,
                 **model_kwargs,
             )
             post_update_logprobs_list.append(out["logprobs"].cpu())
+            if compute_values:
+                post_update_values_list.append(out["values"].cpu())
 
-        return torch.cat(post_update_logprobs_list, dim=0)
+        post_update_values = (
+            torch.cat(post_update_values_list, dim=0) if compute_values else None
+        )
+        return torch.cat(post_update_logprobs_list, dim=0), post_update_values
+
+    def compute_global_explained_variance_metrics(
+        self, post_update_values: torch.Tensor
+    ) -> dict[str, float]:
+        """Compute one EV over the complete post-update batch on all actor ranks."""
+        statistics = compute_explained_variance_statistics(
+            returns=self.rollout_batch["returns"],
+            values=post_update_values,
+            loss_mask=self.rollout_batch.get("loss_mask", None),
+        ).to(self.device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(statistics, op=torch.distributed.ReduceOp.SUM)
+        metrics = explained_variance_metrics_from_statistics(statistics)
+        return {key: float(value.item()) for key, value in metrics.items()}
 
     def _measure_global_grad_norm(self, loss: torch.Tensor) -> float:
         """Backward one sampled loss and return its unclipped global grad norm."""
@@ -1595,7 +1626,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
 
-        post_update_logprobs = self.compute_post_update_logprobs()
+        post_update_logprobs, post_update_values = self.compute_post_update_outputs()
         post_update_metrics = compute_policy_adv_logprob_diagnostics(
             advantages=self.rollout_batch["advantages"],
             proximal_logprobs=self.rollout_batch["proximal_logprobs"],
@@ -1637,11 +1668,21 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         )
         append_to_dict(metrics, post_update_metrics)
 
+        if post_update_values is not None:
+            global_ev_metrics = self.compute_global_explained_variance_metrics(
+                post_update_values
+            )
+            # EV is nonlinear and must not be averaged over optimizer
+            # micro-batches. Replace all local samples with the one global value.
+            for key, value in global_ev_metrics.items():
+                metrics[key] = [value]
+
         clear_memory()
 
         mean_metric_dict = {k: float(np.mean(v)) for k, v in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict,
             op=torch.distributed.ReduceOp.AVG,
+            validate_schema=True,
         )
         return mean_metric_dict

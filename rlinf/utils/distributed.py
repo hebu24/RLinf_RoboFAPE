@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 from collections import UserDict
 from contextlib import contextmanager
 from typing import Any, Callable, Optional, Sequence, Union
@@ -1051,13 +1052,42 @@ class VocabUtility:
 
 
 def all_reduce_dict(
-    dictionary, dtype=torch.float32, group=None, op=torch.distributed.ReduceOp.SUM
+    dictionary,
+    dtype=torch.float32,
+    group=None,
+    op=torch.distributed.ReduceOp.SUM,
+    validate_schema=False,
 ):
     keys = sorted(dictionary)
+    device = Worker.torch_platform.current_device()
+    if validate_schema:
+        digest = hashlib.blake2b(
+            "\0".join(keys).encode("utf-8"), digest_size=8
+        ).digest()
+        fingerprint = int.from_bytes(digest, "big") & ((1 << 63) - 1)
+        local_schema = torch.tensor(
+            [len(keys), fingerprint], dtype=torch.int64, device=device
+        )
+        schema_min = local_schema.clone()
+        schema_max = local_schema.clone()
+        torch.distributed.all_reduce(
+            schema_min, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        torch.distributed.all_reduce(
+            schema_max, op=torch.distributed.ReduceOp.MAX, group=group
+        )
+        if not torch.equal(schema_min, schema_max):
+            raise RuntimeError(
+                "all_reduce_dict metric schema differs across ranks: "
+                f"local_count={len(keys)} local_fingerprint={fingerprint} "
+                f"global_min={schema_min.tolist()} global_max={schema_max.tolist()} "
+                f"local_keys={keys}"
+            )
+
     tensor = torch.as_tensor(
         [dictionary[k] for k in keys],
         dtype=dtype,
-        device=Worker.torch_platform.current_device(),
+        device=device,
     )
     torch.distributed.all_reduce(tensor, op=op, group=group)
     return dict(zip(keys, tensor.tolist()))

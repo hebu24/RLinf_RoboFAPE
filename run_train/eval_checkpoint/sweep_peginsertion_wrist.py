@@ -44,10 +44,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--checkpoint-dir",
-        required=True,
+        default=None,
         help=(
             "Directory containing global_step_*/actor checkpoints, or one actor "
-            "checkpoint directory."
+            "checkpoint directory. Required unless --plot-only is used."
         ),
     )
     parser.add_argument(
@@ -153,6 +153,15 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="Reuse existing per-step trajectory_metrics.json files.",
+    )
+    parser.add_argument(
+        "--plot-only",
+        action="store_true",
+        help=(
+            "Do not evaluate checkpoints or start Ray. Rebuild metrics and plots "
+            "from every evaluation_summary.json under --output-dir, including "
+            "results whose original checkpoints have since been deleted."
+        ),
     )
     parser.add_argument(
         "--continue-on-error",
@@ -327,6 +336,83 @@ def summarize_episode_metrics(
     return row
 
 
+def summarize_evaluation_summary(
+    summary_path: Path, reward_key: str
+) -> dict[str, Any]:
+    """Convert a persisted evaluation summary into one sweep-plot row."""
+    checkpoint_name = summary_path.parent.name
+    match = STEP_RE.match(checkpoint_name)
+    if not match:
+        raise RuntimeError(
+            f"Evaluation summary is not under a global_step_* directory: {summary_path}"
+        )
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    metrics = summary.get("metrics")
+    if not isinstance(metrics, dict):
+        raise RuntimeError(f"No metrics object in {summary_path}")
+    if "success_once" not in metrics:
+        raise RuntimeError(f"No success_once metric in {summary_path}")
+    if reward_key not in metrics:
+        raise RuntimeError(f"No {reward_key!r} metric in {summary_path}")
+
+    step = int(match.group(1))
+    selected_reward = float(metrics[reward_key])
+    row = {
+        "step": step,
+        "trainenvstep": int(match.group(2)) if match.group(2) is not None else None,
+        "checkpoint_name": checkpoint_name,
+        "checkpoint_path": str(summary.get("checkpoint_path", "")),
+        "num_trajectories": int(metrics.get("num_trajectories", 0)),
+        "success_rate": float(metrics["success_once"]),
+        "mean_selected_reward": selected_reward,
+        "max_selected_reward": selected_reward,
+        "reward_key": reward_key,
+        "evaluation_summary_path": str(summary_path),
+    }
+    for metric_name, row_mean_key, row_max_key in (
+        ("max_reward", "mean_max_reward", "max_reward"),
+        ("return", "mean_return", "max_return"),
+        ("reward", "mean_episode_avg_reward", "max_episode_avg_reward"),
+    ):
+        if metric_name in metrics:
+            value = float(metrics[metric_name])
+            row[row_mean_key] = value
+            row[row_max_key] = value
+    return row
+
+
+def rebuild_plots_from_evaluation_summaries(
+    output_dir: Path, reward_key: str
+) -> list[dict[str, Any]]:
+    """Rebuild sweep artifacts solely from persisted evaluation summaries."""
+    rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for summary_path in sorted(output_dir.rglob("evaluation_summary.json")):
+        try:
+            rows.append(summarize_evaluation_summary(summary_path, reward_key))
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            failures.append(f"{summary_path}: {exc}")
+
+    if not rows:
+        raise FileNotFoundError(
+            f"No usable evaluation_summary.json files found under {output_dir}"
+        )
+    rows.sort(
+        key=lambda row: (
+            int(row["step"]),
+            int(row["trainenvstep"]) if row["trainenvstep"] is not None else 0,
+            str(row["checkpoint_name"]),
+        )
+    )
+    write_rows(rows, output_dir)
+    plot_rows(rows, output_dir)
+    for failure in failures:
+        print(f"Skipping invalid evaluation summary: {failure}", file=sys.stderr)
+    print(f"Rebuilt plots from {len(rows)} evaluation summaries.")
+    return rows
+
+
 def run_eval_for_checkpoint(
     *,
     checkpoint_path: Path,
@@ -406,6 +492,22 @@ def write_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     print(f"Wrote {csv_path}")
 
 
+def annotate_curve_points(ax: Any, steps: list[int], values: list[float]) -> None:
+    """Label every curve marker with its plotted metric value."""
+    for index, (step, value) in enumerate(zip(steps, values, strict=True)):
+        # Alternate offsets so adjacent points with similar values remain legible.
+        vertical_offset = 7 if index % 2 == 0 else -13
+        ax.annotate(
+            f"{value:.3f}",
+            (step, value),
+            xytext=(0, vertical_offset),
+            textcoords="offset points",
+            ha="center",
+            va="bottom" if vertical_offset > 0 else "top",
+            fontsize=7,
+        )
+
+
 def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     valid_rows = [
         row
@@ -425,13 +527,15 @@ def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     axes[0].plot(steps, success_rates, marker="o", linewidth=1.8)
     axes[0].set_xlabel("Training step")
     axes[0].set_ylabel("Mean success rate")
-    axes[0].set_ylim(-0.05, 1.05)
+    axes[0].set_ylim(-0.1, 1.1)
     axes[0].grid(True, alpha=0.3)
+    annotate_curve_points(axes[0], steps, success_rates)
 
     axes[1].plot(steps, mean_rewards, marker="o", linewidth=1.8, color="tab:orange")
     axes[1].set_xlabel("Training step")
     axes[1].set_ylabel(f"Mean trajectory {reward_key}")
     axes[1].grid(True, alpha=0.3)
+    annotate_curve_points(axes[1], steps, mean_rewards)
 
     fig.tight_layout()
     combined_path = output_dir / "wrist_sweep_curves.png"
@@ -442,8 +546,9 @@ def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     ax.plot(steps, success_rates, marker="o", linewidth=1.8)
     ax.set_xlabel("Training step")
     ax.set_ylabel("Mean success rate")
-    ax.set_ylim(-0.05, 1.05)
+    ax.set_ylim(-0.1, 1.1)
     ax.grid(True, alpha=0.3)
+    annotate_curve_points(ax, steps, success_rates)
     fig.tight_layout()
     sr_path = output_dir / "success_rate_vs_step.png"
     fig.savefig(sr_path, dpi=180)
@@ -454,6 +559,7 @@ def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     ax.set_xlabel("Training step")
     ax.set_ylabel(f"Mean trajectory {reward_key}")
     ax.grid(True, alpha=0.3)
+    annotate_curve_points(ax, steps, mean_rewards)
     fig.tight_layout()
     reward_path = output_dir / "max_reward_vs_step.png"
     fig.savefig(reward_path, dpi=180)
@@ -609,8 +715,10 @@ def run_checkpoint_sweep(
             with rows_lock:
                 completed[step] = row
                 rows = [completed[item_step] for item_step in sorted(completed)]
-                write_rows(rows, output_dir)
-                plot_rows(rows, output_dir)
+                # Evaluation summaries persist independently of checkpoint
+                # retention. Rebuild from the whole eval directory at every
+                # refresh so intermediate plots do not drop historical points.
+                rebuild_plots_from_evaluation_summaries(output_dir, args.reward_key)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_gpu_ids)) as executor:
         futures = [
@@ -630,6 +738,19 @@ def main() -> None:
     if args.num_eval_episodes % args.num_envs != 0:
         raise ValueError("--num-eval-episodes must be divisible by --num-envs")
 
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else REPO_PATH / "logs" / "peginsertion_wrist_ckpt_sweep"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.plot_only:
+        rebuild_plots_from_evaluation_summaries(output_dir, args.reward_key)
+        return
+
+    if args.checkpoint_dir is None:
+        raise ValueError("--checkpoint-dir is required unless --plot-only is used")
     checkpoints = discover_checkpoints(Path(args.checkpoint_dir))
     if args.step:
         wanted_steps = set(args.step)
@@ -641,17 +762,13 @@ def main() -> None:
             f"No global_step_*/actor checkpoints found under {args.checkpoint_dir}"
         )
 
-    output_dir = (
-        Path(args.output_dir).expanduser().resolve()
-        if args.output_dir
-        else REPO_PATH / "logs" / "peginsertion_wrist_ckpt_sweep"
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     if args.manage_ray:
         start_shared_ray(args)
     try:
         run_checkpoint_sweep(checkpoints, output_dir, args)
+        # Include retained historical evaluations as well as checkpoints from
+        # this invocation; the checkpoint directory may have pruned old RL ckpts.
+        rebuild_plots_from_evaluation_summaries(output_dir, args.reward_key)
     finally:
         if args.manage_ray:
             stop_shared_ray(args)

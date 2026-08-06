@@ -542,6 +542,46 @@ def test_compute_reward_delta_selects_boundary_frames(monkeypatch):
     )
 
 
+def test_compute_reward_delta_uses_transport_preselected_frames(monkeypatch):
+    """Transport preselection must not select boundary indices a second time."""
+    from rlinf.models.embodiment.reward import robometer_reward_model as module
+
+    captured = {}
+
+    def fake_post(server_url, samples, timeout_s, use_frame_steps):
+        captured["n_frames"] = [
+            sample["trajectory"]["frames"].shape[0] for sample in samples
+        ]
+        return {
+            "outputs_progress": {
+                "progress_pred": [[0.0, 0.2, 0.5, 0.8, 1.0]]
+            }
+        }
+
+    monkeypatch.setattr(module, "_post_evaluate_batch_npy", fake_post)
+    model = module.RobometerHistoryRewardModel(_robometer_cfg())
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    # These are the five indices already selected from a 40-step episode.
+    output = model.compute_reward(
+        {
+            "history_input": {
+                "render_buffer": {"render_images": [[frame] * 5]}
+            },
+            "env_infos": {"success": np.array([True])},
+            "dones": np.array([True]),
+            "shaping": "delta",
+            "pickup_counts": [0],
+            "chunk_size": 10,
+            "robometer_history_preselected": True,
+        }
+    )
+
+    assert captured["n_frames"] == [5]
+    np.testing.assert_allclose(
+        output[0].numpy(), [0.0, 0.2, 0.5, 0.8, 1.0], atol=1e-6
+    )
+
+
 def test_compute_reward_delta_requires_pickup_counts(monkeypatch):
     from rlinf.models.embodiment.reward import robometer_reward_model as module
 

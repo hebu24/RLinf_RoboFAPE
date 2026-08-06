@@ -695,13 +695,15 @@ export TMPDIR=/data/yingxi/tmp HF_HOME=/data/yingxi/.cache/huggingface \
 SFT_BASE=logs/20260719-16:44:47-peg_insertion_sft_openpi_pi05_wrist-3200/checkpoints/global_step_40000/actor
 
 /data/yingxi/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/sweep_peginsertion_wrist.py \
-  --ray-port 6501 --ray-dashboard-port 8267 \
-  --checkpoint-dir logs/20260731-11:18:41-peg_insertion_rl_async_absolute_16ep_single_step/peg_insertion_async_ppo_pi05_robometer/checkpoints \
+  --ray-port 6520 --ray-dashboard-port 8287 \
+  --checkpoint-dir /data/yingxi/RLinf_RoboFAPE/logs/20260806-15:56:46-peg_insertion_rl_async_absolute_independent_window_bonus0_fresh_robometer4b_gpu23_sftinit/peg_insertion_async_ppo_pi05_robometer/checkpoints \
   --norm-stats-source "$SFT_BASE" \
-  --output-dir logs/20260731-11:18:41-peg_insertion_rl_async_absolute_16ep_single_step/peg_insertion_async_ppo_pi05_robometer/rl_eval_sweep \
-  --num-eval-episodes 24 --num-envs 8 \
-  --gpu-ids 1,4,5 --action-scale 1.0 \
-  --save-video --continue-on-error
+  --output-dir /data/yingxi/RLinf_RoboFAPE/logs/20260806-15:56:46-peg_insertion_rl_async_absolute_independent_window_bonus0_fresh_robometer4b_gpu23_sftinit/peg_insertion_async_ppo_pi05_robometer/rl_eval_sweep_ep50 \
+  --num-eval-episodes 50 --num-envs 10 \
+  --gpu-ids 7 --action-scale 1.0 \
+  --seed 0 \
+  --hydra-override env.eval.shared_reset_seed=true \
+  --save-video --continue-on-error --resume
 ```
 
 Run it in a persistent tmux so it survives SSH disconnect (the sweep starts its

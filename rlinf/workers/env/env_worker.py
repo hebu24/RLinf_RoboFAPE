@@ -1438,10 +1438,13 @@ class EnvWorker(Worker):
                     return None
         elif not (last_run or (dones is not None and bool(dones.any()))):
             return None
+        reward_transport_input = self._compress_robometer_history_for_transport(
+            reward_input
+        )
         self.send_to(
             group_name=self.cfg.reward.group_name,
             channel=send_channel,
-            data=reward_input,
+            data=reward_transport_input,
             tag="train_reward_obs",
             async_op=True,
             decoupled_mode=self.env_decoupled_mode,
@@ -1485,6 +1488,60 @@ class EnvWorker(Worker):
                 continue
             reward_env_infos[key] = clone_nested_to_cpu(env_infos[key])
         return reward_env_infos
+
+    def _compress_robometer_history_for_transport(
+        self, reward_input: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Send only frames that the Robometer request will consume.
+
+        The full render history is needed locally to reconstruct rewards onto
+        rollout chunks.  Sending it through Ray first, however, creates a large
+        serialized copy in both the env and reward workers before the reward
+        model discards most frames.  Keep the local input intact and construct a
+        shallow transport copy containing the deterministic selected frames.
+        """
+        history_input = reward_input.get("history_input")
+        if not isinstance(history_input, dict):
+            return reward_input
+
+        buffer_name = self.cfg.reward.model.get(
+            "render_buffer_name", "render_buffer"
+        )
+        buffer_data = history_input.get(buffer_name)
+        if not isinstance(buffer_data, dict):
+            return reward_input
+        frame_lists = buffer_data.get("render_images")
+        if not isinstance(frame_lists, list):
+            return reward_input
+
+        delta_mode = reward_input.get("shaping") == "delta"
+        pickup_counts = reward_input.get("pickup_counts", [])
+        chunk_size = int(reward_input.get("chunk_size", 0) or 0)
+        max_frames = int(self.cfg.reward.model.get("max_robometer_frames", 60))
+        selected_frame_lists = []
+        for env_id, frames in enumerate(frame_lists):
+            if not frames:
+                selected_frame_lists.append(frames)
+                continue
+            if delta_mode:
+                if env_id >= len(pickup_counts) or chunk_size <= 0:
+                    # The reward model preserves the existing validation error.
+                    return reward_input
+                indices = _robometer_boundary_frame_indices(
+                    len(frames), int(pickup_counts[env_id]), chunk_size
+                )
+            else:
+                indices = _robometer_downsample_indices(len(frames), max_frames)
+            selected_frame_lists.append([frames[index] for index in indices])
+
+        transport_input = dict(reward_input)
+        transport_history = dict(history_input)
+        transport_buffer = dict(buffer_data)
+        transport_buffer["render_images"] = selected_frame_lists
+        transport_history[buffer_name] = transport_buffer
+        transport_input["history_input"] = transport_history
+        transport_input["robometer_history_preselected"] = True
+        return transport_input
 
     def _scatter_terminal_reward_output(
         self,

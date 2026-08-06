@@ -762,6 +762,7 @@ class RobometerHistoryRewardModel(BaseRewardModel):
         # down-sampling. max_robometer_frames is NOT applied in delta mode (boundary
         # count is already small, bounded by episode chunk count).
         shaping = observations.get("shaping", "absolute")
+        preselected = bool(observations.get("robometer_history_preselected", False))
         pickup_counts = observations.get("pickup_counts", None)
         chunk_size = int(observations.get("chunk_size", 0) or 0)
         delta_mode = shaping == "delta"
@@ -785,7 +786,11 @@ class RobometerHistoryRewardModel(BaseRewardModel):
             arr = np.stack([np.asarray(f, dtype=np.uint8) for f in frames])
             if arr.shape[0] < self.min_history_size:
                 continue
-            if delta_mode:
+            if preselected:
+                # Env workers select the exact same deterministic frame indices
+                # before Ray serialization.  Do not apply those indices again.
+                pass
+            elif delta_mode:
                 # Select chunk-boundary frames (start of insertion + after each
                 # chunk). env_worker recomputes the SAME indices' count to map
                 # boundary progress -> chunks in reconstruct_robometer_delta_reward.
