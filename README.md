@@ -684,6 +684,22 @@ plus a per-checkpoint subdir (`global_step_<N>_trainenvstep_<M>/`) holding
 `checkpoint_name` column for RL checkpoints; the plot x-axis is the PPO step
 (group 1 of the checkpoint name).
 
+To compare a RoboFAPE and Robometer sweep on one success-rate plot, run the
+following after both sweeps have produced `wrist_sweep_metrics.csv`. `--smooth`
+is a centered moving-average window in checkpoints; the original 50-episode
+evaluation samples remain visible as translucent points. The step-10 warmup
+point is excluded by default; use `--exclude-step` again to remove further
+points. The command produces the raw success-rate comparison and a second plot
+of percentage-point change from each run's step-15 base model.
+
+```bash
+/data/yingxi/kairan/envs/rlinf/bin/python run_train/eval_checkpoint/plot_peginsertion_comparison.py \
+  --robofape-dir <robofape_run>/rl_eval_sweep_ep50 \
+  --robometer-dir <robometer_run>/rl_eval_sweep_ep50 \
+  --output-dir <robofape_run>/rl_eval_sweep_ep50 \
+  --smooth 3
+```
+
 ```bash
 cd /data/yingxi/RLinf_RoboFAPE
 export TMPDIR=/data/yingxi/tmp HF_HOME=/data/yingxi/.cache/huggingface \

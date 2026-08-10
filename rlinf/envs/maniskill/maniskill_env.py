@@ -232,6 +232,35 @@ class ManiskillEnv(gym.Env):
                 raw_obs.pop("sensor_param")
                 if hasattr(self.env.unwrapped, "get_pi05_proprio"):
                     state = self.env.unwrapped.get_pi05_proprio()
+                elif bool(getattr(self.cfg, "use_pi05_proprio", False)):
+                    from rlinf.envs.maniskill.peg_insertion_pi05 import (
+                        aligned_pi05_state_from_tcp_matrices,
+                    )
+
+                    tcp_pose_in_root = (
+                        self.env.unwrapped.agent.robot.pose.inv()
+                        * self.env.unwrapped.agent.tcp.pose
+                    )
+                    tcp_transform = (
+                        tcp_pose_in_root.to_transformation_matrix()
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    gripper = (
+                        self.env.unwrapped.agent.robot.get_qpos()
+                        .to(torch.float32)[:, -2:]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    state = torch.as_tensor(
+                        aligned_pi05_state_from_tcp_matrices(
+                            tcp_transform, gripper
+                        ),
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
                 elif self.use_full_state:
                     state = self._get_full_state_obs()
                 else:
