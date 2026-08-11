@@ -1,0 +1,130 @@
+{
+  "steps": [
+    100,
+    600
+  ],
+  "runs": {
+    "rbm4b": {
+      "label": "Robometer-4B (gpu01)",
+      "log_dir": "/data/yingxi/RLinf_RoboFAPE/logs/20260809-01:20:10-peg_insertion_rl_async_absolute_independent_window_bonus0_fresh_robometer4b_gpu01_notcolocate",
+      "ckpt_base": "/data/yingxi/RLinf_RoboFAPE/logs/20260809-01:20:10-peg_insertion_rl_async_absolute_independent_window_bonus0_fresh_robometer4b_gpu01_notcolocate/peg_insertion_async_ppo_pi05_robometer/checkpoints"
+    },
+    "ckpt400": {
+      "label": "Checkpoint-400 (gpu57)",
+      "log_dir": "/data/yingxi/RLinf_RoboFAPE/logs/20260809-01:56:53-peg_insertion_rl_async_absolute_independent_window_bonus0_fresh_ckpt400_gpu57_notcolocate",
+      "ckpt_base": "/data/yingxi/RLinf_RoboFAPE/logs/20260809-01:56:53-peg_insertion_rl_async_absolute_independent_window_bonus0_fresh_ckpt400_gpu57_notcolocate/peg_insertion_async_ppo_pi05_robometer/checkpoints"
+    }
+  },
+  "metrics": {
+    "rbm4b": {
+      "100": {
+        "success": {
+          "spearman": {
+            "mean": -0.17063403781979977,
+            "std": 0.0,
+            "n": 1
+          },
+          "mae": {
+            "mean": 0.33900786296774943,
+            "std": 0.0,
+            "n": 1
+          }
+        },
+        "failure": {
+          "spearman": {
+            "mean": 0.02059820283215021,
+            "std": 0.0,
+            "n": 1
+          },
+          "mae": {
+            "mean": 0.31778322495520117,
+            "std": 0.0,
+            "n": 1
+          }
+        }
+      },
+      "600": {
+        "success": {
+          "spearman": {
+            "mean": -0.5341490545050055,
+            "std": 0.0,
+            "n": 1
+          },
+          "mae": {
+            "mean": 0.44081234391778706,
+            "std": 0.0,
+            "n": 1
+          }
+        },
+        "failure": {
+          "spearman": {
+            "mean": -0.12291753646576593,
+            "std": 0.0,
+            "n": 1
+          },
+          "mae": {
+            "mean": 0.38603258853157363,
+            "std": 0.0,
+            "n": 1
+          }
+        }
+      }
+    },
+    "ckpt400": {
+      "100": {
+        "success": {
+          "spearman": {
+            "mean": -0.0460511679644049,
+            "std": 0.0,
+            "n": 1
+          },
+          "mae": {
+            "mean": 0.398792475881055,
+            "std": 0.0,
+            "n": 1
+          }
+        },
+        "failure": {
+          "spearman": {
+            "mean": 0.2910615617586442,
+            "std": 0.0,
+            "n": 1
+          },
+          "mae": {
+            "mean": 0.25151686345537505,
+            "std": 0.0,
+            "n": 1
+          }
+        }
+      },
+      "600": {
+        "success": {
+          "spearman": {
+            "mean": 0.5688542825361512,
+            "std": 0.0,
+            "n": 1
+          },
+          "mae": {
+            "mean": 0.19941811158011358,
+            "std": 0.0,
+            "n": 1
+          }
+        },
+        "failure": {
+          "spearman": {
+            "mean": 0.5984673496775815,
+            "std": 0.0,
+            "n": 1
+          },
+          "mae": {
+            "mean": 0.2418356613566478,
+            "std": 0.0,
+            "n": 1
+          }
+        }
+      }
+    }
+  },
+  "num_samples": 1,
+  "seed": 42
+}
