@@ -1407,8 +1407,8 @@ class EnvWorker(Worker):
                         (env_id, episode_id, local_chunk_idx, episode_chunk_idx)
                     )
             self._last_history_query_info[stage_id] = query_info_with_refs
-            if self.reward_shaping == "delta":
-                reward_input["shaping"] = "delta"
+            if self.reward_shaping in ("delta", "oracle_value"):
+                reward_input["shaping"] = self.reward_shaping
                 reward_input["pickup_counts"] = _delta_pickup_counts
                 # chunk_size = num_action_chunks matches assign_history_reward's
                 # chunk_size (rollout_rewards[-1].shape[-1]); execute_action_chunks
@@ -1527,7 +1527,7 @@ class EnvWorker(Worker):
         if not isinstance(frame_lists, list):
             return reward_input
 
-        delta_mode = reward_input.get("shaping") == "delta"
+        boundary_mode = reward_input.get("shaping") in ("delta", "oracle_value")
         pickup_counts = reward_input.get("pickup_counts", [])
         chunk_size = int(reward_input.get("chunk_size", 0) or 0)
         max_frames = int(self.cfg.reward.model.get("max_robometer_frames", 60))
@@ -1536,7 +1536,7 @@ class EnvWorker(Worker):
             if not frames:
                 selected_frame_lists.append(frames)
                 continue
-            if delta_mode:
+            if boundary_mode:
                 if env_id >= len(pickup_counts) or chunk_size <= 0:
                     # The reward model preserves the existing validation error.
                     return reward_input

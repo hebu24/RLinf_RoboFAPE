@@ -1500,7 +1500,17 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         old_logprobs = out["prev_logprobs"]
 
                     loss_kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
+                        # Entry-point (train_async.py) uses loss_type to pick the
+                        # runner/worker class -- keep "decoupled_actor_critic"
+                        # there. But for the actual loss, oracle_value mode has
+                        # no critic to train (compute_values=False, injected
+                        # progress as value), so dispatch to the actor-only loss
+                        # (registered losses.py:564) and skip the critic loss.
+                        "loss_type": (
+                            "actor"
+                            if self.cfg.algorithm.get("use_oracle_value", False)
+                            else self.cfg.algorithm.loss_type
+                        ),
                         "logprob_type": self.cfg.algorithm.logprob_type,
                         "reward_type": self.cfg.algorithm.reward_type,
                         "single_action_dim": self.cfg.actor.model.get("action_dim", 7),

@@ -874,16 +874,18 @@ class RobometerHistoryRewardModel(BaseRewardModel):
 
         env_infos = observations.get("env_infos")
 
-        # Delta shaping: env_worker passes per-env pickup_counts + chunk_size so we
-        # select chunk-boundary frames (n_chunks+1) instead of uniformly
-        # down-sampling. max_robometer_frames is NOT applied in delta mode (boundary
-        # count is already small, bounded by episode chunk count).
+        # Delta / oracle_value shaping: env_worker passes per-env pickup_counts +
+        # chunk_size so we select chunk-boundary frames (n_chunks+1) instead of
+        # uniformly down-sampling. max_robometer_frames is NOT applied in these
+        # modes (boundary count is already small, bounded by episode chunk count).
+        # oracle_value reuses the SAME boundary-frame selection as delta; the
+        # shaping-specific reconstruction happens later in env_worker.
         shaping = observations.get("shaping", "absolute")
         preselected = bool(observations.get("robometer_history_preselected", False))
         pickup_counts = observations.get("pickup_counts", None)
         chunk_size = int(observations.get("chunk_size", 0) or 0)
-        delta_mode = shaping == "delta"
-        if delta_mode:
+        boundary_mode = shaping in ("delta", "oracle_value")
+        if boundary_mode:
             if pickup_counts is None:
                 raise ValueError(
                     "Delta shaping requires `pickup_counts` in the reward input."
@@ -907,7 +909,7 @@ class RobometerHistoryRewardModel(BaseRewardModel):
                 # Env workers select the exact same deterministic frame indices
                 # before Ray serialization.  Do not apply those indices again.
                 pass
-            elif delta_mode:
+            elif boundary_mode:
                 # Select chunk-boundary frames (start of insertion + after each
                 # chunk). env_worker recomputes the SAME indices' count to map
                 # boundary progress -> chunks in reconstruct_robometer_delta_reward.

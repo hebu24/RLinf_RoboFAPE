@@ -45,7 +45,7 @@ defaults:
   - env/maniskill_peg_insertion_vertical_rl@env.train
   - env/maniskill_peg_insertion_vertical_rl@env.eval
   - model/pi0_5@actor.model
-  - training-backend/fsdp@actor.fsdp_config
+  - training_backend/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
 
@@ -97,8 +97,8 @@ algorithm:
   entropy_type: chunk_level
   update_epoch: 1
   adv_type: gae                     # GAE else-branch (advantages.py:61) consumes the injected oracle values
-  loss_type: actor                  # actor-only: NO critic loss (registered losses.py:564)
-  use_oracle_value: True            # skip the value-head forward during training (compute_values=False)
+  loss_type: decoupled_actor_critic  # entry-point runner/worker selection; use_oracle_value dispatches to actor-only loss inside the worker
+  use_oracle_value: True            # skip value-head forward + dispatch to actor-only loss (no critic)
   loss_agg_func: "token-mean"
   kl_beta: 0.05
   entropy_bonus: 0.0
