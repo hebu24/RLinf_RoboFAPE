@@ -276,6 +276,12 @@ class RobometerEpisodeReward:
     per_step_loss_mask: np.ndarray
     chunk_reward: np.ndarray
     chunk_loss_mask: np.ndarray
+    # Per-chunk oracle value V(s_chunk) for "oracle_value" shaping (progress used
+    # directly as the GAE value). Same [total_chunks, chunk_size] layout as
+    # ``chunk_reward`` (value at index 0, zeros elsewhere) so env_worker can
+    # scatter it into ``prev_values`` with the same indexing. None for
+    # absolute/delta shaping (value head supplies prev_values).
+    chunk_values: np.ndarray = None
     episode_success: bool = False
     initial_progress: float = float("nan")
     final_progress: float = float("nan")
@@ -560,6 +566,117 @@ def reconstruct_robometer_delta_reward(
                 ]
             )
         ),
+    )
+
+
+def reconstruct_robometer_oracle_value_reward(
+    boundary_progress: Any,
+    *,
+    history_len: int,
+    pickup_count: int,
+    success_trace: Any,
+    chunk_size: int,
+    total_chunks: int,
+    success_bonus: float = 1.0,
+    failure_terminal_penalty: float = -0.4,
+    fail_shift: float = 1.0,
+) -> RobometerEpisodeReward:
+    """Reconstruct per-chunk oracle value + terminal-only reward (oracle_value shaping).
+
+    Oracle-value shaping: Robometer boundary-frame progress is used DIRECTLY as
+    the GAE value ``V(s_chunk)``; the reward carries only terminal bonuses
+    (``success_bonus`` on success / ``failure_terminal_penalty`` on failure). The
+    per-chunk advantage under ``V = progress`` is the TD delta::
+
+        delta_i = r_i + gamma * V[i+1] * (~done) - V[i]
+                = gamma * prog[i+1] - prog[i]      (non-terminal; r_i = 0)
+
+    i.e. the chunk progress increment -- dense, low-variance, and equivalent to
+    potential-based reward shaping (Ng et al. 1999, Phi = progress), which is
+    policy-invariant w.r.t. the optimal policy.
+
+    Boundary progress, layout, and validation mirror
+    ``reconstruct_robometer_delta_reward``: ``boundary_progress`` has
+    ``total_chunks + 1`` entries; ``chunk_values[i]`` (the oracle V for chunk i)
+    is placed at index 0 of the ``[chunk_size]`` sub-step vector; ``loss_mask``
+    is True for all sub-steps of each insertion chunk. ``chunk_reward`` is zero
+    except the terminal chunk's bonus/penalty (the value-head bootstrap path is
+    overwritten by ``assign_history_reward`` for robometer episodes, so -- like
+    delta mode -- we use a fixed terminal penalty rather than a gamma*V
+    bootstrap).
+
+    The per-episode success/fail shift (``V -= fail_shift`` on failure) is a
+    constant offset. With ``gamma != 1`` it leaves a tiny
+    ``(gamma - 1) * shift`` residual in non-terminal deltas (negligible,
+    ~0.01/chunk at gamma=0.99); it only materially separates success from
+    failure at the terminal chunk.
+    """
+    if chunk_size <= 0 or total_chunks <= 0:
+        raise ValueError(
+            f"chunk_size and total_chunks must be positive, got {chunk_size=} {total_chunks=}."
+        )
+    success = np.asarray(success_trace, dtype=bool)
+    if success.shape[0] != history_len:
+        raise ValueError(
+            "Success trace must align with the complete Robometer history: "
+            f"{success.shape[0]=} vs {history_len=}."
+        )
+    n_expected = total_chunks + 1
+    prog = np.asarray(boundary_progress, dtype=np.float32)
+    if prog.shape[0] < n_expected:
+        raise ValueError(
+            "Robometer boundary progress is shorter than the completed episode's "
+            f"boundary frame count: expected={n_expected}, got {prog.shape[0]=}."
+        )
+    prog = prog[:n_expected]
+    if not np.isfinite(prog).all():
+        raise ValueError("Robometer returned non-finite boundary progress.")
+
+    insert_success = success[pickup_count:history_len]
+    episode_success = (
+        bool(insert_success.any()) if insert_success.size > 0 else False
+    )
+    # Per-episode constant shift: failed trajectories get V -= fail_shift so a
+    # failed episode that reached high progress still values below a successful
+    # one (matches the absolute-mode reward convention).
+    shift = 0.0 if episode_success else float(fail_shift)
+
+    chunk_reward = np.zeros((total_chunks, chunk_size), dtype=np.float32)
+    chunk_values = np.zeros((total_chunks, chunk_size), dtype=np.float32)
+    chunk_loss_mask = np.zeros((total_chunks, chunk_size), dtype=bool)
+
+    # Oracle V at chunk i = progress at chunk i's start boundary frame.
+    for i in range(total_chunks):
+        chunk_values[i, 0] = float(prog[i]) - shift
+        chunk_loss_mask[i, :] = True
+
+    # Terminal-only reward on the LAST chunk (mirrors delta's terminal handling;
+    # the value-head bootstrap is overwritten by assign_history_reward, so use a
+    # fixed bonus/penalty, not a gamma*V bootstrap).
+    if episode_success:
+        chunk_reward[-1, 0] += float(success_bonus)
+    else:
+        chunk_reward[-1, 0] += float(failure_terminal_penalty)
+
+    # Diagnostics: per-chunk delta (the effective dense signal) + terminal reward.
+    per_step_progress = prog[1:] - prog[:-1]
+    per_step_reward = chunk_reward[:, 0].copy()
+    per_step_loss_mask = np.ones(total_chunks, dtype=bool)
+
+    return RobometerEpisodeReward(
+        downsample_indices=_robometer_boundary_frame_indices(
+            history_len, pickup_count, chunk_size
+        ),
+        per_step_progress=per_step_progress,
+        per_step_reward=per_step_reward,
+        per_step_loss_mask=per_step_loss_mask,
+        chunk_reward=chunk_reward,
+        chunk_loss_mask=chunk_loss_mask,
+        chunk_values=chunk_values,
+        episode_success=episode_success,
+        initial_progress=float(prog[0]),
+        final_progress=float(prog[-1]),
+        success_bonus_sum=float(success_bonus) if episode_success else 0.0,
     )
 
 

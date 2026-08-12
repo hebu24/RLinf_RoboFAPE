@@ -1064,12 +1064,23 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             gamma=float(self.cfg.algorithm.get("gamma", 1.0)),
         )
 
+        # critic_free: force values=None so GAE's critic_free branch fires
+        # (gamma=lambda=1, advantage = cumulative reward = REINFORCE). Used by
+        # the delta+critic_free fallback. use_oracle_value: prev_values holds
+        # injected robometer progress (env_worker), used as the GAE value.
+        critic_free = self.cfg.algorithm.get("critic_free", False)
+        if critic_free:
+            gae_values = None
+        else:
+            gae_values = (
+                proximal_values if proximal_values is not None else prev_values
+            )
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
             "rewards": self.rollout_batch["rewards"],
             "dones": self.rollout_batch["dones"],
-            "values": proximal_values if proximal_values is not None else prev_values,
+            "values": gae_values,
             "gamma": self.cfg.algorithm.get("gamma", 1),
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
             "group_size": self.cfg.algorithm.get("group_size", 8),
@@ -1266,7 +1277,11 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.model.eval()
         post_update_logprobs_list = []
         post_update_values_list = []
-        compute_values = self.cfg.algorithm.adv_type == "gae"
+        # Skip the value-head forward when using an oracle value (robometer
+        # progress injected as prev_values by env_worker) -- no critic to update.
+        compute_values = self.cfg.algorithm.adv_type == "gae" and not (
+            self.cfg.algorithm.get("use_oracle_value", False)
+        )
 
         for micro_batch in iterator:
             micro_batch = put_tensor_device(micro_batch, self.device)
@@ -1464,7 +1479,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                     ]:
                         model_kwargs["prev_logprobs"] = old_logprobs
 
-                    compute_values = self.cfg.algorithm.adv_type == "gae"
+                    compute_values = self.cfg.algorithm.adv_type == "gae" and not (
+                        self.cfg.algorithm.get("use_oracle_value", False)
+                    )
 
                     with self.amp_context:
                         out = self.model(

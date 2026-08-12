@@ -46,6 +46,7 @@ from rlinf.models.embodiment.reward.robometer_reward_model import (
     _robometer_downsample_indices,
     reconstruct_robometer_delta_reward,
     reconstruct_robometer_episode_reward,
+    reconstruct_robometer_oracle_value_reward,
     robometer_assignment_metric_values,
 )
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
@@ -175,6 +176,18 @@ class EnvWorker(Worker):
             )
             self.delta_failure_terminal_penalty = float(
                 self.cfg.reward.get("delta", {}).get("failure_terminal_penalty", 0.0)
+            )
+            # Oracle-value shaping: robometer progress is used directly as the
+            # GAE value V(s_chunk); reward carries only terminal bonuses. See
+            # reconstruct_robometer_oracle_value_reward. Reuses delta's
+            # chunk-boundary frame selection.
+            self.oracle_success_bonus = float(
+                self.cfg.reward.get("oracle_value", {}).get("success_bonus", 1.0)
+            )
+            self.oracle_failure_terminal_penalty = float(
+                self.cfg.reward.get("oracle_value", {}).get(
+                    "failure_terminal_penalty", -0.4
+                )
             )
 
         # Env configurations
@@ -1593,6 +1606,10 @@ class EnvWorker(Worker):
         fail_shift = float(self.cfg.reward.model.get("fail_shift", 1.0))
         chunk_size = int(rollout_rewards[-1].shape[-1])
         delta_mode = self.reward_shaping == "delta"
+        oracle_value_mode = self.reward_shaping == "oracle_value"
+        # delta and oracle_value both POST chunk-boundary frames (total_chunks+1)
+        # instead of a uniformly down-sampled video.
+        boundary_mode = delta_mode or oracle_value_mode
         assignments: dict[int, RobometerEpisodeReward] = {}
         funnel_state = self._window_chunk_funnel[stage_id]
         for env_id, entry in stash.items():
@@ -1612,10 +1629,11 @@ class EnvWorker(Worker):
             insert_steps = history_len - pickup_count
             total_chunks = math.ceil(insert_steps / chunk_size)
             env_progress = reward[env_id].detach().cpu().numpy().astype(np.float32)
-            if delta_mode:
-                # Delta shaping: progress is one value per chunk-boundary frame
-                # (total_chunks + 1). max_robometer_frames is NOT applied; the
-                # boundary frame count is already bounded by episode chunk count.
+            if boundary_mode:
+                # Delta / oracle_value shaping: progress is one value per
+                # chunk-boundary frame (total_chunks + 1). max_robometer_frames
+                # is NOT applied; the boundary frame count is already bounded by
+                # episode chunk count.
                 expected_progress = len(
                     _robometer_boundary_frame_indices(
                         history_len, pickup_count, chunk_size
@@ -1627,16 +1645,29 @@ class EnvWorker(Worker):
                         f"episode's boundary frame count: env_id={env_id}, "
                         f"expected={expected_progress}, got={env_progress.shape[0]}."
                     )
-                assignment = reconstruct_robometer_delta_reward(
-                    env_progress[:expected_progress],
-                    history_len=history_len,
-                    pickup_count=pickup_count,
-                    success_trace=success_trace,
-                    chunk_size=chunk_size,
-                    total_chunks=total_chunks,
-                    success_bonus=self.delta_success_bonus,
-                    failure_terminal_penalty=self.delta_failure_terminal_penalty,
-                )
+                if oracle_value_mode:
+                    assignment = reconstruct_robometer_oracle_value_reward(
+                        env_progress[:expected_progress],
+                        history_len=history_len,
+                        pickup_count=pickup_count,
+                        success_trace=success_trace,
+                        chunk_size=chunk_size,
+                        total_chunks=total_chunks,
+                        success_bonus=self.oracle_success_bonus,
+                        failure_terminal_penalty=self.oracle_failure_terminal_penalty,
+                        fail_shift=fail_shift,
+                    )
+                else:
+                    assignment = reconstruct_robometer_delta_reward(
+                        env_progress[:expected_progress],
+                        history_len=history_len,
+                        pickup_count=pickup_count,
+                        success_trace=success_trace,
+                        chunk_size=chunk_size,
+                        total_chunks=total_chunks,
+                        success_bonus=self.delta_success_bonus,
+                        failure_terminal_penalty=self.delta_failure_terminal_penalty,
+                    )
             else:
                 expected_progress = len(
                     _robometer_downsample_indices(history_len, max_frames)
@@ -1665,21 +1696,27 @@ class EnvWorker(Worker):
                     with open(_rdebug_log_path(), "a") as _f:
                         _n_boundary = (
                             len(assignment.downsample_indices)
-                            if delta_mode
+                            if boundary_mode
                             else 0
                         )
                         _delta_sum = float(
                             np.asarray(assignment.chunk_reward[:, 0]).sum()
-                        ) if delta_mode else 0.0
+                        ) if boundary_mode else 0.0
                         _success_chunks = int(
                             np.asarray(assignment.chunk_reward[:, 0] > 0).sum()
-                        ) if delta_mode else 0
+                        ) if boundary_mode else 0
+                        _oracle_v0 = (
+                            float(np.asarray(assignment.chunk_values[:, 0])[0])
+                            if (oracle_value_mode and assignment.chunk_values is not None)
+                            else float("nan")
+                        )
                         _f.write(
                             f"[assign] env_id={env_id} shaping={self.reward_shaping} "
                             f"history_len={history_len} pickup={pickup_count} "
                             f"total_chunks={total_chunks} chunk_size={chunk_size} "
                             f"n_boundary={_n_boundary} delta_sum={_delta_sum:.4f} "
                             f"success_chunks={_success_chunks} "
+                            f"oracle_v0={_oracle_v0:.4f} "
                             f"episode_success={assignment.episode_success}\n"
                         )
                 except Exception:
@@ -1758,6 +1795,29 @@ class EnvWorker(Worker):
                         dtype=torch.bool,
                         device=target.device,
                     )
+                    # oracle_value: overwrite the value-head's prev_values for
+                    # this chunk with the robometer progress oracle V(s_chunk),
+                    # so GAE uses V=progress (advantage = TD delta = chunk
+                    # progress increment). Requires collect_prev_infos=True so
+                    # the prev_values list is populated. The +1 bootstrap
+                    # boundary entry (truncation) is left as the value-head
+                    # output -- only affects the last chunk of truncated
+                    # (failed) episodes; failure_terminal_penalty carries the
+                    # terminal signal. See reconstruct_robometer_oracle_value_reward.
+                    if (
+                        oracle_value_mode
+                        and assignment.chunk_values is not None
+                        and len(self.rollout_results[stage_id].prev_values)
+                        > local_chunk_idx
+                    ):
+                        pv_target = self.rollout_results[stage_id].prev_values[
+                            local_chunk_idx
+                        ]
+                        pv_target[env_id] = torch.as_tensor(
+                            [float(assignment.chunk_values[episode_chunk_idx, 0])],
+                            dtype=pv_target.dtype,
+                            device=pv_target.device,
+                        )
                     funnel_state["assigned_chunks"] += 1
                     funnel_state["assigned_chunk_refs"].add(
                         (env_id, episode_id, local_chunk_idx, episode_chunk_idx)
