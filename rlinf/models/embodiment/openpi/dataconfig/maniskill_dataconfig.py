@@ -134,7 +134,7 @@ class LeRobotManiSkillWristDataConfig(LeRobotManiSkillDataConfig):
             inputs=[
                 maniskill_policy.ManiSkillInputs(model_type=model_config.model_type)
             ],
-            outputs=[maniskill_policy.ManiSkillOutputs()],
+            outputs=[maniskill_policy.ManiSkillOutputs(action_dim=8)],
         )
 
         if self.extra_delta_transform:

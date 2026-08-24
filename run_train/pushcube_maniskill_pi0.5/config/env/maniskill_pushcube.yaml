@@ -1,0 +1,46 @@
+env_type: maniskill
+
+total_num_envs: null
+wrap_obs_mode: simple
+use_wrist_image: True
+use_wrist_back_image: False
+auto_reset: True
+ignore_terminations: False
+use_rel_reward: False
+reward_mode: raw
+action_scale: 1.0
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 180
+max_episode_steps: 180
+task_description: "Push the cube across the tabletop until its center lies inside the target region."
+reset_options:
+  randomize_initial_poses: True
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+  max_videos: 5
+
+enable_offload: False
+
+init_params:
+  id: PushCube-v1
+  num_envs: null
+  obs_mode: "rgb"
+  robot_uids: panda_wristcam
+  control_mode: "pd_joint_pos"
+  sim_backend: "gpu"
+  reward_mode: normalized_dense
+  max_episode_steps: ${..max_episode_steps}
+  render_mode: all
+  sensor_configs:
+    shader_pack: "default"
+    base_camera:
+      width: 224
+      height: 224
+    hand_camera:
+      width: 224
+      height: 224
