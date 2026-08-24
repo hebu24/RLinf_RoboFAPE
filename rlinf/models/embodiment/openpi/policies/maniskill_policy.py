@@ -125,16 +125,15 @@ class ManiSkillInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class ManiSkillOutputs(transforms.DataTransformFn):
-    """
-    This class is used to convert outputs from the model back the the dataset specific format. It is
-    used for inference only.
+    """Convert model outputs back to dataset action format (inference only).
 
-    For your own dataset, you can copy this class and modify the action dimension based on the comments below.
+    action_dim truncates the model output to the env action dimension. Default 7
+    (Libero / PegInsertion). PushCube pd_joint_pos (7 joints + 1 gripper) uses 8 so the
+    gripper action is retained instead of dropped by the old hardcoded [:, :7].
     """
+    action_dim: int = 7
 
     def __call__(self, data: dict) -> dict:
         # Only return the first N actions -- since we padded actions above to fit the model action
         # dimension, we need to now parse out the correct number of actions in the return dict.
-        # For Libero, we only return the first 7 actions (since the rest is padding).
-        # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        return {"actions": np.asarray(data["actions"][:, :self.action_dim])}

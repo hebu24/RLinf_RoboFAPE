@@ -264,9 +264,17 @@ class ManiskillEnv(gym.Env):
                 elif self.use_full_state:
                     state = self._get_full_state_obs()
                 else:
-                    state = common.flatten_state_dict(
-                        raw_obs, use_torch=True, device=self.device
-                    )
+                    # Default proprio = robot qpos (matches collectors that store
+                    # agent/qpos as observation.state). flatten_state_dict produced a
+                    # mismatched dim for tasks lacking get_pi05_proprio (e.g. PushCube-v1
+                    # gave 25-dim flatten vs 9-dim qpos/norm_stats).
+                    _robot = getattr(getattr(self.env.unwrapped, "agent", None), "robot", None)
+                    if _robot is not None:
+                        state = _robot.get_qpos().to(self.device, dtype=torch.float32)
+                    else:
+                        state = common.flatten_state_dict(
+                            raw_obs, use_torch=True, device=self.device
+                        )
 
                 main_images = sensor_data["base_camera"]["rgb"]
                 sorted_images = OrderedDict(sorted(sensor_data.items()))

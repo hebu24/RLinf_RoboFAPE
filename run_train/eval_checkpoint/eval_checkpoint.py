@@ -190,7 +190,7 @@ def build_config(args: argparse.Namespace, hydra_overrides: list[str]) -> DictCo
             "evaluates a fixed-size parallel batch each rollout epoch"
         )
 
-    with initialize_config_dir(version_base="1.1", config_dir=str(config_dir)):
+    with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         cfg = compose(config_name=args.config_name, overrides=hydra_overrides)
 
     actor_model = cfg.get("actor", {}).get("model")

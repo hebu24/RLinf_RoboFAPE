@@ -436,6 +436,12 @@ class RecordVideo(gym.Wrapper):
         return result
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
+        # Cap saved videos per process (per seed). video_cnt spans every episode
+        # across the vectorized envs, so max_videos=N keeps exactly N videos.
+        _max_videos = getattr(self.video_cfg, "max_videos", None)
+        if _max_videos is not None and self.video_cnt >= int(_max_videos):
+            self.render_images = []
+            return
         """Write buffered frames to an MP4 file.
 
         The encode happens on the background thread pool, but we wait for the
