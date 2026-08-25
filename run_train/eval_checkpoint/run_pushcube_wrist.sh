@@ -54,6 +54,8 @@ fi
 export EMBODIED_PATH="${CONFIG_DIR%/config}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+[[ -f /etc/vulkan/icd.d/nvidia_icd.json ]] && export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/etc/vulkan/icd.d/nvidia_icd.json}"
+[[ -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json ]] && export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
 export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
 export HYDRA_FULL_ERROR=1
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
@@ -63,9 +65,12 @@ EVAL_RAY_PORT="${EVAL_RAY_PORT:-6380}"
 export RAY_ADDRESS="${RAY_ADDRESS:-127.0.0.1:${EVAL_RAY_PORT}}"
 
 _eval_scoped_ray_kill() {
+  local ray_tmp_dir="${RAY_TMP_DIR:-/tmp/ray_eval_pushcube}"
   pkill -9 -f "gcs_server.*--gcs_server_port=${EVAL_RAY_PORT}"  >/dev/null 2>&1 || true
   pkill -9 -f "raylet.*--gcs-address=[^ ]*:${EVAL_RAY_PORT}"    >/dev/null 2>&1 || true
   pkill -9 -f "dashboard.*--gcs-address=[^ ]*:${EVAL_RAY_PORT}" >/dev/null 2>&1 || true
+  pkill -9 -f "ray/autoscaler/_private/monitor.py.*--logs-dir=${ray_tmp_dir}/" >/dev/null 2>&1 || true
+  pkill -9 -f "ray/_private/log_monitor.py.*--session-dir=${ray_tmp_dir}/" >/dev/null 2>&1 || true
   sleep 2
 }
 
@@ -79,7 +84,7 @@ if [[ "${MANAGE_RAY}" == "true" ]]; then
     mkdir -p "${RAY_TMP_DIR}"
     unset CUDA_VISIBLE_DEVICES
     _eval_scoped_ray_kill
-    "${RAY_BIN}" start --head --port="${EVAL_RAY_PORT}" --temp-dir="${RAY_TMP_DIR}" --include-dashboard=false
+    "${RAY_BIN}" start --head --port="${EVAL_RAY_PORT}" --temp-dir="${RAY_TMP_DIR}" --include-dashboard=true --dashboard-host=127.0.0.1 --dashboard-port="${EVAL_RAY_DASHBOARD_PORT:-8265}"
     _EVAL_STARTED_RAY=true
     export RLINF_EVAL_STARTED_RAY=1
     export RAY_ADDRESS="127.0.0.1:${EVAL_RAY_PORT}"

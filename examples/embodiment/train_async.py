@@ -31,7 +31,7 @@ mp.set_start_method("spawn", force=True)
 
 
 @hydra.main(
-    version_base="1.1", config_path="config", config_name="maniskill_sac_mlp_async"
+    version_base=None, config_path="config", config_name="maniskill_sac_mlp_async"
 )
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)

@@ -27,8 +27,8 @@ import matplotlib.pyplot as plt
 
 
 REPO_PATH = Path(__file__).resolve().parents[2]
-STEP_RE = re.compile(r"global_step_(\d+)$")
-EXPECTED_CKPT_SUBDIRS = ("dcp_checkpoint", "model_state_dict", "physical-intelligence")
+STEP_RE = re.compile(r"global_step_(\d+)(?:_trainenvstep_\d+)?$")
+EXPECTED_CKPT_ENTRIES = ("dcp_checkpoint", "model_state_dict", "trainer_state.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,19 +38,23 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--checkpoint-dir", required=True, help="Directory containing global_step_*/actor checkpoints.")
     p.add_argument("--output-dir", default=None, help="Dir for per-(step,seed) logs, CSV, JSON, plots.")
-    p.add_argument("--venv-dir", default="/opt/kairan/envs/rlinf")
+    p.add_argument("--venv-dir", default="/data/yingxi/RLinf_RoboFAPE/.venv")
     p.add_argument("--run-script", default=str(REPO_PATH / "run_train/eval_checkpoint/run_pushcube_wrist.sh"))
-    p.add_argument("--gpu-ids", default="7")
+    p.add_argument("--gpu-ids", default="3")
     p.add_argument("--seeds", default="0-7", help="Seed range or comma list, e.g. 0-7 or 0,2,4.")
     p.add_argument("--num-eval-episodes", type=int, default=50)
     p.add_argument("--num-envs", type=int, default=50)
-    p.add_argument("--max-episode-steps", type=int, default=180)
+    p.add_argument("--max-episode-steps", type=int, default=200)
     p.add_argument("--action-scale", type=float, default=1.0)
     p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--manage-ray", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--ray-port", type=int, default=6380)
+    p.add_argument("--ray-port", type=int, default=6387)
     p.add_argument("--ray-object-store-memory", type=int, default=50_000_000_000)
-    p.add_argument("--ray-dashboard-port", type=int, default=8266)
+    p.add_argument("--ray-dashboard-port", type=int, default=8267)
+    p.add_argument("--ray-dashboard-agent-port", type=int, default=52373)
+    p.add_argument("--ray-min-worker-port", type=int, default=13400)
+    p.add_argument("--ray-max-worker-port", type=int, default=13799)
+    p.add_argument("--ray-temp-dir", default=None)
     p.add_argument("--resume", action="store_true", help="Reuse existing per-(step,seed) trajectory_metrics.json.")
     p.add_argument("--continue-on-error", action="store_true")
     p.add_argument("--watch", action="store_true", help="Poll for new checkpoints and eval each as it completes.")
@@ -109,8 +113,8 @@ def discover_checkpoints(checkpoint_dir: Path, only_steps: set[int] | None = Non
 
 
 def ckpt_is_complete(actor_dir: Path) -> bool:
-    """A checkpoint is complete when all expected subdirs are present."""
-    return all((actor_dir / sub).exists() for sub in EXPECTED_CKPT_SUBDIRS)
+    """A RLinf actor checkpoint is complete when its saved state is present."""
+    return all((actor_dir / entry).exists() for entry in EXPECTED_CKPT_ENTRIES)
 
 
 def ckpt_mtime(actor_dir: Path) -> float:
@@ -231,6 +235,20 @@ def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
             xm.append(st)
             ym.append(mean(vals))
     ax.plot(xm, ym, marker="o", markersize=6, linewidth=2.6, alpha=1.0, color="black", label="mean SR", zorder=10)
+    for idx, (x, y) in enumerate(zip(xm, ym)):
+        y_offset = 8 if idx % 2 == 0 else -12
+        ax.annotate(
+            f"{y:.2f}",
+            (x, y),
+            textcoords="offset points",
+            xytext=(0, y_offset),
+            ha="center",
+            va="bottom" if y_offset >= 0 else "top",
+            fontsize=7,
+            color="black",
+            alpha=0.9,
+            zorder=11,
+        )
     ax.set_xlabel("Training step")
     ax.set_ylabel("Success rate")
     ax.set_ylim(-0.05, 1.05)
@@ -240,7 +258,32 @@ def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     out = output_dir / "sr_vs_step_multiseed.png"
     fig.savefig(out, dpi=180)
     plt.close(fig)
+    write_index_html(output_dir)
     print(f"Wrote {out}")
+
+
+def write_index_html(output_dir: Path) -> None:
+    html = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="30">
+  <title>PushCube Eval Sweep</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; background: #fafafa; color: #111; }
+    img { max-width: 100%; border: 1px solid #ddd; background: white; }
+    a { color: #0645ad; }
+  </style>
+</head>
+<body>
+  <h1>PushCube Eval Sweep</h1>
+  <p>Auto-refreshes every 30 seconds.</p>
+  <p><a href="pushcube_sweep_metrics.csv">CSV</a> | <a href="pushcube_sweep_metrics.json">JSON</a></p>
+  <img src="sr_vs_step_multiseed.png" alt="Success rate vs training step">
+</body>
+</html>
+"""
+    (output_dir / "index.html").write_text(html, encoding="utf-8")
 
 
 def raise_file_descriptor_limit(minimum: int = 65536) -> None:
@@ -259,6 +302,7 @@ def _scoped_ray_kill(ray_port: int) -> None:
         f"gcs_server.*--gcs_server_port={ray_port}",
         f"raylet.*--gcs-address=[^ ]*:{ray_port}",
         f"dashboard.*--gcs-address=[^ ]*:{ray_port}",
+        f"dashboard_agent.*--gcs-address=[^ ]*:{ray_port}",
     ):
         subprocess.run(["pkill", "-9", "-f", pattern], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
@@ -269,7 +313,7 @@ def start_shared_ray(args: argparse.Namespace) -> None:
     ray_bin = Path(args.venv_dir).expanduser().resolve() / "bin" / "ray"
     if not ray_bin.exists():
         raise FileNotFoundError(f"Ray binary not found: {ray_bin}")
-    ray_tmp = Path(f"/opt/yingxi/ray_tmp_eval_sweep_{os.getpid()}")
+    ray_tmp = Path(args.ray_temp_dir or f"/data/yingxi/ray_tmp_eval_sweep_{args.ray_port}")
     ray_tmp.mkdir(parents=True, exist_ok=True)
     _scoped_ray_kill(args.ray_port)
     os.environ.pop("RAY_ADDRESS", None)
@@ -279,7 +323,11 @@ def start_shared_ray(args: argparse.Namespace) -> None:
             f"--port={args.ray_port}",
             f"--temp-dir={ray_tmp}",
             f"--num-cpus=48",
+            "--dashboard-host=127.0.0.1",
             f"--dashboard-port={int(args.ray_dashboard_port)}",
+            f"--dashboard-agent-listen-port={int(args.ray_dashboard_agent_port)}",
+            f"--min-worker-port={int(args.ray_min_worker_port)}",
+            f"--max-worker-port={int(args.ray_max_worker_port)}",
             f"--object-store-memory={int(args.ray_object_store_memory)}",
         ],
         check=True,
@@ -289,12 +337,19 @@ def start_shared_ray(args: argparse.Namespace) -> None:
 
 def stop_shared_ray(args: argparse.Namespace) -> None:
     _scoped_ray_kill(int(args.ray_port))
-    shutil.rmtree(f"/opt/yingxi/ray_tmp_eval_sweep_{os.getpid()}", ignore_errors=True)
+    shutil.rmtree(args.ray_temp_dir or f"/data/yingxi/ray_tmp_eval_sweep_{args.ray_port}", ignore_errors=True)
 
 
 def eval_checkpoint_all_seeds(step: int, checkpoint_path: Path, output_dir: Path, args: argparse.Namespace, rows: list, lock) -> None:
     """Evaluate all seeds for one checkpoint (serial, single GPU). Append rows + replot."""
     for seed in parse_seeds(args.seeds):
+        with lock:
+            if args.resume and any(
+                "success_rate" in r and int(r["step"]) == step and int(r["seed"]) == seed
+                for r in rows
+            ):
+                print(f"[step {step} seed {seed}] already complete; skipping", flush=True)
+                continue
         log_dir = output_dir / f"global_step_{step}" / f"seed_{seed}"
         try:
             row = run_eval_for_step_seed(
@@ -333,11 +388,11 @@ def watch_loop(args: argparse.Namespace, output_dir: Path, rows: list, lock) -> 
     # will skip the already-done seeds and only redo the missing ones).
     all_seeds = parse_seeds(args.seeds)
     from collections import defaultdict
-    seed_count: dict[int, int] = defaultdict(int)
+    seed_count: dict[int, set[int]] = defaultdict(set)
     for r in rows:
         if "success_rate" in r:
-            seed_count[int(r["step"])] += 1
-    seen: set[int] = set(step for step, cnt in seed_count.items() if cnt >= len(all_seeds))
+            seed_count[int(r["step"])].add(int(r["seed"]))
+    seen: set[int] = set(step for step, seeds in seed_count.items() if set(all_seeds).issubset(seeds))
     print(f"[watch] start; checkpoint_dir={checkpoint_dir}; seen={sorted(seen)} (full-seed steps); "
           f"partial={[s for s in sorted(seed_count) if s not in seen]}", flush=True)
     while True:
@@ -365,9 +420,13 @@ def watch_loop(args: argparse.Namespace, output_dir: Path, rows: list, lock) -> 
             step, path = candidates[0]
             print(f"[watch] new completed checkpoint: global_step_{step}", flush=True)
             eval_checkpoint_all_seeds(step, path, output_dir, args, rows, lock)
-            seen.add(step)
             with lock:
                 completed = [r for r in rows if "success_rate" in r]
+                completed_seeds = {
+                    int(r["seed"]) for r in completed if int(r["step"]) == step
+                }
+                if set(all_seeds).issubset(completed_seeds):
+                    seen.add(step)
                 if completed:
                     by_step: dict[int, list[float]] = {}
                     for r in completed:
@@ -391,6 +450,7 @@ def main() -> None:
         else REPO_PATH / "logs" / "pushcube_wrist_ckpt_sweep"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    write_index_html(output_dir)
 
     rows: list[dict[str, Any]] = []
     lock = threading.Lock()
@@ -405,6 +465,9 @@ def main() -> None:
                         rows.append(summarize_step_seed(step, seed, path, traj))
                     except Exception:
                         pass
+        if rows:
+            write_rows(rows, output_dir)
+            plot_rows(rows, output_dir)
 
     if args.manage_ray:
         start_shared_ray(args)

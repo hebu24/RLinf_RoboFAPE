@@ -98,10 +98,11 @@ class ManiskillEnv(gym.Env):
     ):
         env_seed = cfg.seed
         self.shared_reset_seed = bool(getattr(cfg, "shared_reset_seed", False))
-        # Training normally decorrelates environment workers by rank.  For
-        # deterministic SFT-baseline runs, deliberately keep every worker on
+        # Training normally decorrelates every vector env with consecutive seeds.
+        # For deterministic SFT-baseline runs, deliberately keep every worker on
         # the exact same reset seed instead.
-        self.seed = env_seed if self.shared_reset_seed else env_seed + seed_offset
+        self.seed_offset = int(seed_offset)
+        self.seed = env_seed if self.shared_reset_seed else env_seed + self.seed_offset
         self.total_num_processes = total_num_processes
         self.worker_info = worker_info
         self.auto_reset = cfg.auto_reset
@@ -149,6 +150,14 @@ class ManiskillEnv(gym.Env):
     @property
     def num_envs(self):
         return self.env.unwrapped.num_envs
+
+    @property
+    def reset_seed(self):
+        if self.shared_reset_seed:
+            return self.seed
+        base_seed = int(getattr(self.cfg, "seed", 0))
+        start = base_seed + self.seed_offset * int(self.num_envs)
+        return list(range(start, start + int(self.num_envs)))
 
     @property
     def device(self):
@@ -436,7 +445,7 @@ class ManiskillEnv(gym.Env):
         options: Optional[dict] = None,
     ):
         if options is None:
-            seed = self.seed
+            seed = self.reset_seed
             options = (
                 {"episode_id": self.reset_state_ids}
                 if self.use_fixed_reset_state_ids

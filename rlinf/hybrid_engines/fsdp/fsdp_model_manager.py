@@ -14,7 +14,9 @@
 
 import json
 import os
+import shutil
 import warnings
+from pathlib import Path
 from typing import ContextManager, Union
 
 import torch
@@ -357,6 +359,34 @@ class FSDPModelManager:
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
 
+    def _copy_openpi_norm_stats(self, save_path: str) -> None:
+        if SupportedModel(self._cfg.model.model_type) != SupportedModel.OPENPI:
+            return
+
+        model_path = Path(self._cfg.model.model_path)
+        if not model_path.exists():
+            self._logger.warning(
+                f"[FSDP] model_path does not exist, cannot copy norm_stats: {model_path}"
+            )
+            return
+
+        copied = False
+        for src_norm_stats in model_path.rglob("norm_stats.json"):
+            if not src_norm_stats.is_file():
+                continue
+            dest_norm_stats = Path(save_path) / src_norm_stats.relative_to(model_path)
+            dest_norm_stats.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_norm_stats, dest_norm_stats)
+            self._logger.info(
+                f"[FSDP] Copied norm_stats.json from {src_norm_stats} to {dest_norm_stats}"
+            )
+            copied = True
+
+        if not copied:
+            self._logger.warning(
+                f"[FSDP] Could not find norm_stats.json under model_path={model_path}; rollout/eval will fail to load norm stats."
+            )
+
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """
         Save checkpoint to local path.
@@ -383,6 +413,7 @@ class FSDPModelManager:
             ),
         )
         if torch.distributed.get_rank() == 0:
+            self._copy_openpi_norm_stats(save_path)
             trainer_state_path = os.path.join(save_path, "trainer_state.json")
             with open(trainer_state_path, "w") as trainer_state_file:
                 json.dump(

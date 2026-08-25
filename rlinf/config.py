@@ -1054,11 +1054,21 @@ def validate_embodied_cfg(cfg):
                 else:
                     raise NotImplementedError(f"Robot {robot} not supported")
 
-            if cfg.env.get("train", None) is not None:
+            def control_mode_is_unset(env_cfg):
+                control_mode = env_cfg.init_params.get("control_mode", None)
+                return control_mode is None or str(control_mode).lower() == "none"
+
+            if (
+                cfg.env.get("train", None) is not None
+                and control_mode_is_unset(cfg.env.train)
+            ):
                 cfg.env.train.init_params.control_mode = get_robot_control_mode(
                     model_cfg.policy_setup
                 )
-            if cfg.env.get("eval", None) is not None:
+            if (
+                cfg.env.get("eval", None) is not None
+                and control_mode_is_unset(cfg.env.eval)
+            ):
                 cfg.env.eval.init_params.control_mode = get_robot_control_mode(
                     model_cfg.policy_setup
                 )
