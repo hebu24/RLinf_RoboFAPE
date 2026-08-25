@@ -29,6 +29,12 @@ import matplotlib.pyplot as plt
 REPO_PATH = Path(__file__).resolve().parents[2]
 STEP_RE = re.compile(r"global_step_(\d+)(?:_trainenvstep_\d+)?$")
 EXPECTED_CKPT_ENTRIES = ("dcp_checkpoint", "model_state_dict", "trainer_state.json")
+SFT_BASELINE_SWEEP_DIR = Path(
+    "/data/yingxi/RLinf_RoboFAPE/logs/"
+    "pushcube_sft_wrist_filtered_conservative_20260823/sweep_multiseed"
+)
+SFT_BASELINE_SOURCE_STEP = 20000
+SFT_BASELINE_PLOT_STEP = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--manage-ray", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--ray-port", type=int, default=6387)
+    p.add_argument("--ray-num-cpus", type=int, default=8, help="CPU slots exposed to the managed Ray eval cluster.")
     p.add_argument("--ray-object-store-memory", type=int, default=50_000_000_000)
     p.add_argument("--ray-dashboard-port", type=int, default=8267)
     p.add_argument("--ray-dashboard-agent-port", type=int, default=52373)
@@ -139,6 +146,22 @@ def _to_float_list(values: Any) -> list[float]:
     return [float(v) for v in values]
 
 
+def load_sft_baseline_rows() -> list[dict[str, Any]]:
+    csv_path = SFT_BASELINE_SWEEP_DIR / "pushcube_sweep_metrics.csv"
+    if not csv_path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if int(float(row.get("step", -1))) != SFT_BASELINE_SOURCE_STEP:
+                continue
+            row = dict(row)
+            row["step"] = SFT_BASELINE_PLOT_STEP
+            rows.append(row)
+    return rows
+
+
 def summarize_step_seed(step: int, seed: int, checkpoint_path: Path, traj_path: Path) -> dict[str, Any]:
     metrics = json.loads(traj_path.read_text(encoding="utf-8"))
     success_values = _to_float_list(metrics.get("success_once"))
@@ -158,7 +181,7 @@ def summarize_step_seed(step: int, seed: int, checkpoint_path: Path, traj_path: 
     return row
 
 
-def run_eval_for_step_seed(*, checkpoint_path: Path, step: int, seed: int, log_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+def run_eval_for_step_seed(*, checkpoint_path: Path, step: int, seed: int, gpu_id: str, log_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     traj_path = log_dir / "trajectory_metrics.json"
     if args.resume and traj_path.exists():
         return summarize_step_seed(step, seed, checkpoint_path, traj_path)
@@ -170,7 +193,7 @@ def run_eval_for_step_seed(*, checkpoint_path: Path, step: int, seed: int, log_d
             "VENV_DIR": args.venv_dir,
             "CHECKPOINT_PATH": str(checkpoint_path),
             "LOG_DIR": str(log_dir),
-            "GPU_IDS": args.gpu_ids,
+            "GPU_IDS": gpu_id,
             "NUM_EVAL_EPISODES": str(args.num_eval_episodes),
             "NUM_ENVS": str(args.num_envs),
             "MAX_EPISODE_STEPS": str(args.max_episode_steps),
@@ -179,6 +202,15 @@ def run_eval_for_step_seed(*, checkpoint_path: Path, step: int, seed: int, log_d
             "SAVE_VIDEO": "true" if args.save_video else "false",
             "MANAGE_RAY": "false",  # sweep owns the shared Ray head
             "RAY_TMP_DIR": f"/tmp/ray_eval_pushcube_{os.getpid()}_{step}_{seed}",
+            "TORCHINDUCTOR_COMPILE_THREADS": "4",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "TF_NUM_INTRAOP_THREADS": "1",
+            "TF_NUM_INTEROP_THREADS": "1",
+            "NUMEXPR_MAX_THREADS": "1",
+            "JAX_NUM_THREADS": "1",
+            "TOKENIZERS_PARALLELISM": "false",
         }
     )
     run_script = args.run_script
@@ -322,7 +354,7 @@ def start_shared_ray(args: argparse.Namespace) -> None:
             str(ray_bin), "start", "--head",
             f"--port={args.ray_port}",
             f"--temp-dir={ray_tmp}",
-            f"--num-cpus=48",
+            f"--num-cpus={int(args.ray_num_cpus)}",
             "--dashboard-host=127.0.0.1",
             f"--dashboard-port={int(args.ray_dashboard_port)}",
             f"--dashboard-agent-listen-port={int(args.ray_dashboard_agent_port)}",
@@ -341,32 +373,62 @@ def stop_shared_ray(args: argparse.Namespace) -> None:
 
 
 def eval_checkpoint_all_seeds(step: int, checkpoint_path: Path, output_dir: Path, args: argparse.Namespace, rows: list, lock) -> None:
-    """Evaluate all seeds for one checkpoint (serial, single GPU). Append rows + replot."""
-    for seed in parse_seeds(args.seeds):
-        with lock:
-            if args.resume and any(
-                "success_rate" in r and int(r["step"]) == step and int(r["seed"]) == seed
-                for r in rows
-            ):
-                print(f"[step {step} seed {seed}] already complete; skipping", flush=True)
-                continue
-        log_dir = output_dir / f"global_step_{step}" / f"seed_{seed}"
-        try:
-            row = run_eval_for_step_seed(
-                checkpoint_path=checkpoint_path, step=step, seed=seed, log_dir=log_dir, args=args
-            )
-        except Exception as exc:
-            print(f"[step {step} seed {seed}] FAILED: {exc}", file=sys.stderr, flush=True)
-            if not args.continue_on_error and not args.watch:
-                raise
-            row = {"step": step, "seed": seed, "checkpoint_path": str(checkpoint_path), "error": str(exc)}
-        with lock:
-            rows.append(row)
-            write_rows(rows, output_dir)
-            plot_rows(rows, output_dir)
-            # emit a line the Monitor can catch
-            if "success_rate" in row:
-                print(f"[done] step {step} seed {seed} sr={row['success_rate']:.4f}", flush=True)
+    """Evaluate all seeds for one checkpoint in parallel across GPU groups."""
+    seeds = parse_seeds(args.seeds)
+    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    if not gpu_ids:
+        raise ValueError("--gpu-ids must contain at least one GPU id")
+
+    seed_groups = [seeds[i::len(gpu_ids)] for i in range(len(gpu_ids))]
+    stop_event = threading.Event()
+    errors: list[BaseException] = []
+
+    def worker(gpu_id: str, seed_group: list[int]) -> None:
+        for seed in seed_group:
+            if stop_event.is_set():
+                return
+            with lock:
+                if args.resume and any(
+                    "success_rate" in r and int(r["step"]) == step and int(r["seed"]) == seed
+                    for r in rows
+                ):
+                    print(f"[step {step} seed {seed}] already complete; skipping", flush=True)
+                    continue
+            log_dir = output_dir / f"global_step_{step}" / f"seed_{seed}"
+            try:
+                row = run_eval_for_step_seed(
+                    checkpoint_path=checkpoint_path,
+                    step=step,
+                    seed=seed,
+                    gpu_id=gpu_id,
+                    log_dir=log_dir,
+                    args=args,
+                )
+            except Exception as exc:
+                print(f"[step {step} seed {seed}] FAILED: {exc}", file=sys.stderr, flush=True)
+                if not args.continue_on_error and not args.watch:
+                    errors.append(exc)
+                    stop_event.set()
+                    return
+                row = {"step": step, "seed": seed, "checkpoint_path": str(checkpoint_path), "error": str(exc)}
+            with lock:
+                rows.append(row)
+                write_rows(rows, output_dir)
+                plot_rows(rows, output_dir)
+                if "success_rate" in row:
+                    print(f"[done] step {step} seed {seed} sr={row['success_rate']:.4f} gpu={gpu_id}", flush=True)
+
+    threads: list[threading.Thread] = []
+    for gpu_id, seed_group in zip(gpu_ids, seed_groups):
+        if not seed_group:
+            continue
+        t = threading.Thread(target=worker, args=(gpu_id, seed_group), daemon=True)
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+    if errors and not args.continue_on_error and not args.watch:
+        raise errors[0]
 
 
 def discover_completed_checkpoints(checkpoint_dir: Path, seen: set[int]) -> list[tuple[int, Path]]:
@@ -465,9 +527,12 @@ def main() -> None:
                         rows.append(summarize_step_seed(step, seed, path, traj))
                     except Exception:
                         pass
-        if rows:
-            write_rows(rows, output_dir)
-            plot_rows(rows, output_dir)
+    baseline_rows = load_sft_baseline_rows()
+    if baseline_rows and not any(int(r.get("step", -1)) == SFT_BASELINE_PLOT_STEP for r in rows):
+        rows = baseline_rows + rows
+    if rows:
+        write_rows(rows, output_dir)
+        plot_rows(rows, output_dir)
 
     if args.manage_ray:
         start_shared_ray(args)

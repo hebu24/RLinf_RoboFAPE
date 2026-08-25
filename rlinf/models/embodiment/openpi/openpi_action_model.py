@@ -14,6 +14,7 @@
 
 import math
 import random
+import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -262,6 +263,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
 
+    def _input_transform_workers(self, batch_size: int) -> int:
+        raw = os.environ.get("OPENPI_INPUT_TRANSFORM_MAX_WORKERS", "1")
+        try:
+            limit = int(raw)
+        except ValueError:
+            limit = 1
+        limit = max(1, limit)
+        return min(batch_size, limit)
+
     def input_transform(self, obs: dict, transpose=True):
         inputs = tree_map(lambda x: x, obs)
         # process input
@@ -294,8 +304,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 sample["prompt"] = "xxxx"
             batch_samples.append(sample)
         # transform
-        with ThreadPoolExecutor(max_workers=min(len(batch_samples), 8)) as ex:
-            transformed_samples = list(ex.map(self._input_transform, batch_samples))
+        workers = self._input_transform_workers(len(batch_samples))
+        if workers == 1:
+            transformed_samples = [self._input_transform(sample) for sample in batch_samples]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                transformed_samples = list(ex.map(self._input_transform, batch_samples))
         # recombine
         inputs = tree_map(
             lambda *torch_arr: torch.from_numpy(np.asarray(torch_arr).copy()),

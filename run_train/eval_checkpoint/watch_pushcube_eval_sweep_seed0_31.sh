@@ -16,10 +16,10 @@ exec /data/yingxi/RLinf_RoboFAPE/.venv/bin/python \
   --watch \
   --resume \
   --continue-on-error \
-  --gpu-ids 3 \
+  --gpu-ids 0,1,2,3 \
   --seeds 0-7 \
   --num-eval-episodes 50 \
-  --num-envs 50 \
+  --num-envs 10 \
   --max-episode-steps 200 \
   --ray-port 6387 \
   --ray-dashboard-port 8267 \

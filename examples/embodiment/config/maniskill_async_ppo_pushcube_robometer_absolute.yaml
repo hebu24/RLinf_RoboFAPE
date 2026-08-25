@@ -147,13 +147,13 @@ actor:
       joint_logprob: False
     policy_setup: panda
   optim:
-    lr: 3.0e-7
+    lr: 5.0e-7
     value_lr: 5.0e-5
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-05
     clip_grad: 1.0
-    critic_warmup_steps: 15
+    critic_warmup_steps: 50
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"
