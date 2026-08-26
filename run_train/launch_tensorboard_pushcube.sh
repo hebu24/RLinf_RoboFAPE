@@ -3,8 +3,8 @@ set -euo pipefail
 
 cd /data/yingxi/RLinf_RoboFAPE
 
-exec /data/yingxi/RLinf_RoboFAPE/.venv/bin/tensorboard \
-  --logdir /data/yingxi/RLinf_RoboFAPE/logs \
+exec "${TENSORBOARD_BIN:-/data/yingxi/RLinf_RoboFAPE/.venv/bin/tensorboard}" \
+  --logdir "${TB_LOGDIR:-/data/yingxi/RLinf_RoboFAPE/logs}" \
   --host 0.0.0.0 \
-  --port 6006 \
-  --reload_interval 30
+  --port "${TB_PORT:-6006}" \
+  --reload_interval "${TB_RELOAD_INTERVAL:-30}"

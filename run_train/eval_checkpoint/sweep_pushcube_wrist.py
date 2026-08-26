@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ray-object-store-memory", type=int, default=50_000_000_000)
     p.add_argument("--ray-dashboard-port", type=int, default=8267)
     p.add_argument("--ray-dashboard-agent-port", type=int, default=52373)
+    p.add_argument("--ray-client-server-port", type=int, default=10041)
     p.add_argument("--ray-min-worker-port", type=int, default=13400)
     p.add_argument("--ray-max-worker-port", type=int, default=13799)
     p.add_argument("--ray-temp-dir", default=None)
@@ -335,6 +336,7 @@ def _scoped_ray_kill(ray_port: int) -> None:
         f"raylet.*--gcs-address=[^ ]*:{ray_port}",
         f"dashboard.*--gcs-address=[^ ]*:{ray_port}",
         f"dashboard_agent.*--gcs-address=[^ ]*:{ray_port}",
+        f"ray.util.client.server.*--address=[^ ]*:{ray_port}",
     ):
         subprocess.run(["pkill", "-9", "-f", pattern], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
@@ -353,6 +355,7 @@ def start_shared_ray(args: argparse.Namespace) -> None:
         [
             str(ray_bin), "start", "--head",
             f"--port={args.ray_port}",
+            f"--ray-client-server-port={int(args.ray_client_server_port)}",
             f"--temp-dir={ray_tmp}",
             f"--num-cpus={int(args.ray_num_cpus)}",
             "--dashboard-host=127.0.0.1",
