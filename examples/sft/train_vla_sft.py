@@ -28,9 +28,7 @@ from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
 mp.set_start_method("spawn", force=True)
 
 
-@hydra.main(
-    version_base="1.1", config_path="config", config_name="maniskill_ppo_openvlaoft"
-)
+@hydra.main(config_path="config", config_name="maniskill_ppo_openvlaoft")
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
     logging.info(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))

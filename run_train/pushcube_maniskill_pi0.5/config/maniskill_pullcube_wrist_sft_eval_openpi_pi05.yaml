@@ -1,0 +1,99 @@
+defaults:
+  - env/maniskill_pullcube@env.train
+  - env/maniskill_pullcube@env.eval
+  - model/pi0_5@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run: {dir: .}
+  output_subdir: null
+  searchpath: [file://${oc.env:EMBODIED_PATH}/config/]
+cluster:
+  num_nodes: 1
+  component_placement: {actor,env,rollout: all}
+runner:
+  task_type: embodied
+  logger: {log_path: "../results", project_name: rlinf, experiment_name: pullcube_natural_smoke, logger_backends: [tensorboard]}
+  max_epochs: 1
+  max_steps: -1
+  only_eval: true
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+algorithm:
+  group_size: 1
+  normalize_advantages: true
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: chunk_level
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: token-mean
+  gamma: 0.99
+  gae_lambda: 0.95
+env:
+  group_name: EnvGroup
+  train: {rollout_epoch: 1, total_num_envs: 1}
+  eval:
+    main_camera_key: render_camera
+    rollout_epoch: 1
+    total_num_envs: 1
+    auto_reset: false
+    ignore_terminations: true
+    use_wrist_image: true
+    group_size: ${algorithm.group_size}
+    is_eval: true
+    execute_action_chunks: 5
+    temporal_ensemble_weight: 0.01
+    reset_options: {randomize_initial_poses: false}
+    video_cfg:
+      save_video: true
+      render_source: policy_input
+      render_camera_name: render_camera
+      video_base_dir: ${runner.logger.log_path}/video/eval
+      max_videos: 1
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  recompute_logprobs: false
+  unnorm_key: maniskill
+  enable_offload: false
+  pipeline_stage_num: 1
+  model: {model_path: ${oc.env:MODEL_PATH,/path/to/checkpoint}, precision: ${actor.model.precision}}
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 1
+  seed: 0
+  enable_offload: false
+  model:
+    model_path: ${oc.env:MODEL_PATH,/path/to/checkpoint}
+    model_type: openpi
+    add_value_head: false
+    num_action_chunks: 10
+    action_dim: 8
+    use_proprio: true
+    num_steps: 5
+    openpi:
+      config_name: pi05_maniskill_wrist
+      num_images_in_input: 2
+      action_horizon: 10
+      action_chunk: ${..num_action_chunks}
+      action_env_dim: ${..action_dim}
+      train_expert_only: true
+      detach_critic_input: true
+      mask_gripper_loss: false
+      noise_method: flow_sde
+    policy_setup: panda
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    gradient_checkpointing: false
+    mixed_precision: {param_dtype: ${actor.model.precision}, reduce_dtype: ${actor.model.precision}, buffer_dtype: ${actor.model.precision}}
+reward: {use_reward_model: false}
+critic: {use_critic_model: false}

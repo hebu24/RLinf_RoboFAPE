@@ -2,7 +2,8 @@
 # ruff: noqa: I001
 """Sweep PushCube-v1 wrist checkpoints across multiple seeds; plot per-seed (transparent)
 + mean (opaque) success rate vs training step. Supports --watch to eval each new checkpoint
-as it appears (serial, single GPU, no overlap)."""
+as it appears (serial, single GPU, no overlap). Video saving is opt-in because the
+training-synchronized sweep only needs scalar metrics."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import subprocess
 import sys
 import threading
@@ -47,16 +49,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--venv-dir", default="/data/yingxi/RLinf_RoboFAPE/.venv")
     p.add_argument("--run-script", default=str(REPO_PATH / "run_train/eval_checkpoint/run_pushcube_wrist.sh"))
     p.add_argument("--gpu-ids", default="3")
+    p.add_argument(
+        "--gpu-groups",
+        default=None,
+        help="Semicolon-separated GPU groups; a group like '0,1' dedicates rollout to GPU 0 and Vulkan env to GPU 1.",
+    )
     p.add_argument("--seeds", default="0-7", help="Seed range or comma list, e.g. 0-7 or 0,2,4.")
     p.add_argument("--num-eval-episodes", type=int, default=50)
     p.add_argument("--num-envs", type=int, default=50)
     p.add_argument("--max-episode-steps", type=int, default=200)
     p.add_argument("--action-scale", type=float, default=1.0)
-    p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument(
+        "--video-seeds",
+        default=None,
+        help="When set, save videos only for these seeds; omit to save for all seeds.",
+    )
     p.add_argument("--manage-ray", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--ray-port", type=int, default=6387)
     p.add_argument("--ray-num-cpus", type=int, default=8, help="CPU slots exposed to the managed Ray eval cluster.")
     p.add_argument("--ray-object-store-memory", type=int, default=50_000_000_000)
+    p.add_argument("--ray-include-dashboard", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--ray-dashboard-port", type=int, default=8267)
     p.add_argument("--ray-dashboard-agent-port", type=int, default=52373)
     p.add_argument("--ray-client-server-port", type=int, default=10041)
@@ -70,6 +83,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt-stable-seconds", type=int, default=30, help="Checkpoint mtime stability window before evaluating.")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--step", type=int, action="append", default=None, help="Only evaluate specific global steps.")
+    p.add_argument("--skip-step", type=int, action="append", default=[], help="Global step to skip in watch/eval.")
+    p.add_argument("--pin-checkpoints", action=argparse.BooleanOptionalAction, default=False,
+                   help="Hardlink/copy each discovered actor checkpoint into output-dir before eval.")
     p.add_argument("--hydra-override", action="append", default=[])
     return p.parse_args()
 
@@ -182,12 +198,140 @@ def summarize_step_seed(step: int, seed: int, checkpoint_path: Path, traj_path: 
     return row
 
 
+def summarize_existing_trajectory(step: int, seed: int, traj_path: Path, checkpoint_path: Path | None = None) -> dict[str, Any]:
+    """Summarize an existing eval result even if its source checkpoint was pruned."""
+    if checkpoint_path is None:
+        checkpoint_path = traj_path.parents[2] / "checkpoint_pruned_or_unknown"
+    return summarize_step_seed(step, seed, checkpoint_path, traj_path)
+
+
+def load_resume_rows(output_dir: Path, checkpoint_dir: Path, seeds: list[int]) -> list[dict[str, Any]]:
+    checkpoint_by_step = {step: path for step, path in discover_checkpoints(checkpoint_dir)}
+    rows: list[dict[str, Any]] = []
+    for step_dir in sorted(output_dir.glob("global_step_*")):
+        m = re.fullmatch(r"global_step_(\d+)", step_dir.name)
+        if not m:
+            continue
+        step = int(m.group(1))
+        for seed in seeds:
+            traj = step_dir / f"seed_{seed}" / "trajectory_metrics.json"
+            if not traj.exists():
+                continue
+            try:
+                rows.append(summarize_existing_trajectory(step, seed, traj, checkpoint_by_step.get(step)))
+            except Exception:
+                pass
+    return rows
+
+
+def dedupe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_key: dict[tuple[int, int], dict[str, Any]] = {}
+    for row in rows:
+        if "step" not in row or "seed" not in row:
+            continue
+        key = (int(row["step"]), int(row["seed"]))
+        old = by_key.get(key)
+        if old is None or ("success_rate" in row and "success_rate" not in old):
+            by_key[key] = row
+    return [by_key[key] for key in sorted(by_key)]
+
+
+def link_or_copy(src: str, dst: str) -> None:
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def pin_checkpoint(step: int, actor_dir: Path, output_dir: Path) -> Path:
+    target = output_dir / "checkpoint_pins" / f"global_step_{step}" / "actor"
+    if ckpt_is_complete(target):
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(
+        tempfile.mkdtemp(prefix=".actor.tmp.", dir=str(target.parent))
+    )
+    tmp.rmdir()
+    print(f"[watch] pinning global_step_{step} checkpoint to {target}", flush=True)
+    try:
+        shutil.copytree(actor_dir, tmp, copy_function=link_or_copy, symlinks=True)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    if not ckpt_is_complete(tmp):
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"pinned checkpoint is incomplete: {tmp}")
+    shutil.rmtree(target, ignore_errors=True)
+    try:
+        tmp.rename(target)
+    except FileExistsError:
+        if not ckpt_is_complete(target):
+            raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return target
+
+
+def discover_watch_checkpoints(checkpoint_dir: Path, output_dir: Path) -> list[tuple[int, Path]]:
+    """Discover pinned checkpoints plus currently retained training checkpoints."""
+    by_step: dict[int, Path] = {}
+    pin_root = output_dir / "checkpoint_pins"
+    for step, path in discover_checkpoints(pin_root):
+        if ckpt_is_complete(path):
+            by_step[step] = path
+    for step, path in discover_checkpoints(checkpoint_dir):
+        if step not in by_step and ckpt_is_complete(path):
+            by_step[step] = path
+    return sorted(by_step.items())
+
+
+def start_checkpoint_pinner(
+    *,
+    args: argparse.Namespace,
+    checkpoint_dir: Path,
+    output_dir: Path,
+    stop_event: threading.Event,
+) -> threading.Thread | None:
+    if not args.pin_checkpoints:
+        return None
+
+    skip_steps = set(args.skip_step or [])
+    interval = max(5, min(int(args.watch_poll_interval), 15))
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                for step, path in discover_checkpoints(checkpoint_dir):
+                    if step in skip_steps:
+                        continue
+                    if ckpt_is_complete(output_dir / "checkpoint_pins" / f"global_step_{step}" / "actor"):
+                        continue
+                    if not ckpt_is_complete(path):
+                        continue
+                    if time.time() - ckpt_mtime(path) < args.ckpt_stable_seconds:
+                        continue
+                    try:
+                        pin_checkpoint(step, path, output_dir)
+                    except Exception as exc:
+                        print(f"[watch] failed to pin global_step_{step}: {exc}", file=sys.stderr, flush=True)
+            except Exception as exc:
+                print(f"[watch] checkpoint pinner error: {exc}", file=sys.stderr, flush=True)
+            stop_event.wait(interval)
+
+    thread = threading.Thread(target=worker, name="checkpoint-pinner", daemon=True)
+    thread.start()
+    print(f"[watch] checkpoint pinner enabled; interval={interval}s", flush=True)
+    return thread
+
+
 def run_eval_for_step_seed(*, checkpoint_path: Path, step: int, seed: int, gpu_id: str, log_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     traj_path = log_dir / "trajectory_metrics.json"
     if args.resume and traj_path.exists():
         return summarize_step_seed(step, seed, checkpoint_path, traj_path)
 
     env = os.environ.copy()
+    video_seeds = None if args.video_seeds is None else set(parse_seeds(args.video_seeds))
     env.update(
         {
             "RAY_ADDRESS": f"127.0.0.1:{args.ray_port}",
@@ -199,8 +343,9 @@ def run_eval_for_step_seed(*, checkpoint_path: Path, step: int, seed: int, gpu_i
             "NUM_ENVS": str(args.num_envs),
             "MAX_EPISODE_STEPS": str(args.max_episode_steps),
             "SEED": str(seed),
+            "SEEDS": "",  # run one seed per sweep worker; do not inherit the sweep seed list
             "EVAL_ACTION_SCALE": str(args.action_scale),
-            "SAVE_VIDEO": "true" if args.save_video else "false",
+            "SAVE_VIDEO": "true" if args.save_video and (video_seeds is None or seed in video_seeds) else "false",
             "MANAGE_RAY": "false",  # sweep owns the shared Ray head
             "RAY_TMP_DIR": f"/tmp/ray_eval_pushcube_{os.getpid()}_{step}_{seed}",
             "TORCHINDUCTOR_COMPILE_THREADS": "4",
@@ -223,6 +368,17 @@ def run_eval_for_step_seed(*, checkpoint_path: Path, step: int, seed: int, gpu_i
     with (log_dir / "sweep_call.log").open("w") as f:
         proc = subprocess.run(cmd, cwd=REPO_PATH, env=env, stdout=f, stderr=subprocess.STDOUT)
     if proc.returncode != 0:
+        if traj_path.exists():
+            try:
+                print(
+                    f"[step {step} seed {seed}] eval exited {proc.returncode}, "
+                    f"but metrics exist; using {traj_path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return summarize_step_seed(step, seed, checkpoint_path, traj_path)
+            except Exception:
+                pass
         raise RuntimeError(f"eval failed (exit {proc.returncode}) for step {step} seed {seed}; see {log_dir}/sweep_call.log")
     return summarize_step_seed(step, seed, checkpoint_path, traj_path)
 
@@ -230,6 +386,7 @@ def run_eval_for_step_seed(*, checkpoint_path: Path, step: int, seed: int, gpu_i
 def write_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
     if not rows:
         return
+    rows = dedupe_rows(rows)
     json_path = output_dir / "pushcube_sweep_metrics.json"
     json_path.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
     csv_path = output_dir / "pushcube_sweep_metrics.csv"
@@ -243,6 +400,7 @@ def write_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
 
 
 def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    rows = dedupe_rows(rows)
     by_step: dict[int, dict[int, float]] = {}
     for r in rows:
         if "success_rate" not in r:
@@ -351,22 +509,26 @@ def start_shared_ray(args: argparse.Namespace) -> None:
     ray_tmp.mkdir(parents=True, exist_ok=True)
     _scoped_ray_kill(args.ray_port)
     os.environ.pop("RAY_ADDRESS", None)
-    subprocess.run(
-        [
-            str(ray_bin), "start", "--head",
-            f"--port={args.ray_port}",
-            f"--ray-client-server-port={int(args.ray_client_server_port)}",
-            f"--temp-dir={ray_tmp}",
-            f"--num-cpus={int(args.ray_num_cpus)}",
-            "--dashboard-host=127.0.0.1",
-            f"--dashboard-port={int(args.ray_dashboard_port)}",
-            f"--dashboard-agent-listen-port={int(args.ray_dashboard_agent_port)}",
-            f"--min-worker-port={int(args.ray_min_worker_port)}",
-            f"--max-worker-port={int(args.ray_max_worker_port)}",
-            f"--object-store-memory={int(args.ray_object_store_memory)}",
-        ],
-        check=True,
-    )
+    cmd = [
+        str(ray_bin), "start", "--head",
+        f"--port={args.ray_port}",
+        f"--ray-client-server-port={int(args.ray_client_server_port)}",
+        f"--temp-dir={ray_tmp}",
+        f"--num-cpus={int(args.ray_num_cpus)}",
+        f"--include-dashboard={'true' if args.ray_include_dashboard else 'false'}",
+        f"--min-worker-port={int(args.ray_min_worker_port)}",
+        f"--max-worker-port={int(args.ray_max_worker_port)}",
+        f"--object-store-memory={int(args.ray_object_store_memory)}",
+    ]
+    if args.ray_include_dashboard:
+        cmd.extend(
+            [
+                "--dashboard-host=127.0.0.1",
+                f"--dashboard-port={int(args.ray_dashboard_port)}",
+                f"--dashboard-agent-listen-port={int(args.ray_dashboard_agent_port)}",
+            ]
+        )
+    subprocess.run(cmd, check=True)
     os.environ["RAY_ADDRESS"] = f"127.0.0.1:{args.ray_port}"
 
 
@@ -378,9 +540,13 @@ def stop_shared_ray(args: argparse.Namespace) -> None:
 def eval_checkpoint_all_seeds(step: int, checkpoint_path: Path, output_dir: Path, args: argparse.Namespace, rows: list, lock) -> None:
     """Evaluate all seeds for one checkpoint in parallel across GPU groups."""
     seeds = parse_seeds(args.seeds)
-    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    gpu_ids = (
+        [group.strip() for group in args.gpu_groups.split(";") if group.strip()]
+        if args.gpu_groups
+        else parse_gpu_ids(args.gpu_ids)
+    )
     if not gpu_ids:
-        raise ValueError("--gpu-ids must contain at least one GPU id")
+        raise ValueError("--gpu-ids or --gpu-groups must contain at least one GPU group")
 
     seed_groups = [seeds[i::len(gpu_ids)] for i in range(len(gpu_ids))]
     stop_event = threading.Event()
@@ -416,6 +582,7 @@ def eval_checkpoint_all_seeds(step: int, checkpoint_path: Path, output_dir: Path
                 row = {"step": step, "seed": seed, "checkpoint_path": str(checkpoint_path), "error": str(exc)}
             with lock:
                 rows.append(row)
+                rows[:] = dedupe_rows(rows)
                 write_rows(rows, output_dir)
                 plot_rows(rows, output_dir)
                 if "success_rate" in row:
@@ -452,6 +619,7 @@ def watch_loop(args: argparse.Namespace, output_dir: Path, rows: list, lock) -> 
     # otherwise the watch loop must re-enter it (eval_checkpoint_all_seeds + --resume
     # will skip the already-done seeds and only redo the missing ones).
     all_seeds = parse_seeds(args.seeds)
+    skip_steps = set(args.skip_step or [])
     from collections import defaultdict
     seed_count: dict[int, set[int]] = defaultdict(set)
     for r in rows:
@@ -460,7 +628,13 @@ def watch_loop(args: argparse.Namespace, output_dir: Path, rows: list, lock) -> 
     seen: set[int] = set(step for step, seeds in seed_count.items() if set(all_seeds).issubset(seeds))
     print(f"[watch] start; checkpoint_dir={checkpoint_dir}; seen={sorted(seen)} (full-seed steps); "
           f"partial={[s for s in sorted(seed_count) if s not in seen]}", flush=True)
-    while True:
+    pinner_stop = threading.Event()
+    # The watch loop pins immediately before eval; a background pinner races with it
+    # and can duplicate the same checkpoint.
+    if args.pin_checkpoints:
+        print("[watch] pinning in main watch loop; background pinner disabled", flush=True)
+    try:
+      while True:
         # check shared ray alive; restart if died
         try:
             subprocess.run([str(Path(args.venv_dir) / "bin" / "ray"), "status"],
@@ -471,7 +645,9 @@ def watch_loop(args: argparse.Namespace, output_dir: Path, rows: list, lock) -> 
             start_shared_ray(args)
         # find newly-completed checkpoints (stable mtime)
         candidates = []
-        for step, path in discover_checkpoints(checkpoint_dir):
+        for step, path in discover_watch_checkpoints(checkpoint_dir, output_dir):
+            if step in skip_steps:
+                continue
             if step in seen:
                 continue
             if not ckpt_is_complete(path):
@@ -484,7 +660,8 @@ def watch_loop(args: argparse.Namespace, output_dir: Path, rows: list, lock) -> 
             candidates.sort(key=lambda x: x[0])
             step, path = candidates[0]
             print(f"[watch] new completed checkpoint: global_step_{step}", flush=True)
-            eval_checkpoint_all_seeds(step, path, output_dir, args, rows, lock)
+            eval_path = pin_checkpoint(step, path, output_dir) if args.pin_checkpoints else path
+            eval_checkpoint_all_seeds(step, eval_path, output_dir, args, rows, lock)
             with lock:
                 completed = [r for r in rows if "success_rate" in r]
                 completed_seeds = {
@@ -501,6 +678,8 @@ def watch_loop(args: argparse.Namespace, output_dir: Path, rows: list, lock) -> 
                           ", ".join(f"{s}={a:.3f}" for s, a in sorted(avgs.items())), flush=True)
         else:
             time.sleep(args.watch_poll_interval)
+    finally:
+        pinner_stop.set()
 
 
 def main() -> None:
@@ -522,17 +701,11 @@ def main() -> None:
 
     # seed rows from resume
     if args.resume:
-        for step, path in discover_checkpoints(Path(args.checkpoint_dir)):
-            for seed in parse_seeds(args.seeds):
-                traj = output_dir / f"global_step_{step}" / f"seed_{seed}" / "trajectory_metrics.json"
-                if traj.exists():
-                    try:
-                        rows.append(summarize_step_seed(step, seed, path, traj))
-                    except Exception:
-                        pass
-    baseline_rows = load_sft_baseline_rows()
+        rows.extend(load_resume_rows(output_dir, Path(args.checkpoint_dir), parse_seeds(args.seeds)))
+    baseline_rows = load_sft_baseline_rows() if os.environ.get("TASK_ID") == "PushCube-v1" else []
     if baseline_rows and not any(int(r.get("step", -1)) == SFT_BASELINE_PLOT_STEP for r in rows):
         rows = baseline_rows + rows
+    rows = dedupe_rows(rows)
     if rows:
         write_rows(rows, output_dir)
         plot_rows(rows, output_dir)
@@ -544,13 +717,15 @@ def main() -> None:
             watch_loop(args, output_dir, rows, lock)
         else:
             only_steps = set(args.step) if args.step else None
-            checkpoints = discover_checkpoints(Path(args.checkpoint_dir), only_steps)
+            checkpoints = [(step, path) for step, path in discover_checkpoints(Path(args.checkpoint_dir), only_steps)
+                           if step not in set(args.skip_step or [])]
             if args.limit is not None:
                 checkpoints = checkpoints[: args.limit]
             if not checkpoints:
                 raise FileNotFoundError(f"No global_step_*/actor checkpoints under {args.checkpoint_dir}")
             for step, path in checkpoints:
-                eval_checkpoint_all_seeds(step, path, output_dir, args, rows, lock)
+                eval_path = pin_checkpoint(step, path, output_dir) if args.pin_checkpoints else path
+                eval_checkpoint_all_seeds(step, eval_path, output_dir, args, rows, lock)
     finally:
         if args.manage_ray and not args.watch:
             stop_shared_ray(args)

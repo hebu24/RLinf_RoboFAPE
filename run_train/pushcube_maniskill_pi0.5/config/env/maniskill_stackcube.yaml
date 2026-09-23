@@ -1,0 +1,57 @@
+env_type: maniskill
+
+total_num_envs: null
+wrap_obs_mode: simple
+main_camera_key: render_camera
+use_wrist_image: True
+use_wrist_back_image: False
+auto_reset: True
+ignore_terminations: False
+use_rel_reward: False
+reward_mode: raw
+action_scale: 1.0
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 300
+max_episode_steps: 300
+task_description: "Stack the red cube on top of the green cube."
+reset_options:
+  randomize_initial_poses: True
+
+video_cfg:
+  save_video: False
+  # The policy main view and converted LeRobot ``top`` stream are both this view.
+  # Without this, ManiSkillEnv.capture_image records base_camera + wrist instead.
+  render_source: render_camera
+  render_camera_name: render_camera
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+  max_videos: 5
+
+enable_offload: False
+
+init_params:
+  id: StackCube-v1
+  num_envs: null
+  obs_mode: "rgb"
+  robot_uids: panda_wristcam
+  control_mode: "pd_joint_pos"
+  sim_backend: "gpu"
+  reward_mode: normalized_dense
+  max_episode_steps: ${..max_episode_steps}
+  render_mode: all
+  sensor_configs:
+    shader_pack: "default"
+    base_camera:
+      width: 224
+      height: 224
+    hand_camera:
+      width: 224
+      height: 224
+  # Exact collection schema and 3,200-trajectory quaternion-aligned mean.
+  # ManiSkill expects overrides under the named render camera, not top-level pose.
+  human_render_camera_configs:
+    shader_pack: default
+    render_camera:
+      pose: [0.64865931, 0.60030247, 0.64905606, 0.35656082, 0.19597671, 0.07677193, -0.91025468]

@@ -27,7 +27,7 @@ class LeRobotIsaacLabStackCubeDataConfig(DataConfigFactory):
     """OpenPI data config aligned with stack-cube fine-tuning recipe."""
 
     default_prompt: str | None = (
-        "Stack the red block on the blue block, then stack the green block on the red block"
+        "Stack the red cube on top of the green cube."
     )
 
     @override
@@ -38,10 +38,11 @@ class LeRobotIsaacLabStackCubeDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image": "observation.images.front",
+                        "observation/image": "observation.images.top",
                         "observation/wrist_image": "observation.images.wrist",
                         "observation/state": "observation.state",
-                        "actions": "action",
+                        "actions": "actions",
+                        "prompt": "prompt",
                     }
                 )
             ]
@@ -61,5 +62,5 @@ class LeRobotIsaacLabStackCubeDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            action_sequence_keys=("action",),
+            action_sequence_keys=("actions",),
         )

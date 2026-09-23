@@ -178,6 +178,25 @@ _CONFIGS = [
         save_interval=250,
     ),
     TrainConfig(
+        name="pi05_maniskill_stackcube_wrist",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False
+        ),
+        data=LeRobotManiSkillWristDataConfig(
+            repo_id="",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_maniskill/assets",
+                asset_id="physical-intelligence/maniskill",
+            ),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base/params"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+    ),
+    TrainConfig(
         name="pi05_maniskill_peg_insertion_wrist",
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=10, discrete_state_input=False

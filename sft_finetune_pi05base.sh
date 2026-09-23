@@ -15,6 +15,8 @@
 #   DATA_DIR=... GPU_IDS=0 bash sft_finetune_pi05base.sh
 #   CONFIG_NAME=peg_insertion_sft_openpi_pi05_wrist \
 #     OPENPI_CONFIG_NAME=pi05_maniskill_peg_insertion_wrist bash sft_finetune_pi05base.sh
+#   TASK_ID=PegInsertionVertical-v1 PEG_INSERTION_MODE=full \
+#     GPU_IDS=0,1,2,3 bash sft_finetune_pi05base.sh
 set -euo pipefail
 
 cd /data/yingxi/RLinf_RoboFAPE
@@ -22,9 +24,14 @@ cd /data/yingxi/RLinf_RoboFAPE
 # Resolve the repo-local rlinf package (an older installed copy at
 # /opt/kairan/RLinf shadows it otherwise and lacks the peg_insertion configs).
 export PYTHONPATH=/data/yingxi/RLinf_RoboFAPE:${PYTHONPATH:-}
-export PATH=/data/yingxi/kairan/envs/rlinf/bin:$PATH
+VENV_DIR="${VENV_DIR:-/data/yingxi/RLinf_RoboFAPE/.venv}"
+export PATH="${VENV_DIR}/bin:/data/yingxi/kairan/envs/rlinf/bin:${PATH}"
 export SFT_RAY_PORT="${SFT_RAY_PORT:-6379}"
 export RAY_TMPDIR="${SFT_RAY_TMPDIR:-/tmp/ray_sft_${SFT_RAY_PORT}}"
+export SFT_DASHBOARD_PORT="${SFT_DASHBOARD_PORT:-8265}"
+export SFT_RAY_CLIENT_SERVER_PORT="${SFT_RAY_CLIENT_SERVER_PORT:-10001}"
+export SFT_RAY_MIN_WORKER_PORT="${SFT_RAY_MIN_WORKER_PORT:-10002}"
+export SFT_RAY_MAX_WORKER_PORT="${SFT_RAY_MAX_WORKER_PORT:-19999}"
 # Dashboard-agent listen port MUST be unique per Ray cluster on the same host: Ray's
 # default 52365 is a FIXED (non-random) port. If a concurrent cluster (e.g. an eval
 # sweep) already binds 52365, this head's raylet crashes in its HTTP loop on bind.
@@ -38,18 +45,71 @@ export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 ulimit -n 1048576 2>/dev/null || true
 
 # --- inputs ---
-DATA_DIR="${DATA_DIR:-/data/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/data/peg_insertion_vertical_insert_only_3200}"
+TASK_ID="${TASK_ID:-PegInsertionVertical-v1}"
+PEG_INSERTION_MODE="${PEG_INSERTION_MODE:-insert_only}"
+if [[ "${TASK_ID}" == "PegInsertionVertical-v1" && \
+      "${PEG_INSERTION_MODE}" != "insert_only" && \
+      "${PEG_INSERTION_MODE}" != "full" ]]; then
+  echo "PEG_INSERTION_MODE must be insert_only or full, got: ${PEG_INSERTION_MODE}" >&2
+  exit 1
+fi
+if [[ -z "${DATA_DIR:-}" ]]; then
+  case "${TASK_ID}" in
+    PegInsertionSide-v1)
+      DATA_DIR="/data/yingxi/datasets/robofpe_sft/PegInsertionSide-v1_render_wrist_filtered_q99_tcp/PegInsertionSide-v1_render_wrist_filtered_q99/lerobot"
+      ;;
+    PegInsertionVertical-v1)
+      DATA_DIR="/data/yingxi/datasets/robofpe_sft/PegInsertionVertical-v1_render_wrist_filtered_q99/lerobot"
+      ;;
+    StackCube-v1)
+      DATA_DIR="/data/yingxi/datasets/robofpe_sft/StackCube-v1_render_wrist_filtered_q99/lerobot"
+      ;;
+    UprightStack-v1)
+      DATA_DIR="/data/yingxi/datasets/robofpe_sft/uprightstack_sft_gate_20260921/UprightStack-v1_render_wrist_filtered_q99/lerobot"
+      ;;
+    PullCubeTool-golf)
+      DATA_DIR="/data/yingxi/datasets/robofpe_sft/releases/PullCubeTool-golf_20260921/lerobot_filtered_q99"
+      ;;
+    LiftPegUpright-box|PickCube-ball|PullCube-block)
+      DATA_DIR="/data/yingxi/datasets/robofpe_sft/${TASK_ID}_render_wrist_filtered_q99/lerobot"
+      ;;
+    *)
+      echo "Unsupported TASK_ID=${TASK_ID}; set DATA_DIR explicitly." >&2
+      exit 1
+      ;;
+  esac
+fi
 PI05_BASE="${PI05_BASE:-/data/yingxi/weights/pi05_base}"
-PREPARED_BASE="${PREPARED_BASE:-/data/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_wrist_insert}"
+MODE_SUFFIX=""
+if [[ "${TASK_ID}" == "PegInsertionVertical-v1" ]]; then
+  MODE_SUFFIX="_${PEG_INSERTION_MODE}"
+fi
+PREPARED_BASE="${PREPARED_BASE:-/data/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_${TASK_ID}${MODE_SUFFIX}_wrist}"
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
+OPENPI_NUM_WORKERS="${OPENPI_NUM_WORKERS:-0}"
 # logger experiment name (override to distinguish logs/checkpoints across runs).
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_sft_insert_only_wrist}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-peg_insertion_${TASK_ID}${MODE_SUFFIX}_sft_wrist}"
 
 # Hydra config (examples/sft/config/<NAME>.yaml) and the matching openpi config_name
 # used to compute norm_stats. Both default to the wrist insert-only variant.
-CONFIG_NAME="${CONFIG_NAME:-peg_insertion_sft_openpi_pi05_wrist}"
-OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_peg_insertion_wrist}"
 NORM_STATS_ASSET="physical-intelligence/maniskill"
+EXPECTED_ACTION_DIM=7
+if [[ "${TASK_ID}" == "PegInsertionVertical-v1" && "${PEG_INSERTION_MODE}" == "full" ]]; then
+  CONFIG_NAME="${CONFIG_NAME:-robofpe_maniskill_sft_openpi_pi05_wrist}"
+  OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_wrist}"
+  EXPECTED_ACTION_DIM=8
+elif [[ "${TASK_ID}" == "StackCube-v1" || "${TASK_ID}" == "UprightStack-v1" || "${TASK_ID}" == "LiftPegUpright-box" || "${TASK_ID}" == "PickCube-ball" || "${TASK_ID}" == "PullCube-block" || "${TASK_ID}" == "PullCubeTool-golf" ]]; then
+  CONFIG_NAME="${CONFIG_NAME:-robofpe_maniskill_sft_openpi_pi05_wrist}"
+  OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_wrist}"
+  EXPECTED_ACTION_DIM=8
+else
+  CONFIG_NAME="${CONFIG_NAME:-peg_insertion_sft_openpi_pi05_wrist}"
+  OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_maniskill_peg_insertion_wrist}"
+fi
+TASK_NORM_STATS_SOURCE=""
+if [[ "${TASK_ID}" == "PegInsertionSide-v1" ]]; then
+  TASK_NORM_STATS_SOURCE="/data/yingxi/RLinf_RoboFAPE/run_train/peginsertion_maniskill_pi0.5/base/pi05_base_peg_insertion_side_wrist_filtered_q99_tcp/${NORM_STATS_ASSET}/norm_stats.json"
+fi
 
 # Fail early instead of silently starting from the base model when a resume path is
 # misspelled or points at the actor subdirectory rather than global_step_<N>.
@@ -78,20 +138,25 @@ echo "[pi05base] prepared base dir: $PREPARED_BASE (symlinks -> $PI05_BASE)"
 # state transforms can produce different statistics from the same LeRobot dataset.
 NS_FILE="$PREPARED_BASE/$NORM_STATS_ASSET/norm_stats.json"
 DATA_NS_FILE="$DATA_DIR/meta/openpi/$OPENPI_CONFIG_NAME/norm_stats.json"
-if [[ -f "$DATA_NS_FILE" ]]; then
+if [[ -n "$TASK_NORM_STATS_SOURCE" && -f "$TASK_NORM_STATS_SOURCE" ]]; then
+  mkdir -p "$(dirname "$NS_FILE")" "$(dirname "$DATA_NS_FILE")"
+  [[ "$TASK_NORM_STATS_SOURCE" == "$NS_FILE" ]] || cp -f "$TASK_NORM_STATS_SOURCE" "$NS_FILE"
+  [[ "$TASK_NORM_STATS_SOURCE" == "$DATA_NS_FILE" ]] || cp -f "$TASK_NORM_STATS_SOURCE" "$DATA_NS_FILE"
+  echo "[pi05base] using audited ${TASK_ID} norm_stats: $TASK_NORM_STATS_SOURCE"
+elif [[ -f "$DATA_NS_FILE" ]] && \
+  [[ "$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["norm_stats"]["actions"]["mean"]))' "$DATA_NS_FILE")" == "${EXPECTED_ACTION_DIM}" ]]; then
   mkdir -p "$(dirname "$NS_FILE")"
   cp -f "$DATA_NS_FILE" "$NS_FILE"
   echo "[pi05base] using dataset norm_stats: $DATA_NS_FILE -> $NS_FILE"
 else
   echo "[pi05base] computing norm_stats from $DATA_DIR -> $NS_FILE"
-  # Norm_stats is a pure-statistics (CPU) pass: hide all GPUs so the data loader does
-  # not allocate VRAM and compete with training on other cards. GPU visibility is
-  # restored (unset CUDA_VISIBLE_DEVICES) below before launching the SFT trainer.
   CUDA_VISIBLE_DEVICES="" JAX_PLATFORMS=cpu \
-  python toolkits/lerobot/calculate_norm_stats.py \
+  python precompute_openpi_norm_stats.py \
     --config-name "$OPENPI_CONFIG_NAME" \
-    --repo-id "$DATA_DIR" \
-    --output-dir "$PREPARED_BASE"
+    --data-dir "$DATA_DIR"
+  [[ -f "$DATA_NS_FILE" ]] || { echo "[pi05base] norm_stats missing: $DATA_NS_FILE" >&2; exit 1; }
+  mkdir -p "$(dirname "$NS_FILE")"
+  cp -f "$DATA_NS_FILE" "$NS_FILE"
 fi
 
 # Persist the exact OpenPI stats next to the dataset for future prepared-base dirs.
@@ -137,6 +202,7 @@ _sft_scoped_ray_kill() {
   pkill -9 -f "gcs_server.*--gcs_server_port=${SFT_RAY_PORT}"  >/dev/null 2>&1 || true
   pkill -9 -f "raylet.*--gcs-address=[^ ]*:${SFT_RAY_PORT}"    >/dev/null 2>&1 || true
   pkill -9 -f "dashboard.*--gcs-address=[^ ]*:${SFT_RAY_PORT}" >/dev/null 2>&1 || true
+  pkill -9 -f "ray.util.client.server.*--address=[^ ]*:${SFT_RAY_PORT}" >/dev/null 2>&1 || true
   sleep 2
 }
 
@@ -155,13 +221,21 @@ trap '_sft_scoped_ray_kill' EXIT
 
 # Start the SFT detached head. The driver + workers attach to it via RAY_ADDRESS.
 # --dashboard-agent-listen-port must differ from any concurrent cluster (see above).
-ray start --head --port="${SFT_RAY_PORT}" --temp-dir="${RAY_TMPDIR}" --dashboard-agent-listen-port="${SFT_DASHBOARD_AGENT_PORT}"
+ray start --head \
+  --port="${SFT_RAY_PORT}" \
+  --temp-dir="${RAY_TMPDIR}" \
+  --dashboard-port="${SFT_DASHBOARD_PORT}" \
+  --dashboard-agent-listen-port="${SFT_DASHBOARD_AGENT_PORT}" \
+  --ray-client-server-port="${SFT_RAY_CLIENT_SERVER_PORT}" \
+  --min-worker-port="${SFT_RAY_MIN_WORKER_PORT}" \
+  --max-worker-port="${SFT_RAY_MAX_WORKER_PORT}"
 
 # --- (d) launch the existing Hydra SFT entrypoint, overriding model_path + experiment_name ---
 bash examples/sft/run_vla_sft.sh \
   "$CONFIG_NAME" \
   data.train_data_paths="${DATA_DIR}" \
   actor.model.model_path="${PREPARED_BASE}" \
+  +actor.openpi_num_workers="${OPENPI_NUM_WORKERS}" \
   runner.logger.experiment_name="${EXPERIMENT_NAME}" \
   cluster.component_placement="{actor\\,env\\,rollout:${SFT_COMPONENT_PLACEMENT}}" \
   "${RESUME_DIR:+runner.resume_dir=${RESUME_DIR}}" \

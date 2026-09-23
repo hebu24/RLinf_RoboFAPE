@@ -401,6 +401,24 @@ class EnvWorker(Worker):
 
         self._init_env()
 
+    def set_eval_seed(self, seed: int):
+        seed = int(seed)
+        if not self.enable_eval:
+            return
+        self.cfg.env.eval.seed = seed
+        for env in self.eval_env_list:
+            set_seed = get_env_attr(env, "set_eval_seed")
+            if callable(set_seed):
+                set_seed(seed)
+                continue
+            if hasattr(env, "cfg"):
+                env.cfg.seed = seed
+            if hasattr(env, "seed"):
+                env.seed = seed
+            reset_ids = get_env_attr(env, "_init_reset_state_ids")
+            if callable(reset_ids):
+                reset_ids()
+
     def _reset_window_chunk_refs(self) -> None:
         if self.reward_mode != "history_buffer" or not self.enable_train:
             return

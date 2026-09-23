@@ -50,6 +50,8 @@ actor:
     add_value_head: False
     openpi:
       config_name: "pi05_maniskill_wrist"
+      # The dataset's historical top field now contains render_camera pixels;
+      # the model still consumes exactly two image views.
       num_images_in_input: 2
       train_expert_only: True
       mask_gripper_loss: True

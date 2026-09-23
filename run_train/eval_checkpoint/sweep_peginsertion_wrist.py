@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=5)
     parser.add_argument("--max-episode-steps", type=int, default=600)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help="Comma/range seed spec, e.g. 0-7 or 0,2,4. Runs each seed as one 50-episode eval task.",
+    )
     parser.add_argument("--action-scale", type=float, default=1.0)
     parser.add_argument(
         "--reward-key",
@@ -230,6 +235,22 @@ def parse_gpu_ids(raw_value: str) -> list[str]:
     return gpu_ids
 
 
+def parse_seeds(raw_value: str | None, default_seed: int) -> list[int]:
+    if not raw_value:
+        return [int(default_seed)]
+    seeds: list[int] = []
+    for piece in raw_value.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            start_raw, end_raw = piece.split("-", 1)
+            seeds.extend(range(int(start_raw), int(end_raw) + 1))
+        else:
+            seeds.append(int(piece))
+    return sorted(set(seeds))
+
+
 def discover_checkpoints(checkpoint_dir: Path) -> list[tuple[int, Path]]:
     checkpoint_dir = checkpoint_dir.expanduser().resolve()
     if checkpoint_dir.name == "actor":
@@ -299,6 +320,7 @@ def summarize_episode_metrics(
     checkpoint_path: Path,
     trajectory_metrics_path: Path,
     reward_key: str,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     metrics = json.loads(trajectory_metrics_path.read_text(encoding="utf-8"))
     success_values = _to_float_list(metrics.get("success_once"))
@@ -324,6 +346,8 @@ def summarize_episode_metrics(
         "reward_key": reward_key,
         "trajectory_metrics_path": str(trajectory_metrics_path),
     }
+    if seed is not None:
+        row["seed"] = int(seed)
     if max_reward_values:
         row["mean_max_reward"] = mean(max_reward_values)
         row["max_reward"] = max(max_reward_values)
@@ -340,7 +364,13 @@ def summarize_evaluation_summary(
     summary_path: Path, reward_key: str
 ) -> dict[str, Any]:
     """Convert a persisted evaluation summary into one sweep-plot row."""
-    checkpoint_name = summary_path.parent.name
+    seed: int | None = None
+    checkpoint_dir = summary_path.parent
+    seed_match = re.fullmatch(r"seed_(\d+)", checkpoint_dir.name)
+    if seed_match:
+        seed = int(seed_match.group(1))
+        checkpoint_dir = checkpoint_dir.parent
+    checkpoint_name = checkpoint_dir.name
     match = STEP_RE.match(checkpoint_name)
     if not match:
         raise RuntimeError(
@@ -370,6 +400,8 @@ def summarize_evaluation_summary(
         "reward_key": reward_key,
         "evaluation_summary_path": str(summary_path),
     }
+    if seed is not None:
+        row["seed"] = seed
     for metric_name, row_mean_key, row_max_key in (
         ("max_reward", "mean_max_reward", "max_reward"),
         ("return", "mean_return", "max_return"),
@@ -421,11 +453,12 @@ def run_eval_for_checkpoint(
     worker_slot: int,
     log_dir: Path,
     args: argparse.Namespace,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     trajectory_metrics_path = log_dir / "trajectory_metrics.json"
     if args.resume and trajectory_metrics_path.exists():
         row = summarize_episode_metrics(
-            step, checkpoint_path, trajectory_metrics_path, args.reward_key
+            step, checkpoint_path, trajectory_metrics_path, args.reward_key, seed
         )
         row["gpu_id"] = gpu_id
         row["log_dir"] = str(log_dir)
@@ -449,14 +482,14 @@ def run_eval_for_checkpoint(
             "NUM_EVAL_EPISODES": str(args.num_eval_episodes),
             "NUM_ENVS": str(args.num_envs),
             "MAX_EPISODE_STEPS": str(args.max_episode_steps),
-            "SEED": str(args.seed),
+            "SEED": str(args.seed if seed is None else seed),
             "EVAL_ACTION_SCALE": str(args.action_scale),
             "SAVE_VIDEO": "true" if args.save_video else "false",
             "MANAGE_RAY": "false",
-            "RAY_TMP_DIR": f"{args.ray_tmp_dir}_{os.getpid()}_{step}",
+            "RAY_TMP_DIR": f"{args.ray_tmp_dir}_{os.getpid()}_{step}_{seed if seed is not None else args.seed}",
         }
     )
-    unique_suffix = f"{os.getpid()}_{worker_slot}_{step}"
+    unique_suffix = f"{os.getpid()}_{worker_slot}_{step}_{seed if seed is not None else args.seed}"
     run_script = args.run_script
     if not os.path.isabs(run_script):
         run_script = str(REPO_PATH / run_script)
@@ -468,10 +501,11 @@ def run_eval_for_checkpoint(
         f"rollout.group_name=RolloutGroupEval{unique_suffix}",
         *args.hydra_override,
     ]
-    print(f"[gpu {gpu_id} step {step}] evaluating {checkpoint_path}", flush=True)
+    seed_label = f" seed {seed}" if seed is not None else ""
+    print(f"[gpu {gpu_id} step {step}{seed_label}] evaluating {checkpoint_path}", flush=True)
     subprocess.run(cmd, cwd=REPO_PATH, env=env, check=True)
     row = summarize_episode_metrics(
-        step, checkpoint_path, trajectory_metrics_path, args.reward_key
+        step, checkpoint_path, trajectory_metrics_path, args.reward_key, seed
     )
     row["gpu_id"] = gpu_id
     row["log_dir"] = str(log_dir)
@@ -518,9 +552,17 @@ def plot_rows(rows: list[dict[str, Any]], output_dir: Path) -> None:
         print("No successful eval rows to plot.", file=sys.stderr)
         return
 
-    steps = [int(row["step"]) for row in valid_rows]
-    success_rates = [float(row["success_rate"]) for row in valid_rows]
-    mean_rewards = [float(row["mean_selected_reward"]) for row in valid_rows]
+    if any("seed" in row for row in valid_rows):
+        by_step: dict[int, list[dict[str, Any]]] = {}
+        for row in valid_rows:
+            by_step.setdefault(int(row["step"]), []).append(row)
+        steps = sorted(by_step)
+        success_rates = [mean(float(row["success_rate"]) for row in by_step[step]) for step in steps]
+        mean_rewards = [mean(float(row["mean_selected_reward"]) for row in by_step[step]) for step in steps]
+    else:
+        steps = [int(row["step"]) for row in valid_rows]
+        success_rates = [float(row["success_rate"]) for row in valid_rows]
+        mean_rewards = [float(row["mean_selected_reward"]) for row in valid_rows]
     reward_key = str(valid_rows[0].get("reward_key", "return"))
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -663,32 +705,27 @@ def run_checkpoint_sweep(
     args: argparse.Namespace,
 ) -> list[dict[str, Any]]:
     gpu_ids = parse_gpu_ids(args.gpu_ids)
-    # When --gpus-per-ckpt, every checkpoint gets the FULL gpu set (one worker,
-    # checkpoints run sequentially) so a 2-GPU set yields 2 env workers (ranks
-    # 0+1, env seeds 0+1) = training's multi-worker seed topology. Otherwise
-    # (default) one GPU per parallel worker slot (1 env worker each).
+    seeds = parse_seeds(args.seeds, args.seed)
     if args.gpus_per_ckpt:
         worker_gpu_ids = [",".join(gpu_ids)]
     else:
         worker_gpu_ids = gpu_ids
     rows: list[dict[str, Any]] = []
-    completed: dict[int, dict[str, Any]] = {}
+    completed: dict[tuple[int, int], dict[str, Any]] = {}
     rows_lock = threading.Lock()
-    task_queue: queue.Queue[tuple[int, Path]] = queue.Queue()
-    for item in checkpoints:
-        task_queue.put(item)
+    task_queue: queue.Queue[tuple[int, Path, int]] = queue.Queue()
+    for step, checkpoint_path in checkpoints:
+        for seed in seeds:
+            task_queue.put((step, checkpoint_path, seed))
 
     def gpu_worker(worker_slot: int, gpu_id: str) -> None:
         nonlocal rows
         while True:
             try:
-                step, checkpoint_path = task_queue.get_nowait()
+                step, checkpoint_path, seed = task_queue.get_nowait()
             except queue.Empty:
                 return
-            # Use the checkpoint's own dir name (global_step_<N> for SFT,
-            # global_step_<N>_trainenvstep_<M> for RL) so RL checkpoints are
-            # unambiguous and never collide; SFT behavior is unchanged.
-            log_dir = output_dir / _checkpoint_name(checkpoint_path)
+            log_dir = output_dir / _checkpoint_name(checkpoint_path) / f"seed_{seed}"
             log_dir.mkdir(parents=True, exist_ok=True)
             try:
                 row = run_eval_for_checkpoint(
@@ -698,27 +735,30 @@ def run_checkpoint_sweep(
                     worker_slot=worker_slot,
                     log_dir=log_dir,
                     args=args,
+                    seed=seed,
                 )
             except Exception as exc:
                 if not args.continue_on_error:
                     raise
                 row = {
                     "step": step,
+                    "seed": seed,
                     "checkpoint_path": str(checkpoint_path),
                     "gpu_id": gpu_id,
                     "error": str(exc),
                 }
-                print(f"[gpu {gpu_id} step {step}] failed: {exc}", file=sys.stderr)
+                print(f"[gpu {gpu_id} step {step} seed {seed}] failed: {exc}", file=sys.stderr)
             finally:
                 task_queue.task_done()
 
             with rows_lock:
-                completed[step] = row
-                rows = [completed[item_step] for item_step in sorted(completed)]
-                # Evaluation summaries persist independently of checkpoint
-                # retention. Rebuild from the whole eval directory at every
-                # refresh so intermediate plots do not drop historical points.
-                rebuild_plots_from_evaluation_summaries(output_dir, args.reward_key)
+                completed[(step, seed)] = row
+                rows = [completed[key] for key in sorted(completed)]
+                try:
+                    rebuild_plots_from_evaluation_summaries(output_dir, args.reward_key)
+                except FileNotFoundError:
+                    if not args.continue_on_error:
+                        raise
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_gpu_ids)) as executor:
         futures = [

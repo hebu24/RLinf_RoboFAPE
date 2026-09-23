@@ -17,12 +17,16 @@ from typing import Optional, Union
 
 import gymnasium as gym
 import numpy as np
+import json
+from pathlib import Path
+import copy
 import torch
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils import common, gym_utils
 from mani_skill.utils.common import torch_clone_dict
 from mani_skill.utils.structs.types import Array
 from mani_skill.utils.visualization.misc import put_info_on_image, tile_images
+from mani_envs.data_collection.exact_state import compare_states, env_slice, state_hash
 from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
 
@@ -109,6 +113,9 @@ class ManiskillEnv(gym.Env):
         self.use_rel_reward = cfg.use_rel_reward
         self.ignore_terminations = cfg.ignore_terminations
         self.use_full_state = bool(getattr(cfg, "use_full_state", False))
+        self.record_kinematic_trace = bool(
+            getattr(cfg, "record_kinematic_trace", False)
+        )
         # Re-anchor the pd_ee_target_delta_pose controller's _target_pose to the actual
         # EE pose once per action chunk (see _sync_target_delta_pose_controller). This
         # prevents the open-loop target from drifting away from the real EE over a long
@@ -119,6 +126,11 @@ class ManiskillEnv(gym.Env):
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
+        self.initial_state_manifest = getattr(cfg, "initial_state_manifest", None)
+        self._initial_state_records = []
+        if self.initial_state_manifest:
+            manifest = json.loads(Path(self.initial_state_manifest).read_text())
+            self._initial_state_records = manifest.get("references", [])
 
         self.video_cfg = cfg.video_cfg
 
@@ -127,7 +139,20 @@ class ManiskillEnv(gym.Env):
         with open_dict(cfg):
             cfg.init_params.num_envs = num_envs
         env_args = OmegaConf.to_container(cfg.init_params, resolve=True)
+        for camera_key in ("human_render_camera_configs",):
+            camera_cfg = env_args.get(camera_key)
+            if isinstance(camera_cfg, dict) and "pose" in camera_cfg:
+                camera_cfg["pose"] = np.asarray(camera_cfg["pose"], dtype=np.float32)
         self.env: BaseEnv = gym.make(**env_args)
+        render_randomization_spec = getattr(cfg, "render_randomization_spec", None)
+        if render_randomization_spec:
+            try:
+                from render_domain_randomization import apply_render_randomization
+            except ImportError as exc:
+                raise RuntimeError(
+                    "render_randomization_spec requires RoboFPE render helpers on PYTHONPATH"
+                ) from exc
+            apply_render_randomization(self.env, render_randomization_spec)
         self.prev_step_reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
             self.device
         )  # [B, ]
@@ -200,7 +225,26 @@ class ManiskillEnv(gym.Env):
         self._generator.manual_seed(self.seed)
         self.update_reset_state_ids()
 
+    def set_eval_seed(self, seed: int):
+        seed = int(seed)
+        self.cfg.seed = seed
+        self.seed = seed if self.shared_reset_seed else seed + self.seed_offset
+        self._is_start = True
+        self._init_reset_state_ids()
+
     def update_reset_state_ids(self):
+        if self._initial_state_records:
+            # Exact-pair rollouts must select a manifest state deterministically
+            # from the logical evaluation seed, never from ManiSkill's random
+            # trial table. This makes state identity reproducible and auditable.
+            ref_idx = int(self.seed) % len(self._initial_state_records)
+            reset_state_ids = torch.full(
+                (self.num_group,), ref_idx, dtype=torch.long
+            )
+            self.reset_state_ids = reset_state_ids.repeat_interleave(
+                repeats=self.group_size
+            ).to(self.device)
+            return
         if self.shared_reset_seed and hasattr(self, "reset_state_ids"):
             return
         reset_state_ids = torch.randint(
@@ -285,7 +329,26 @@ class ManiskillEnv(gym.Env):
                             raw_obs, use_torch=True, device=self.device
                         )
 
-                main_images = sensor_data["base_camera"]["rgb"]
+                main_camera_key = getattr(self.cfg, "main_camera_key", "base_camera")
+                if main_camera_key == "render_camera":
+                    try:
+                        main_images = self.env.unwrapped.render_rgb_array(
+                            camera_name=main_camera_key
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Configured main_camera_key=render_camera, but the "
+                            "environment could not render render_camera"
+                        ) from exc
+                    if not torch.is_tensor(main_images):
+                        main_images = torch.as_tensor(
+                            main_images, device=self.device
+                        )
+                    if main_images.ndim == 3:
+                        main_images = main_images.unsqueeze(0)
+                    main_images = main_images.to(torch.uint8)
+                else:
+                    main_images = sensor_data[main_camera_key]["rgb"]
                 sorted_images = OrderedDict(sorted(sensor_data.items()))
                 sorted_images.pop("base_camera", None)
                 wrist_images = None
@@ -402,6 +465,49 @@ class ManiskillEnv(gym.Env):
         self.max_rewards = torch.full(
             (self.num_envs,), -float("inf"), device=self.device, dtype=torch.float32
         )
+        if self.record_kinematic_trace:
+            trace_shape = (
+                self.num_envs,
+                int(getattr(self.cfg, "max_episode_steps", 0)),
+                3,
+            )
+            if trace_shape[1] <= 0:
+                raise ValueError("record_kinematic_trace requires max_episode_steps > 0")
+            self._trace_eef_pos = torch.full(
+                trace_shape, float("nan"), device=self.device, dtype=torch.float32
+            )
+            self._trace_cube_pos = torch.full_like(self._trace_eef_pos, float("nan"))
+            self._trace_goal_pos = torch.full_like(self._trace_eef_pos, float("nan"))
+            self._trace_push_success = torch.zeros(
+                trace_shape[:2], device=self.device, dtype=torch.bool
+            )
+            self._trace_cube_a_pos = torch.full_like(self._trace_eef_pos, float("nan"))
+            self._trace_cube_b_pos = torch.full_like(self._trace_eef_pos, float("nan"))
+            self._trace_cube_a_grasped = torch.zeros(trace_shape[:2], device=self.device, dtype=torch.bool)
+            self._trace_stack_success = torch.zeros(trace_shape[:2], device=self.device, dtype=torch.bool)
+            self._trace_left_ball_force = torch.full(trace_shape[:2], float("nan"), device=self.device)
+            self._trace_right_ball_force = torch.full_like(self._trace_left_ball_force, float("nan"))
+            self._trace_left_ball_angle = torch.full_like(self._trace_left_ball_force, float("nan"))
+            self._trace_right_ball_angle = torch.full_like(self._trace_left_ball_force, float("nan"))
+            self._trace_gripper_width = torch.full_like(self._trace_left_ball_force, float("nan"))
+            self._trace_ball_height = torch.full_like(self._trace_left_ball_force, float("nan"))
+            self._trace_ball_to_tcp_distance = torch.full_like(self._trace_left_ball_force, float("nan"))
+            self._trace_left_ball_contact = torch.zeros(trace_shape[:2], device=self.device, dtype=torch.bool)
+            self._trace_right_ball_contact = torch.zeros_like(self._trace_left_ball_contact)
+            self._trace_grasp_confirmed_raw = torch.zeros_like(self._trace_left_ball_contact)
+            self._trace_grasp_confirmed = torch.zeros_like(self._trace_left_ball_contact)
+            self._trace_lift_confirmed = torch.zeros_like(self._trace_left_ball_contact)
+            self._trace_agent_is_grasping = torch.zeros_like(self._trace_left_ball_contact)
+            self._trace_tool_pos = torch.full_like(self._trace_eef_pos, float("nan"))
+            self._trace_ball_velocity = torch.full_like(self._trace_eef_pos, float("nan"))
+            self._trace_tool_grasp_confirmed = torch.zeros_like(self._trace_left_ball_contact)
+            self._trace_tool_grasp_raw = torch.zeros_like(self._trace_left_ball_contact)
+            self._trace_ball_forward_velocity = torch.full_like(self._trace_left_ball_force, float("nan"))
+            self._trace_pull_success = torch.zeros_like(self._trace_left_ball_contact)
+            self._tool_grasp_streak = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+            self._grasp_streak = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+            self._lift_baseline = torch.full((self.num_envs,), float("nan"), device=self.device)
+            self._trace_actions = None
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -413,6 +519,7 @@ class ManiskillEnv(gym.Env):
                 self.fail_once[mask] = False
                 self.returns[mask] = 0
                 self.max_rewards[mask] = -float("inf")
+                self._reset_kinematic_trace(mask)
         else:
             self.prev_step_reward[:] = 0
             if self.record_metrics:
@@ -420,8 +527,208 @@ class ManiskillEnv(gym.Env):
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
                 self.max_rewards[:] = -float("inf")
+                self._reset_kinematic_trace()
 
-    def _record_metrics(self, step_reward, infos):
+    def _reset_kinematic_trace(self, mask=None) -> None:
+        if not self.record_kinematic_trace:
+            return
+        if mask is None:
+            self._trace_eef_pos.fill_(float("nan"))
+            self._trace_cube_pos.fill_(float("nan"))
+            self._trace_goal_pos.fill_(float("nan"))
+            self._trace_push_success.fill_(False)
+            self._trace_cube_a_pos.fill_(float("nan")); self._trace_cube_b_pos.fill_(float("nan"))
+            self._trace_cube_a_grasped.fill_(False); self._trace_stack_success.fill_(False)
+            for name in ("_trace_left_ball_force", "_trace_right_ball_force", "_trace_left_ball_angle", "_trace_right_ball_angle", "_trace_gripper_width", "_trace_ball_height", "_trace_ball_to_tcp_distance", "_lift_baseline"):
+                getattr(self, name).fill_(float("nan"))
+            for name in ("_trace_left_ball_contact", "_trace_right_ball_contact", "_trace_grasp_confirmed_raw", "_trace_grasp_confirmed", "_trace_lift_confirmed", "_trace_agent_is_grasping"):
+                getattr(self, name).fill_(False)
+            self._trace_tool_pos.fill_(float("nan")); self._trace_ball_velocity.fill_(float("nan"))
+            self._trace_tool_grasp_confirmed.fill_(False); self._trace_tool_grasp_raw.fill_(False)
+            self._trace_ball_forward_velocity.fill_(float("nan")); self._trace_pull_success.fill_(False)
+            self._tool_grasp_streak.zero_()
+            self._grasp_streak.zero_()
+            self._trace_actions = None
+            return
+        self._trace_eef_pos[mask] = float("nan")
+        self._trace_cube_pos[mask] = float("nan")
+        self._trace_goal_pos[mask] = float("nan")
+        self._trace_push_success[mask] = False
+        self._trace_cube_a_pos[mask] = float("nan"); self._trace_cube_b_pos[mask] = float("nan")
+        self._trace_cube_a_grasped[mask] = False; self._trace_stack_success[mask] = False
+        for name in ("_trace_left_ball_force", "_trace_right_ball_force", "_trace_left_ball_angle", "_trace_right_ball_angle", "_trace_gripper_width", "_trace_ball_height", "_trace_ball_to_tcp_distance", "_lift_baseline"):
+            getattr(self, name)[mask] = float("nan")
+        for name in ("_trace_left_ball_contact", "_trace_right_ball_contact", "_trace_grasp_confirmed_raw", "_trace_grasp_confirmed", "_trace_lift_confirmed", "_trace_agent_is_grasping"):
+            getattr(self, name)[mask] = False
+        self._trace_tool_pos[mask] = float("nan"); self._trace_ball_velocity[mask] = float("nan")
+        self._trace_tool_grasp_confirmed[mask] = False; self._trace_tool_grasp_raw[mask] = False
+        self._trace_ball_forward_velocity[mask] = float("nan"); self._trace_pull_success[mask] = False
+        self._tool_grasp_streak[mask] = 0
+        self._grasp_streak[mask] = 0
+        if self._trace_actions is not None:
+            self._trace_actions[mask] = float("nan")
+
+    def _pose_position(self, obj, name: str) -> torch.Tensor:
+        pose = getattr(obj, "pose", None)
+        pos = getattr(pose, "p", None)
+        if pos is None:
+            raise AttributeError(f"{name}.pose.p is unavailable")
+        if not isinstance(pos, torch.Tensor):
+            pos = torch.as_tensor(pos, device=self.device, dtype=torch.float32)
+        return pos.to(device=self.device, dtype=torch.float32)
+
+    def _record_current_kinematic_trace(self, episode_info: dict, actions) -> None:
+        if not self.record_kinematic_trace:
+            return
+        unw = self.env.unwrapped
+        eef_pos = self._pose_position(unw.agent.tcp, "agent.tcp")
+        evaluate_result = unw.evaluate()
+        push_success = evaluate_result.get("success", False)
+        if not isinstance(push_success, torch.Tensor):
+            push_success = torch.as_tensor(
+                push_success, device=self.device, dtype=torch.bool
+            )
+        push_success = push_success.to(device=self.device, dtype=torch.bool)
+
+        step_idx = (self.elapsed_steps.to(self.device).long() - 1).clamp(
+            min=0, max=self._trace_eef_pos.shape[1] - 1
+        )
+        env_idx = torch.arange(self.num_envs, device=self.device)
+        self._trace_eef_pos[env_idx, step_idx] = eef_pos
+        action_tensor = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+        if self._trace_actions is None:
+            self._trace_actions = torch.full(
+                (*self._trace_eef_pos.shape[:2], action_tensor.shape[-1]),
+                float("nan"), device=self.device, dtype=torch.float32,
+            )
+        self._trace_actions[env_idx, step_idx] = action_tensor
+        cube_obj = getattr(unw, "obj", getattr(unw, "cube", None))
+        goal_obj = getattr(unw, "goal_region", getattr(unw, "goal_site", None))
+        cube_pos = self._pose_position(cube_obj, "obj") if cube_obj is not None else torch.full_like(eef_pos, float("nan"))
+        goal_pos = self._pose_position(goal_obj, "goal_region") if goal_obj is not None else torch.full_like(eef_pos, float("nan"))
+        self._trace_cube_pos[env_idx, step_idx] = cube_pos
+        self._trace_goal_pos[env_idx, step_idx] = goal_pos
+        self._trace_push_success[env_idx, step_idx] = push_success
+
+        # PullCubeTool-golf task-specific observables.  ``is_grasping`` is
+        # backed by bilateral contact geometry in ManiSkill; combine it with
+        # a closed gripper and three consecutive frames to reject fake closes.
+        tool = getattr(unw, "l_shape_tool", None)
+        if tool is not None:
+            tool_pos = self._pose_position(tool, "l_shape_tool")
+            self._trace_tool_pos[env_idx, step_idx] = tool_pos
+            ball_velocity = getattr(getattr(cube_obj, "get_velocity", None), "__call__", lambda: None)()
+            if ball_velocity is None:
+                ball_velocity = getattr(cube_obj, "velocity", None)
+            if ball_velocity is None:
+                ball_velocity = torch.zeros_like(cube_pos)
+            ball_velocity = torch.as_tensor(ball_velocity, device=self.device, dtype=torch.float32)
+            if ball_velocity.ndim == 1:
+                ball_velocity = ball_velocity.unsqueeze(0).expand(self.num_envs, -1)
+            self._trace_ball_velocity[env_idx, step_idx] = ball_velocity
+            raw_tool = unw.agent.is_grasping(tool, max_angle=20)
+            raw_tool = torch.as_tensor(raw_tool, device=self.device, dtype=torch.bool).reshape(-1)
+            qpos = unw.agent.robot.get_qpos()
+            width = torch.abs(qpos[..., -2:]).sum(dim=1)
+            if hasattr(unw.agent, "finger1_link") and hasattr(unw.agent, "finger2_link"):
+                left_vec = unw.scene.get_pairwise_contact_forces(unw.agent.finger1_link, tool)
+                right_vec = unw.scene.get_pairwise_contact_forces(unw.agent.finger2_link, tool)
+                left_dir = unw.agent.finger1_link.pose.to_transformation_matrix()[..., :3, 1]
+                right_dir = -unw.agent.finger2_link.pose.to_transformation_matrix()[..., :3, 1]
+                left_force = torch.linalg.norm(left_vec, dim=1)
+                right_force = torch.linalg.norm(right_vec, dim=1)
+                left_angle = torch.rad2deg(common.compute_angle_between(left_dir, left_vec))
+                right_angle = torch.rad2deg(common.compute_angle_between(right_dir, right_vec))
+                raw_tool = raw_tool & (left_force >= 0.5) & (right_force >= 0.5) & (left_angle <= 85.0) & (right_angle <= 85.0)
+            raw_tool = raw_tool & (width <= 0.04)
+            self._tool_grasp_streak = torch.where(raw_tool, self._tool_grasp_streak + 1, torch.zeros_like(self._tool_grasp_streak))
+            tool_grasp = self._tool_grasp_streak >= 3
+            robot_base = unw.agent.robot.get_links()[0].pose.p
+            axis = robot_base[:, :2] + torch.tensor([0.05, 0.0], device=self.device) - cube_pos[:, :2]
+            axis = axis / torch.linalg.norm(axis, dim=1, keepdim=True).clamp_min(1e-6)
+            forward_v = (ball_velocity[:, :2] * axis).sum(dim=1)
+            self._trace_tool_grasp_raw[env_idx, step_idx] = raw_tool
+            self._trace_tool_grasp_confirmed[env_idx, step_idx] = tool_grasp
+            self._trace_ball_forward_velocity[env_idx, step_idx] = forward_v
+            self._trace_pull_success[env_idx, step_idx] = push_success
+
+        def pos_or_none(name):
+            obj = getattr(unw, name, None)
+            return self._pose_position(obj, name) if obj is not None and getattr(obj, "pose", None) is not None else None
+        cube_a = pos_or_none("cubeA")
+        cube_b = pos_or_none("cubeB")
+        if cube_a is not None and cube_b is not None:
+            self._trace_cube_a_pos[env_idx, step_idx] = cube_a
+            self._trace_cube_b_pos[env_idx, step_idx] = cube_b
+            result = evaluate_result
+            grasp = result.get("is_src_obj_grasped", result.get("is_cubeA_grasped", False))
+            stack = result.get("success", False)
+            self._trace_cube_a_grasped[env_idx, step_idx] = torch.as_tensor(grasp, device=self.device, dtype=torch.bool)
+            self._trace_stack_success[env_idx, step_idx] = torch.as_tensor(stack, device=self.device, dtype=torch.bool)
+
+        # Keep the exact Panda contact physics in the trajectory metrics.  This
+        # is the same 0.5 N / 85 deg / 3-frame rule used by the standalone
+        # PickCube-ball smoke test.
+        cube = getattr(unw, "cube", None)
+        if cube is not None and hasattr(unw.agent, "finger1_link"):
+            left_vec = unw.scene.get_pairwise_contact_forces(unw.agent.finger1_link, cube)
+            right_vec = unw.scene.get_pairwise_contact_forces(unw.agent.finger2_link, cube)
+            left_dir = unw.agent.finger1_link.pose.to_transformation_matrix()[..., :3, 1]
+            right_dir = -unw.agent.finger2_link.pose.to_transformation_matrix()[..., :3, 1]
+            left_force = torch.linalg.norm(left_vec, dim=1)
+            right_force = torch.linalg.norm(right_vec, dim=1)
+            left_angle = torch.rad2deg(common.compute_angle_between(left_dir, left_vec))
+            right_angle = torch.rad2deg(common.compute_angle_between(right_dir, right_vec))
+            left_valid = (left_force >= 0.5) & (left_angle <= 85.0)
+            right_valid = (right_force >= 0.5) & (right_angle <= 85.0)
+            raw = left_valid & right_valid
+            self._grasp_streak = torch.where(raw, self._grasp_streak + 1, torch.zeros_like(self._grasp_streak))
+            confirmed = self._grasp_streak >= 3
+            height = cube.pose.p[:, 2]
+            qpos = unw.agent.robot.get_qpos()
+            width = torch.abs(qpos[..., -2:]).sum(dim=1)
+            tcp_distance = torch.linalg.norm(cube.pose.p - eef_pos, dim=1)
+            self._lift_baseline = torch.where(torch.isnan(self._lift_baseline), height, self._lift_baseline)
+            lifted = height >= self._lift_baseline + 0.04
+            self._trace_left_ball_force[env_idx, step_idx] = left_force
+            self._trace_right_ball_force[env_idx, step_idx] = right_force
+            self._trace_left_ball_angle[env_idx, step_idx] = left_angle
+            self._trace_right_ball_angle[env_idx, step_idx] = right_angle
+            self._trace_gripper_width[env_idx, step_idx] = width
+            self._trace_ball_height[env_idx, step_idx] = height
+            self._trace_ball_to_tcp_distance[env_idx, step_idx] = tcp_distance
+            self._trace_left_ball_contact[env_idx, step_idx] = left_force > 0
+            self._trace_right_ball_contact[env_idx, step_idx] = right_force > 0
+            self._trace_grasp_confirmed_raw[env_idx, step_idx] = raw
+            self._trace_grasp_confirmed[env_idx, step_idx] = confirmed
+            self._trace_lift_confirmed[env_idx, step_idx] = lifted
+            self._trace_agent_is_grasping[env_idx, step_idx] = unw.agent.is_grasping(cube)
+
+        episode_info["eef_pos"] = self._trace_eef_pos.clone()
+        episode_info["cube_pos"] = self._trace_cube_pos.clone()
+        episode_info["goal_pos"] = self._trace_goal_pos.clone()
+        episode_info["push_success"] = self._trace_push_success.clone()
+        episode_info["tool_pos"] = self._trace_tool_pos.clone()
+        episode_info["ball_velocity"] = self._trace_ball_velocity.clone()
+        episode_info["ball_velocity"] = self._trace_ball_velocity.clone()
+        episode_info["tool_grasp_raw"] = self._trace_tool_grasp_raw.clone()
+        episode_info["tool_grasp_confirmed"] = self._trace_tool_grasp_confirmed.clone()
+        episode_info["ball_forward_velocity"] = self._trace_ball_forward_velocity.clone()
+        episode_info["pull_success"] = self._trace_pull_success.clone()
+        if self._trace_actions is not None:
+            episode_info["executed_actions"] = self._trace_actions.clone()
+        if cube_a is not None and cube_b is not None:
+            episode_info["cube_a_pos"] = self._trace_cube_a_pos.clone()
+            episode_info["cube_b_pos"] = self._trace_cube_b_pos.clone()
+            episode_info["cube_a_grasped"] = self._trace_cube_a_grasped.clone()
+            episode_info["stack_success"] = self._trace_stack_success.clone()
+        for name in ("left_ball_force", "right_ball_force", "left_ball_angle", "right_ball_angle",
+                     "gripper_width", "ball_height", "ball_to_tcp_distance",
+                     "left_ball_contact", "right_ball_contact", "grasp_confirmed_raw",
+                     "grasp_confirmed", "lift_confirmed", "agent_is_grasping"):
+            episode_info[name] = getattr(self, f"_trace_{name}").clone()
+
+    def _record_metrics(self, step_reward, infos, actions):
         episode_info = {}
         self.returns += step_reward
         self.max_rewards = torch.maximum(self.max_rewards, step_reward)
@@ -435,6 +742,9 @@ class ManiskillEnv(gym.Env):
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
         episode_info["max_reward"] = self.max_rewards.clone()
+        if self._initial_state_records:
+            episode_info["manifest_reference_index"] = self.reset_state_ids.clone()
+        self._record_current_kinematic_trace(episode_info, actions)
         infos["episode"] = episode_info
         return infos
 
@@ -461,6 +771,7 @@ class ManiskillEnv(gym.Env):
             merged_options.update(options)
             options = merged_options
         raw_obs, infos = self.env.reset(seed=seed, options=options)
+        raw_obs = self._restore_manifest_states(raw_obs)
         # Pick-up replay-render for the robometer (train only). The task env's
         # _initialize_episode (above, when pre_grasped) stashed a per-env
         # pick-up state trajectory; replay-render reward_camera at each state
@@ -483,12 +794,53 @@ class ManiskillEnv(gym.Env):
             self.env.unwrapped._pending_pickup_trajectories = {}
         self._show_goal_site_visual()
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
+        self._last_policy_obs = extracted_obs
         if "env_idx" in options:
             env_idx = options["env_idx"]
             self._reset_metrics(env_idx)
         else:
             self._reset_metrics()
         return extracted_obs, infos
+
+    def _restore_manifest_states(self, raw_obs):
+        if not self._initial_state_records:
+            return raw_obs
+        # Reset first so simulator bookkeeping exists, then replace each selected
+        # vector slot with the complete saved state. The hash is checked by the
+        # manifest builder/labeler; this path never silently falls back to a seed.
+        current = self.env.unwrapped.get_state_dict()
+        ids = self.reset_state_ids.detach().cpu().tolist() if hasattr(self.reset_state_ids, "detach") else list(range(self.num_envs))
+        saved_by_env = []
+        for env_idx, ref_idx in enumerate(ids):
+            record = self._initial_state_records[int(ref_idx) % len(self._initial_state_records)]
+            saved = torch.load(record["state_path"], map_location="cpu", weights_only=False)
+            saved_by_env.append(saved)
+            def merge(dst, src):
+                if isinstance(dst, dict):
+                    for key in dst:
+                        if key in src: merge(dst[key], src[key])
+                else:
+                    src = torch.as_tensor(src, device=dst.device, dtype=dst.dtype)
+                    if dst.ndim == src.ndim: dst[env_idx] = src
+                    elif dst.ndim == src.ndim + 1: dst[env_idx] = src
+            merge(current, saved)
+        self.env.unwrapped.set_state_dict(current)
+        self.env.unwrapped.scene.update_render()
+        restored = self.env.unwrapped.get_state_dict()
+        for env_idx, ref_idx in enumerate(ids):
+            record = self._initial_state_records[int(ref_idx) % len(self._initial_state_records)]
+            expected = record.get("initial_state_sha256")
+            if expected:
+                restored_state = env_slice(restored, env_idx)
+                actual = state_hash(restored_state)
+                difference = compare_states(saved_by_env[env_idx], restored_state)
+                if actual != expected and difference is not None:
+                    raise RuntimeError(
+                        f"exact initial-state hash mismatch for env={env_idx}, "
+                        f"reference={record.get('id')}: {actual} != {expected}; "
+                        f"difference={difference}"
+                    )
+        return self.env.unwrapped.get_obs()
 
     def reset_all_for_rollout_window(self):
         """Reset all vectorized environments for an independent rollout window.
@@ -595,9 +947,10 @@ class ManiskillEnv(gym.Env):
     ) -> tuple[Array, Array, Array, Array, dict]:
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
+        self._last_policy_obs = extracted_obs
         step_reward = self._calc_step_reward(_reward, infos)
 
-        infos = self._record_metrics(step_reward, infos)
+        infos = self._record_metrics(step_reward, infos, actions)
         if isinstance(terminations, bool):
             terminations = torch.tensor([terminations], device=self.device)
         if isinstance(truncations, bool):
@@ -616,6 +969,7 @@ class ManiskillEnv(gym.Env):
         _auto_reset = auto_reset and self.auto_reset
         if dones.any() and _auto_reset:
             extracted_obs, infos = self._handle_auto_reset(dones, extracted_obs, infos)
+        self._last_policy_obs = extracted_obs
         return extracted_obs, step_reward, terminations, truncations, infos
 
     def chunk_step(self, chunk_actions):
@@ -700,27 +1054,72 @@ class ManiskillEnv(gym.Env):
 
     # render utils
     def capture_image(self, infos=None):
-        raw_obs = self.env.unwrapped.get_obs()
-        sensor_data = raw_obs["sensor_data"]
-        base_img = common.to_numpy(sensor_data["base_camera"]["rgb"])
-        wrist_img = None
-        if bool(getattr(self.cfg, "use_wrist_image", False)) and "hand_camera" in sensor_data:
-            wrist_img = common.to_numpy(sensor_data["hand_camera"]["rgb"])
-
-        if len(base_img.shape) == 3:
-            base_img = base_img[None]
-        if wrist_img is not None and len(wrist_img.shape) == 3:
-            wrist_img = wrist_img[None]
-
         frames = []
-        for i in range(len(base_img)):
-            frame = base_img[i]
-            if wrist_img is not None:
-                if wrist_img.shape[0] > i:
-                    frame = np.concatenate([frame, wrist_img[i]], axis=1)
-                else:
-                    frame = np.concatenate([frame, wrist_img[0]], axis=1)
-            frames.append(frame)
+        render_source = self.video_cfg.get("render_source", "observation")
+        if render_source == "policy_input":
+            policy_obs = getattr(self, "_last_policy_obs", None)
+            if policy_obs is None:
+                return None
+            main_img = common.to_numpy(policy_obs["main_images"])
+            wrist_img = policy_obs.get("wrist_images")
+            wrist_img = None if wrist_img is None else common.to_numpy(wrist_img)
+            if main_img.ndim == 3:
+                main_img = main_img[None]
+            if wrist_img is not None and wrist_img.ndim == 3:
+                wrist_img = wrist_img[None]
+            for i in range(len(main_img)):
+                frame = main_img[i]
+                if wrist_img is not None:
+                    wrist = wrist_img[min(i, len(wrist_img) - 1)]
+                    if frame.shape[:2] != wrist.shape[:2]:
+                        # Video is a display-only montage. Keep both exact
+                        # policy cameras, resizing the render view to the
+                        # wrist stream's 224x224 display resolution.
+                        from PIL import Image
+
+                        frame = np.asarray(
+                            Image.fromarray(frame).resize(
+                                (wrist.shape[1], wrist.shape[0]), Image.Resampling.BILINEAR
+                            )
+                        )
+                    frame = np.concatenate([frame, wrist], axis=1)
+                frames.append(frame)
+        elif render_source in ("human_render", "render_camera", "human"):
+            camera_name = self.video_cfg.get("render_camera_name", "render_camera")
+            render_img = self.env.unwrapped.render_rgb_array(camera_name=camera_name)
+            if render_img is None:
+                _logger.warning(
+                    "Failed to capture human render camera %r; falling back to observation cameras.",
+                    camera_name,
+                )
+                render_source = "observation"
+            else:
+                render_img = common.to_numpy(render_img)
+                if len(render_img.shape) == 3:
+                    render_img = render_img[None]
+                frames = [render_img[i] for i in range(len(render_img))]
+
+        if render_source not in ("policy_input", "human_render", "render_camera", "human"):
+            raw_obs = self.env.unwrapped.get_obs()
+            sensor_data = raw_obs["sensor_data"]
+            base_img = common.to_numpy(sensor_data["base_camera"]["rgb"])
+            wrist_img = None
+            if bool(getattr(self.cfg, "use_wrist_image", False)) and "hand_camera" in sensor_data:
+                wrist_img = common.to_numpy(sensor_data["hand_camera"]["rgb"])
+
+            if len(base_img.shape) == 3:
+                base_img = base_img[None]
+            if wrist_img is not None and len(wrist_img.shape) == 3:
+                wrist_img = wrist_img[None]
+
+            for i in range(len(base_img)):
+                frame = base_img[i]
+                if wrist_img is not None:
+                    if wrist_img.shape[0] > i:
+                        frame = np.concatenate([frame, wrist_img[i]], axis=1)
+                    else:
+                        frame = np.concatenate([frame, wrist_img[0]], axis=1)
+                frames.append(frame)
 
         if infos is not None:
             for i in range(len(frames)):

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import logging
 import os
 from typing import Any
@@ -129,6 +130,9 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 repo_id=repo_id,
                 data_kwargs=getattr(self.cfg.actor, "openpi_data", None),
             )
+            openpi_num_workers = getattr(self.cfg.actor, "openpi_num_workers", None)
+            if openpi_num_workers is not None:
+                config = dataclasses.replace(config, num_workers=int(openpi_num_workers))
             data_loader = openpi_data_loader.create_data_loader(
                 config, framework="pytorch", shuffle=True
             )

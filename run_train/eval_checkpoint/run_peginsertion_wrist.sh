@@ -11,7 +11,19 @@ CONFIG_DIR="${CONFIG_DIR:-${REPO_PATH}/examples/embodiment/config}"
 CONFIG_NAME="${CONFIG_NAME:-maniskill_async_ppo_peg_insertion_pi05}"
 TASK_ID="${TASK_ID:-PegInsertionVertical-v1}"
 OBJ_SET="${OBJ_SET:-}"
-TASK_DESCRIPTION="${TASK_DESCRIPTION:-transport and insert the grasped peg into the hole}"
+if [[ -z "${TASK_DESCRIPTION:-}" ]]; then
+  case "${TASK_ID}" in
+    PegInsertionSide-v1)
+      TASK_DESCRIPTION="Insert the peg into the side-facing target hole."
+      ;;
+    PegInsertionVertical-v1)
+      TASK_DESCRIPTION="Insert the peg vertically into the target hole."
+      ;;
+    *)
+      TASK_DESCRIPTION="Insert the peg into the target hole."
+      ;;
+  esac
+fi
 
 # NUM_EVAL_EPISODES is the exact trajectory count and must be divisible by NUM_ENVS.
 NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-25}"

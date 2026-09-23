@@ -264,7 +264,11 @@ class WorkerGroup(Generic[WorkerClsType]):
             # Call cleanup methods if they exist
             if hasattr(worker_info.worker, "_close"):
                 ray.get(worker_info.worker._close.remote())
-            ray.kill(worker_info.worker)
+            try:
+                ray.kill(worker_info.worker)
+            except ray.exceptions.ActorHandleNotFoundError:
+                # Ray may have already reclaimed the actor during shutdown.
+                pass
         self._workers.clear()
         self._cluster = None
         self._placement_strategy = None

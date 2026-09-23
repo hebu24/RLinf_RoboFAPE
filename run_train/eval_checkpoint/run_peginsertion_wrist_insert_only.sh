@@ -12,7 +12,19 @@ export CONFIG_NAME="maniskill_async_ppo_peg_insertion_pi05"
 # insert (200 steps cut off ~half the successes -> 1/8 vs 4/8 at 600). Divisible by
 # num_action_chunks (10) and execute_action_chunks (10).
 export MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-600}"
-export TASK_DESCRIPTION="${TASK_DESCRIPTION:-transport and insert the grasped peg into the hole}"
+if [[ -z "${TASK_DESCRIPTION:-}" ]]; then
+  case "${TASK_ID:-PegInsertionVertical-v1}" in
+    PegInsertionSide-v1)
+      export TASK_DESCRIPTION="Insert the peg into the side-facing target hole."
+      ;;
+    PegInsertionVertical-v1)
+      export TASK_DESCRIPTION="Insert the peg vertically into the target hole."
+      ;;
+    *)
+      export TASK_DESCRIPTION="Insert the peg into the target hole."
+      ;;
+  esac
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "${SCRIPT_DIR}/run_peginsertion_wrist.sh" "$@"

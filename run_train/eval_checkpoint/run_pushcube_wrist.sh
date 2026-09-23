@@ -20,6 +20,7 @@ NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-50}"
 NUM_ENVS="${NUM_ENVS:-50}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-180}"
 SEED="${SEED:-0}"
+SEEDS="${SEEDS:-}"
 GPU_IDS="${GPU_IDS:-7}"
 
 SAVE_VIDEO="${SAVE_VIDEO:-true}"
@@ -30,13 +31,20 @@ FIXED_RESET_STATE_IDS="${FIXED_RESET_STATE_IDS:-true}"
 CONTROL_MODE="${CONTROL_MODE:-pd_joint_pos}"
 OBS_MODE="${OBS_MODE:-}"
 SIM_BACKEND="${SIM_BACKEND:-}"
-INIT_PARAMS_JSON="${INIT_PARAMS_JSON:-{}}"
+INIT_PARAMS_JSON="${INIT_PARAMS_JSON:-$(printf "{}")}"
 EVAL_ACTION_SCALE="${EVAL_ACTION_SCALE:-1.0}"
 
 PYTHON_BIN="${VENV_DIR}/bin/python"
 RAY_BIN="${VENV_DIR}/bin/ray"
-if [[ ! -x "${PYTHON_BIN}" || ! -x "${RAY_BIN}" ]]; then
-  echo "Missing Python or Ray in ${VENV_DIR}." >&2; exit 1
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Missing Python in ${VENV_DIR}." >&2; exit 1
+fi
+if [[ -x "${RAY_BIN}" ]]; then
+  RAY_CMD=("${RAY_BIN}")
+elif "${PYTHON_BIN}" -c "import ray" >/dev/null 2>&1; then
+  RAY_CMD=("${PYTHON_BIN}" -m ray)
+else
+  echo "Missing Ray executable/module in ${VENV_DIR}." >&2; exit 1
 fi
 if [[ -z "${CHECKPOINT_PATH}" ]]; then
   echo "Set CHECKPOINT_PATH to the actor checkpoint you want to evaluate." >&2; exit 1
@@ -54,14 +62,22 @@ fi
 export EMBODIED_PATH="${CONFIG_DIR%/config}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+export MS_ASSET_DIR="${MS_ASSET_DIR:-/data/yingxi/maniskill_assets}"
 [[ -f /etc/vulkan/icd.d/nvidia_icd.json ]] && export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/etc/vulkan/icd.d/nvidia_icd.json}"
 [[ -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json ]] && export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
 export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
 export HYDRA_FULL_ERROR=1
+export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
+export TORCH_COMPILE_DISABLE="${TORCH_COMPILE_DISABLE:-1}"
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 ulimit -n 1048576 2>/dev/null || true
 
 EVAL_RAY_PORT="${EVAL_RAY_PORT:-6380}"
+EVAL_RAY_MIN_WORKER_PORT="${EVAL_RAY_MIN_WORKER_PORT:-}"
+EVAL_RAY_MAX_WORKER_PORT="${EVAL_RAY_MAX_WORKER_PORT:-}"
+EVAL_RAY_INCLUDE_DASHBOARD="${EVAL_RAY_INCLUDE_DASHBOARD:-true}"
+EVAL_RAY_CLIENT_SERVER_PORT="${EVAL_RAY_CLIENT_SERVER_PORT:-}"
 export RAY_ADDRESS="${RAY_ADDRESS:-127.0.0.1:${EVAL_RAY_PORT}}"
 
 _eval_scoped_ray_kill() {
@@ -69,22 +85,61 @@ _eval_scoped_ray_kill() {
   pkill -9 -f "gcs_server.*--gcs_server_port=${EVAL_RAY_PORT}"  >/dev/null 2>&1 || true
   pkill -9 -f "raylet.*--gcs-address=[^ ]*:${EVAL_RAY_PORT}"    >/dev/null 2>&1 || true
   pkill -9 -f "dashboard.*--gcs-address=[^ ]*:${EVAL_RAY_PORT}" >/dev/null 2>&1 || true
+  pkill -9 -f "ray/util/client/server.py.*--address=[^ ]*:${EVAL_RAY_PORT}" >/dev/null 2>&1 || true
+  pkill -9 -f "ray.util.client.server.*:${EVAL_RAY_PORT}" >/dev/null 2>&1 || true
   pkill -9 -f "ray/autoscaler/_private/monitor.py.*--logs-dir=${ray_tmp_dir}/" >/dev/null 2>&1 || true
   pkill -9 -f "ray/_private/log_monitor.py.*--session-dir=${ray_tmp_dir}/" >/dev/null 2>&1 || true
   sleep 2
 }
 
-MANAGE_RAY="${MANAGE_RAY:-false}"
+MANAGE_RAY="${MANAGE_RAY:-true}"
+FORCE_RESTART_RAY="${FORCE_RESTART_RAY:-false}"
 _EVAL_STARTED_RAY=false
 if [[ "${MANAGE_RAY}" == "true" ]]; then
-  if RAY_ADDRESS="127.0.0.1:${EVAL_RAY_PORT}" "${RAY_BIN}" status >/dev/null 2>&1; then
+  if [[ "${FORCE_RESTART_RAY}" == "true" ]]; then
+    RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray_eval_pushcube}"
+    _eval_scoped_ray_kill
+  fi
+  if [[ "${FORCE_RESTART_RAY}" != "true" ]] && RAY_ADDRESS="127.0.0.1:${EVAL_RAY_PORT}" "${RAY_CMD[@]}" status >/dev/null 2>&1; then
     echo "Reusing the eval Ray cluster on port ${EVAL_RAY_PORT}; will not stop it."
   else
     RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray_eval_pushcube}"
     mkdir -p "${RAY_TMP_DIR}"
     unset CUDA_VISIBLE_DEVICES
     _eval_scoped_ray_kill
-    "${RAY_BIN}" start --head --port="${EVAL_RAY_PORT}" --temp-dir="${RAY_TMP_DIR}" --include-dashboard=true --dashboard-host=127.0.0.1 --dashboard-port="${EVAL_RAY_DASHBOARD_PORT:-8265}"
+    RAY_START_ARGS=(
+      start
+      --head
+      --port="${EVAL_RAY_PORT}"
+      --temp-dir="${RAY_TMP_DIR}"
+      --include-dashboard="${EVAL_RAY_INCLUDE_DASHBOARD}"
+    )
+    if [[ -n "${EVAL_RAY_CLIENT_SERVER_PORT}" ]]; then
+      RAY_START_ARGS+=(--ray-client-server-port="${EVAL_RAY_CLIENT_SERVER_PORT}")
+    fi
+    if [[ -n "${EVAL_RAY_NUM_CPUS:-}" ]]; then
+      RAY_START_ARGS+=(--num-cpus="${EVAL_RAY_NUM_CPUS}")
+    fi
+    if [[ "${EVAL_RAY_INCLUDE_DASHBOARD}" == "true" ]]; then
+      RAY_START_ARGS+=(
+        --dashboard-host=127.0.0.1
+        --dashboard-port="${EVAL_RAY_DASHBOARD_PORT:-8265}"
+      )
+    fi
+    if [[ -n "${EVAL_RAY_NUM_GPUS:-}" ]]; then
+      RAY_START_ARGS+=(--num-gpus="${EVAL_RAY_NUM_GPUS}")
+    fi
+    if [[ -n "${EVAL_RAY_MIN_WORKER_PORT}" || -n "${EVAL_RAY_MAX_WORKER_PORT}" ]]; then
+      if [[ -z "${EVAL_RAY_MIN_WORKER_PORT}" || -z "${EVAL_RAY_MAX_WORKER_PORT}" ]]; then
+        echo "Set both EVAL_RAY_MIN_WORKER_PORT and EVAL_RAY_MAX_WORKER_PORT, or neither." >&2
+        exit 1
+      fi
+      RAY_START_ARGS+=(
+        --min-worker-port="${EVAL_RAY_MIN_WORKER_PORT}"
+        --max-worker-port="${EVAL_RAY_MAX_WORKER_PORT}"
+      )
+    fi
+    "${RAY_CMD[@]}" "${RAY_START_ARGS[@]}"
     _EVAL_STARTED_RAY=true
     export RLINF_EVAL_STARTED_RAY=1
     export RAY_ADDRESS="127.0.0.1:${EVAL_RAY_PORT}"
@@ -114,6 +169,7 @@ CMD=(
   --control-mode "${CONTROL_MODE}"
 )
 
+[[ -n "${SEEDS}" ]] && CMD+=(--seeds "${SEEDS}")
 [[ -n "${OBS_MODE}" ]] && CMD+=(--obs-mode "${OBS_MODE}")
 [[ -n "${SIM_BACKEND}" ]] && CMD+=(--sim-backend "${SIM_BACKEND}")
 [[ "${SAVE_VIDEO}" == "true" ]] && CMD+=(--save-video) || CMD+=(--no-save-video)

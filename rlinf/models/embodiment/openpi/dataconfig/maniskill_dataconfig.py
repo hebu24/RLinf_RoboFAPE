@@ -107,7 +107,8 @@ class LeRobotManiSkillWristDataConfig(LeRobotManiSkillDataConfig):
     """Generic ManiSkill wrist-camera SFT config.
 
     Dataset keys:
-    - observation.images.top: fixed/base camera.
+    - observation.images.top: the dataset main view. New RoboFPE SFT data
+      stores human render-camera pixels in this historical field.
     - observation.images.wrist: one wrist camera from panda_wristcam.
     - observation.state: robot proprioception, typically Panda qpos.
     """
@@ -158,12 +159,17 @@ class LeRobotManiSkillPegInsertionWristDataConfig(LeRobotManiSkillDataConfig):
     """DataConfig for PegInsertionVertical finetuning with wrist camera.
 
     Configuration (relative to LeRobotManiSkillDataConfig):
-    - image: base (observation.images.top) + wrist (observation.images.wrist).
+    - image: render-camera main view (observation.images.top) + wrist
+      (observation.images.wrist). The two-field contract is intentional:
+      do not add a third policy input for render_camera.
       The wrist image is repacked to ``observation/wrist_image`` so that
       ``ManiSkillInputs`` maps it to ``left_wrist_0_rgb`` and enables the
       corresponding image mask.
     - state: uses observation.state_tcp (8-dim TCP proprio).
-    - action: already delta, so extra_delta_transform stays False (inherited).
+    - action: uses the audited 7D TCP delta field
+      ``debug.fk_delta_action``. The historical ``actions`` field in the
+      RoboFPE Side dataset is 8D Panda joint-position control data and must
+      not be fed to the EE-delta evaluation controller.
     """
 
     @override
@@ -177,7 +183,7 @@ class LeRobotManiSkillPegInsertionWristDataConfig(LeRobotManiSkillDataConfig):
                         "observation/image": "observation.images.top",
                         "observation/wrist_image": "observation.images.wrist",
                         "observation/state": "observation.state_tcp",
-                        "actions": "actions",
+                        "actions": "debug.fk_delta_action",
                         "prompt": "prompt",
                     }
                 )
@@ -205,4 +211,5 @@ class LeRobotManiSkillPegInsertionWristDataConfig(LeRobotManiSkillDataConfig):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=("debug.fk_delta_action",),
         )

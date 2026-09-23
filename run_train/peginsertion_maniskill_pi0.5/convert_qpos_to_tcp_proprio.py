@@ -59,7 +59,12 @@ def process_episode(uw, ep_df):
     states_tcp = np.zeros((T, SDIM_TCP), dtype=np.float32)
     tcp_mats = np.zeros((T, 4, 4), dtype=np.float64)
     source_actions = np.stack(ep_df["actions"] if "actions" in ep_df.columns else ep_df["action"].values)
-    gripper_actions = source_actions[:, 6]
+    if source_actions.shape[-1] >= 8:
+        # Panda pd_joint_pos stores 7 arm joints followed by one gripper
+        # command. The old 7D assumption incorrectly used the last arm joint.
+        gripper_actions = source_actions[:, 7]
+    else:
+        gripper_actions = source_actions[:, 6]
     for t in range(T):
         qpos8 = np.asarray(ep_df["observation.state"].iloc[t], dtype=np.float32)
         proprio, Tmat = fk_proprio(uw, qpos8)

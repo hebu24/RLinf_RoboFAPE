@@ -1,0 +1,51 @@
+env_type: maniskill
+total_num_envs: null
+wrap_obs_mode: simple
+main_camera_key: render_camera
+use_wrist_image: true
+use_wrist_back_image: false
+auto_reset: true
+ignore_terminations: true
+use_rel_reward: false
+reward_mode: raw
+action_scale: 1.0
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 50
+max_episode_steps: 50
+task_description: "Pull the wooden block into the target region."
+reset_options:
+  randomize_initial_poses: false
+video_cfg:
+  save_video: true
+  render_source: policy_input
+  render_camera_name: render_camera
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/eval
+  max_videos: 1
+enable_offload: false
+record_kinematic_trace: true
+init_params:
+  id: PullCube-block
+  num_envs: null
+  obs_mode: rgb
+  robot_uids: panda_wristcam
+  control_mode: pd_joint_pos
+  sim_backend: gpu
+  reward_mode: normalized_dense
+  max_episode_steps: ${..max_episode_steps}
+  render_mode: all
+  sensor_configs:
+    shader_pack: minimal
+    base_camera:
+      width: 224
+      height: 224
+    hand_camera:
+      width: 224
+      height: 224
+  human_render_camera_configs:
+    shader_pack: minimal
+    render_camera:
+      width: 512
+      height: 512

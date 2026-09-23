@@ -92,33 +92,34 @@ tmux new -s eval_400_5tasks
   RAY_TMPDIR、LOG_DIR、eval 侧对应端口和 tmp dir。RAY_TMPDIR 要短，否则 Ray 会报 AF_UNIX socket path 超长。这里
   RAY_NUM_CPUS=8 和 thread caps 是为避免之前的 can't start new thread。
 ## Tensorboard
-复现/恢复工作流：
+更新后的 TB 重启工作流
 
-  # 1. 在本机启动 31065 -> 本地 -> 30088 的 TB log 同步
-  tmux kill-session -t tb_sync_31065_to_30088 2>/dev/null || true
-  tmux new-session -d -s tb_sync_31065_to_30088 \
-    '/Users/luyingxi/tb_sync_31065_to_30088.sh 2>&1 | tee -a /Users/luyingxi/tb_sync_31065_to_30088.runtime.log'
+  以后重启 compare 面板，在 30088 这边执行：
 
-  # 2. 重建本机 6006 tunnel 到 30088 的 TensorBoard
-  tmux kill-session -t tb_30088_tunnel 2>/dev/null || true
-  lsof -tiTCP:6006 -sTCP:LISTEN | xargs -r kill 2>/dev/null || true
-  tmux new-session -d -s tb_30088_tunnel \
-    'ssh -F /dev/null -i ~/.ssh/id_rsa -nNT \
-      -o ExitOnForwardFailure=no \
-      -o ServerAliveInterval=30 \
-      -o ServerAliveCountMax=3 \
-      -p 30088 \
-      -L 127.0.0.1:6006:127.0.0.1:6006 \
-      root@10.210.22.182'
+  ssh 10.210.22.182
+  cd /data/yingxi/RLinf_RoboFAPE
+  bash /tmp/start_tb_compare_30088.sh
 
-  # 3. 验证
-  curl -sS --max-time 8 http://127.0.0.1:6006/data/runs
-  curl -I --max-time 8 http://127.0.0.1:6006
+  确认 logdir：
 
-  30088 上 TensorBoard 本身已经在跑，不需要重启；它的 logdir spec 在：
+  cat logs/tensorboard/tb_compare.logdir_spec
 
-  /data/yingxi/RLinf_RoboFAPE/logs/tensorboard/tb_compare.logdir_spec
+  确认 TB 进程：
 
-  注意：同步日志里反复出现的 remote port forwarding failed for listen port 8888 目前不影响 TB，同步结果是 pull=0
-  push=0。这只是 SSH 配置里某个 remote forward 抢 8888 失败。
-  
+  ps -eo pid=,args= | grep -i tensorboard | grep -v grep
+
+  确认 HTTP/run 已加载：
+
+  curl -sS http://127.0.0.1:6006/data/runs
+
+  确认 checkpoint400_current_31065 的 step：
+
+  .venv/bin/python - <<'PY'
+  import json, urllib.parse, urllib.request
+  base = "http://127.0.0.1:6006"
+  run = "checkpoint400_current_31065/."
+  for tag in ["env/success_once", "train/actor/current_version"]:
+      qs = urllib.parse.urlencode({"run": run, "tag": tag})
+      vals = json.load(urllib.request.urlopen(base + "/data/plugin/scalars/scalars?" + qs))
+      print(tag, "count", len(vals), "last_step", vals[-1][1], "last_value", vals[-1][2])
+  PY

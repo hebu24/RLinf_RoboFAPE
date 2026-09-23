@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+export VENV_DIR="${VENV_DIR:-${REPO_PATH}/.venv}"
+export CONFIG_DIR="${CONFIG_DIR:-${REPO_PATH}/run_train/pushcube_maniskill_pi0.5/config}"
+export CONFIG_NAME="maniskill_pullcubetool_golf_wrist_sft_eval_openpi_pi05"
+export TASK_ID="PullCubeTool-golf"
+export TASK_DESCRIPTION="Use the L-shaped tool to pull the golf ball into the robot's reachable target region."
+export MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-350}"
+export OBS_MODE="${OBS_MODE:-rgb}"
+export SIM_BACKEND="${SIM_BACKEND:-gpu}"
+export CONTROL_MODE="pd_joint_pos"
+export EVAL_RAY_PORT="${EVAL_RAY_PORT:-6380}"
+export RAY_TMP_DIR="${RAY_TMP_DIR:-/data/ray_eval_pullcubetool_golf}"
+export GPU_IDS="${GPU_IDS:-0,1}"
+exec bash "${SCRIPT_DIR}/run_pushcube_wrist.sh" "$@"

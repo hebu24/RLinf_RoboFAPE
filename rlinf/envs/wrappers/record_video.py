@@ -92,6 +92,14 @@ class RecordVideo(gym.Wrapper):
     def is_start(self, value):
         setattr(self.env, "is_start", value)
 
+    def set_eval_seed(self, seed: int):
+        """Switch evaluation seed and start a separate video sequence."""
+        setter = getattr(self.env, "set_eval_seed", None)
+        if callable(setter):
+            setter(seed)
+        self.render_images = []
+        self.video_cnt = 0
+
     def _get_fps_from_env(self, env: gym.Env) -> int:
         """Resolve FPS from config/env metadata with fallback."""
         if hasattr(self.video_cfg, "fps") and self.video_cfg.fps is not None:
